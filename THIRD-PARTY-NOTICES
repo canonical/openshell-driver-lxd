@@ -1,0 +1,16 @@
+Third-Party Notices
+===================
+
+This project is licensed under the GNU Affero General Public License v3.0 or
+later (see LICENSE). It vendors the following third-party file under a
+different license:
+
+proto/compute_driver.proto
+---------------------------
+Source:  https://github.com/NVIDIA/OpenShell
+License: Apache-2.0
+Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This file defines the openshell.compute.v1.ComputeDriver gRPC contract that
+this driver implements. It is included unmodified, with its original
+SPDX headers preserved.
