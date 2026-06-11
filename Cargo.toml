@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/computev1"]
+members = ["crates/computev1", "crates/openshell-driver-lxd"]
 
 [workspace.package]
 version = "0.1.0"
