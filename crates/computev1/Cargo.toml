@@ -1,0 +1,17 @@
+[package]
+name = "computev1"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "tonic + prost generated bindings for the OpenShell ComputeDriver gRPC service"
+
+[dependencies]
+tonic = { workspace = true }
+tonic-prost = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
