@@ -1,2 +1,39 @@
 # openshell-driver-lxd
+
 OpenShell Compute driver for LXD
+
+## Overview
+
+`openshell-driver-lxd` is an out-of-tree [OpenShell](https://github.com/NVIDIA/OpenShell)
+compute driver backed by [LXD](https://github.com/canonical/lxd). It implements
+OpenShell's `compute_driver.proto` contract (see OpenShell PR #1703) and serves
+it over gRPC via a Unix domain socket, which the OpenShell gateway connects to
+at startup.
+
+```
+OpenShell gateway
+    └── Unix socket (gRPC)
+            └── openshell-driver-lxd
+                    └── LXD REST API
+                            └── LXD VM
+```
+
+## Requirements
+
+- Rust (stable, see `rust-toolchain.toml`)
+- `protoc` (`apt install protobuf-compiler`) for `computev1`'s proto codegen
+
+## Build and run
+
+```sh
+make build
+make run -- --socket /var/run/openshell-driver.sock
+```
+
+## License
+
+Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+## Development
+
+See [AGENTS.md](AGENTS.md) for development and contribution conventions.
