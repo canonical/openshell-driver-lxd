@@ -1,0 +1,29 @@
+[package]
+name = "openshell-driver-lxd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OpenShell ComputeDriver gRPC service backed by LXD"
+
+[lib]
+name = "openshell_driver_lxd"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openshell-driver-lxd"
+path = "src/main.rs"
+
+[dependencies]
+computev1 = { path = "../computev1" }
+
+tonic = { workspace = true }
+prost-types = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { workspace = true }
+futures = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+thiserror = { workspace = true }
