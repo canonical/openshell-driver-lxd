@@ -29,3 +29,19 @@ script.
 - **Commit format**: see [COMMITS.md](COMMITS.md) for types, scopes, and
   signing requirements.
 - **License**: AGPLv3 (see [LICENSE](LICENSE)).
+
+## Snap packaging
+
+The snap definition lives in `snap/snapcraft.yaml` (base `core26`, strict
+confinement). A GitHub Actions workflow (`.github/workflows/snap.yaml`) builds
+the snap on every push/PR to `main` using `canonical/setup-lxd` and snapcraft.
+
+When making changes to snap packaging:
+
+- Keep `snap/snapcraft.yaml` minimal; do not add `build-packages` or
+  `stage-packages` unless a concrete missing-dependency failure requires it.
+- The `rust` plugin runs `cargo build --release` inside the LXD build
+  container — no extra Rust toolchain setup is needed.
+- The `lxd` interface auto-connects when the snap is installed
+  alongside the LXD snap; manual connection is required for `--dangerous`
+  installs (see README).
