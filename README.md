@@ -21,13 +21,40 @@ OpenShell gateway
 ## Requirements
 
 - Rust (stable, see `rust-toolchain.toml`)
-- `protoc` (`apt install protobuf-compiler`) for `computev1`'s proto codegen
+- `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
 
 ## Build and run
 
 ```sh
 make build
 make run -- --socket /var/run/openshell-driver.sock
+```
+
+## Snap
+
+The repository ships a snap package definition in `snap/snapcraft.yaml`.
+
+### Build the snap locally
+
+```sh
+snapcraft
+```
+
+Snapcraft uses LXD as its build environment — install and initialise it first
+if needed:
+
+```sh
+sudo snap install lxd
+lxd init --auto
+sudo snap install snapcraft --classic
+```
+
+### Install and run
+
+```sh
+sudo snap install openshell-driver-lxd_*.snap --dangerous
+sudo snap connect openshell-driver-lxd:lxd lxd
+sudo openshell-driver-lxd
 ```
 
 ## License

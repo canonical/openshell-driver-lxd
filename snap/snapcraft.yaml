@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: openshell-driver-lxd
+base: core26
+version: git
+summary: OpenShell ComputeDriver gRPC service backed by LXD
+description: |
+  A gRPC compute driver service for OpenShell, backed by LXD.
+  Exposes the OpenShell ComputeDriver API over a Unix domain socket.
+grade: stable
+confinement: strict
+
+apps:
+  openshell-driver-lxd:
+    command: bin/openshell-driver-lxd --lxd-socket /var/snap/lxd/common/lxd/unix.socket
+    plugs:
+    - lxd
+
+parts:
+  openshell-driver-lxd:
+    plugin: rust
+    build-packages:
+    - protobuf-compiler
+    - libprotobuf-dev
+    source: .
+    rust-path:
+    - crates/openshell-driver-lxd
