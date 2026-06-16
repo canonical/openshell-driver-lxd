@@ -26,7 +26,7 @@ proto:
 	cargo build -p computev1
 
 run:
-	cargo run -p openshell-driver-lxd --
+	cargo run -p openshell-driver-lxd -- $(ARGS)
 
 clean:
 	cargo clean
