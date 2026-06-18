@@ -1,0 +1,20 @@
+name: CLA checks
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  cla-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if CLA signed
+        uses: canonical/has-signed-canonical-cla@86d1373fc19075192a59dd06e8037abd5e44063d
