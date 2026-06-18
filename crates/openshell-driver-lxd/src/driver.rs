@@ -7,7 +7,6 @@ use computev1::pb::GetCapabilitiesResponse;
 use crate::config::Config;
 
 const DRIVER_NAME: &str = "lxd";
-const DEFAULT_SANDBOX_IMAGE: &str = "ubuntu:24.04";
 
 /// LXD compute driver.
 #[derive(Debug, Clone)]
@@ -27,7 +26,7 @@ impl LxdComputeDriver {
         GetCapabilitiesResponse {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
-            default_image: DEFAULT_SANDBOX_IMAGE.to_string(),
+            default_image: self.config.default_image.clone(),
             supports_gpu: self.config.gpu_support,
         }
     }
@@ -48,7 +47,7 @@ mod tests {
 
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.default_image, "ubuntu:24.04");
+        assert_eq!(response.default_image, "openshell-sandbox");
         assert!(!response.supports_gpu);
     }
 
