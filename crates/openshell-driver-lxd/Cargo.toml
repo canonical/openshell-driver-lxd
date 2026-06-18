@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 computev1 = { path = "../computev1" }
+lxd-client = { path = "../lxd-client" }
 
 tonic = { workspace = true }
 prost-types = { workspace = true }

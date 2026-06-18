@@ -659,6 +659,7 @@ dependencies = [
  "clap",
  "computev1",
  "futures",
+ "lxd-client",
  "prost-types",
  "thiserror",
  "tokio",
