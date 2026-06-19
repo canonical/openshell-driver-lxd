@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+
+//! Serde types mirroring LXD's REST API JSON shapes.
+
+use crate::error::LxdError;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+/// Envelope every LXD REST API response is wrapped in.
+///
+/// `metadata` is the typed payload for `sync` responses, and for `async`
+/// responses LXD inlines the full [`Operation`] there too (never just a bare
+/// ID), so callers never need a follow-up `GET` to resolve it.
+///
+/// `status_code` is only meaningful for `sync`/`async` responses; LXD's own
+/// error responses leave it `0` and report the real numeric code in
+/// `error_code`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LxdResponse<T> {
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub status_code: u16,
+    #[serde(default)]
+    pub error_code: u16,
+    pub metadata: Option<T>,
+    pub error: Option<String>,
+}
+
+impl<T> LxdResponse<T> {
+    /// Extracts `metadata`, or [`LxdError::Api`] if LXD reported success
+    /// without a payload (unexpected, but checked rather than panicking).
+    pub(crate) fn into_metadata(self) -> Result<T, LxdError> {
+        self.metadata.ok_or_else(|| LxdError::Api {
+            status_code: self.status_code,
+            message: "LXD response missing metadata".to_string(),
+        })
+    }
+}
+
+/// A container or virtual machine, as returned by
+/// `GET /1.0/instances/<name>` and `GET /1.0/instances?recursion=1`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Instance {
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub status_code: u16,
+    #[serde(default)]
+    pub architecture: String,
+    pub ephemeral: bool,
+    pub profiles: Vec<String>,
+    pub config: HashMap<String, String>,
+    pub devices: HashMap<String, HashMap<String, String>>,
+    #[serde(rename = "type")]
+    pub type_: String,
+    pub project: String,
+}
+
+/// Runtime state of an instance, as returned by
+/// `GET /1.0/instances/<name>/state`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceState {
+    pub status: String,
+    pub status_code: u16,
+    pub disk: HashMap<String, InstanceStateDisk>,
+    pub memory: InstanceStateMemory,
+    pub network: HashMap<String, InstanceStateNetwork>,
+    pub pid: i64,
+    pub processes: i64,
+    pub cpu: InstanceStateCpu,
+}
+
+/// Disk usage for one device in [`InstanceState::disk`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceStateDisk {
+    pub usage: i64,
+    #[serde(default)]
+    pub total: i64,
+}
+
+/// Memory usage section of [`InstanceState`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceStateMemory {
+    pub usage: i64,
+    #[serde(default)]
+    pub usage_peak: i64,
+    #[serde(default)]
+    pub total: i64,
+    #[serde(default)]
+    pub swap_usage: i64,
+    #[serde(default)]
+    pub swap_usage_peak: i64,
+}
+
+/// CPU usage section of [`InstanceState`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceStateCpu {
+    pub usage: i64,
+}
+
+/// Network interface state for one device in [`InstanceState::network`].
+///
+/// IP addresses live in [`InstanceStateNetworkAddress::address`], nested
+/// under `addresses`, not as a flat field on this struct.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceStateNetwork {
+    #[serde(default)]
+    pub addresses: Vec<InstanceStateNetworkAddress>,
+    #[serde(default)]
+    pub hwaddr: String,
+    #[serde(default)]
+    pub host_name: String,
+    #[serde(default)]
+    pub mtu: i64,
+    #[serde(default)]
+    pub state: String,
+    #[serde(rename = "type", default)]
+    pub type_: String,
+}
+
+/// A single address entry within [`InstanceStateNetwork::addresses`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstanceStateNetworkAddress {
+    pub family: String,
+    pub address: String,
+    #[serde(default)]
+    pub netmask: String,
+    #[serde(default)]
+    pub scope: String,
+}
+
+/// An asynchronous background operation, returned by every mutating
+/// instance endpoint and by `GET /1.0/operations/<id>/wait`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Operation {
+    pub id: String,
+    #[serde(default)]
+    pub class: String,
+    #[serde(default)]
+    pub description: String,
+    pub status: String,
+    pub status_code: u16,
+    #[serde(default)]
+    pub resources: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    pub err: String,
+    #[serde(default)]
+    pub location: String,
+}
+
+/// Server info, as returned by `GET /1.0`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LxdServerInfo {
+    #[serde(default)]
+    pub api_extensions: Vec<String>,
+}
