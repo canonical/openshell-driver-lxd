@@ -6,6 +6,7 @@
 mod client;
 mod error;
 mod instances;
+mod operations;
 pub mod resources;
 mod types;
 
