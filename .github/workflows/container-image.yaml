@@ -1,0 +1,59 @@
+name: Build container image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: canonical/setup-lxd@da2ac84e727dc534215fd14cd088b9209d65893b
+      - name: Install rockcraft and umoci
+        run: |
+          sudo snap install rockcraft --classic
+          sudo apt-get install -y umoci
+      - name: Install lxd-convert
+        run: |
+          go install github.com/canonical/lxd/lxd-convert@lxd-6.8
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Build rock
+        run: rockcraft pack --verbosity=brief
+      - name: Convert OCI rock to LXD container image
+        run: |
+          ROCK=$(ls openshell-container-image_*.rock | head -1)
+
+          # The rock is an OCI image archive (tarball); extract it into an
+          # OCI image layout directory that umoci can read.
+          mkdir oci-image
+          tar -xf "$ROCK" -C oci-image
+          TAG=$(jq -r '.manifests[0].annotations["org.opencontainers.image.ref.name"]' oci-image/index.json)
+
+          # Unpack the OCI image to a rootfs bundle. Needs root to chown
+          # the unpacked rootfs contents.
+          sudo umoci unpack --image "oci-image:$TAG" bundle
+
+          # Import the rootfs into LXD as a temporary container, then publish
+          # as a named image and export to a portable tarball.
+          sudo "$(command -v lxd-convert)" --type container \
+            --source bundle/rootfs --name openshell-sandbox-build \
+            --non-interactive
+          lxc publish openshell-sandbox-build --alias openshell-sandbox \
+            description="OpenShell sandbox container image"
+          lxc image export openshell-sandbox openshell-sandbox
+          lxc delete openshell-sandbox-build
+      - name: Upload LXD image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-image
+          path: "openshell-sandbox.tar.gz"
