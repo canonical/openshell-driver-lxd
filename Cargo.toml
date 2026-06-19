@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/computev1", "crates/openshell-driver-lxd"]
+members = ["crates/computev1", "crates/lxd-client", "crates/openshell-driver-lxd"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,3 +31,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Errors
 thiserror = "2"
+
+# HTTP transport (lxd-client)
+hyper = { version = "1.10.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
+http-body-util = "0.1"
+
+# Serialization (lxd-client)
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
