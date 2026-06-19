@@ -4,6 +4,7 @@
 //! domain socket.
 
 mod error;
+pub mod resources;
 mod types;
 
 pub use error::LxdError;
