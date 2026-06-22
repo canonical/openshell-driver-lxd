@@ -14,7 +14,7 @@ script.
 |---|---|
 | `make build` | `cargo build --workspace` |
 | `make check` | `cargo check --workspace --all-targets` |
-| `make test` | `cargo test --workspace` |
+| `make test` | provisions LXD for lxd-client's integration tests, then `cargo test --workspace` |
 | `make fmt` / `make fmt-check` | format / check formatting |
 | `make clippy` | `cargo clippy --workspace --all-targets -- -D warnings` |
 | `make proto` | rebuild `computev1` (forces proto codegen) |
