@@ -1,4 +1,4 @@
-name: Static checks
+name: Tests
 
 on:
   push:
@@ -14,17 +14,16 @@ permissions:
   contents: read
 
 jobs:
-  static-checks:
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: canonical/setup-lxd@da2ac84e727dc534215fd14cd088b9209d65893b
       - name: Install rustup
         run: sudo snap install --classic rustup
       - name: Install Rust toolchain
         run: rustup toolchain install stable --component rustfmt,clippy
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-      - name: Run Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Run tests
+        run: make test
