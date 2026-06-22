@@ -1,4 +1,4 @@
-.PHONY: build release check test fmt fmt-check clippy proto run clean
+.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy proto run clean
 
 build:
 	cargo build --workspace
@@ -9,8 +9,14 @@ release:
 check:
 	cargo check --workspace --all-targets
 
-test:
+test: setup-lxd-test-env
 	cargo test --workspace
+
+# Provisions LXD for lxd-client's integration tests (see
+# crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
+# `test` so the same command works locally and in CI.
+setup-lxd-test-env:
+	./scripts/setup-lxd-test-env.sh
 
 fmt:
 	cargo fmt --all
