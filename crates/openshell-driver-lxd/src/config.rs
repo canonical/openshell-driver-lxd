@@ -14,6 +14,9 @@ pub const DEFAULT_LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
 /// Default tracing log level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
+/// Default sandbox image alias.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -29,4 +32,8 @@ pub struct Config {
     /// Tracing log level (e.g. "trace", "debug", "info", "warn", "error").
     #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     pub log_level: String,
+
+    /// LXD image alias every sandbox is created from.
+    #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
+    pub default_image: String,
 }

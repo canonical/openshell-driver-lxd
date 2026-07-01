@@ -21,5 +21,5 @@ async fn get_capabilities_returns_driver_info() {
 
     assert_eq!(response.driver_name, "lxd");
     assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(response.default_image, "ubuntu:24.04");
+    assert_eq!(response.default_image, "openshell-sandbox");
 }
