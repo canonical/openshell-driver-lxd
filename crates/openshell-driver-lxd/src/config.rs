@@ -29,8 +29,4 @@ pub struct Config {
     /// Tracing log level (e.g. "trace", "debug", "info", "warn", "error").
     #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     pub log_level: String,
-
-    /// Advertise support for GPU-backed sandboxes.
-    #[arg(long, default_value_t = false)]
-    pub gpu_support: bool,
 }

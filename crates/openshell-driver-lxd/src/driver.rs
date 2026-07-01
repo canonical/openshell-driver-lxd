@@ -28,7 +28,6 @@ impl LxdComputeDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: DEFAULT_SANDBOX_IMAGE.to_string(),
-            supports_gpu: self.config.gpu_support,
         }
     }
 }
@@ -49,16 +48,5 @@ mod tests {
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
         assert_eq!(response.default_image, "ubuntu:24.04");
-        assert!(!response.supports_gpu);
-    }
-
-    #[test]
-    fn capabilities_reflects_gpu_support_flag() {
-        let config = Config::parse_from(["openshell-driver-lxd", "--gpu-support"]);
-        let driver = LxdComputeDriver::new(config);
-
-        let response = driver.capabilities();
-
-        assert!(response.supports_gpu);
     }
 }
