@@ -6,7 +6,7 @@ OpenShell Compute driver for LXD
 
 `openshell-driver-lxd` is an out-of-tree [OpenShell](https://github.com/NVIDIA/OpenShell)
 compute driver backed by [LXD](https://github.com/canonical/lxd). It implements
-OpenShell's `compute_driver.proto` contract (see OpenShell PR #1703) and serves
+OpenShell's `compute_driver.proto` contract (OpenShell PR #1703, merged) and serves
 it over gRPC via a Unix domain socket, which the OpenShell gateway connects to
 at startup.
 

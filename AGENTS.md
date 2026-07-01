@@ -2,8 +2,9 @@
 
 `openshell-driver-lxd` is an out-of-tree [OpenShell](https://github.com/NVIDIA/OpenShell)
 compute driver. It implements OpenShell's `compute_driver.proto` contract
-(OpenShell PR #1703) over gRPC via a Unix domain socket, using
-[LXD](https://github.com/canonical/lxd) as the compute backend.
+(introduced in OpenShell PR #1703, now merged to main) over gRPC via a Unix
+domain socket, using [LXD](https://github.com/canonical/lxd) as the compute
+backend.
 
 ## Build and test
 

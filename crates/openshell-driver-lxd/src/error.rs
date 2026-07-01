@@ -18,6 +18,10 @@ pub enum DriverError {
     /// The LXD REST API call failed.
     #[error("LXD error: {0}")]
     Lxd(#[from] LxdError),
+
+    /// An internal driver error (I/O, unexpected state, etc.).
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 impl From<DriverError> for Status {
@@ -29,7 +33,12 @@ impl From<DriverError> for Status {
                 status_code: 409,
                 message,
             }) => Status::already_exists(message),
+            DriverError::Lxd(LxdError::Api {
+                status_code: 404,
+                message,
+            }) => Status::not_found(message),
             DriverError::Lxd(lxd_err) => Status::internal(lxd_err.to_string()),
+            DriverError::Internal(msg) => Status::internal(msg),
         }
     }
 }

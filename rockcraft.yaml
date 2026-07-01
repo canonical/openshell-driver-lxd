@@ -13,6 +13,12 @@ platforms:
   arm64:
 
 parts:
+  users:
+    plugin: nil
+    override-overlay: |
+      groupadd --gid 10001 sandbox
+      useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin sandbox
+
   openshell-sandbox:
     plugin: nil
     source:
@@ -26,7 +32,9 @@ parts:
       - ca-certificates
       - curl
       - iproute2
-      - python3-minimal
+      - dhcpcd
+      - nftables
+      - python3
       - sqlite3
     override-pull: |
       craftctl default
@@ -41,3 +49,14 @@ parts:
     override-build: |
       install -D -m 0755 openshell-container-init.sh \
         "$CRAFT_PART_INSTALL/opt/openshell/bin/openshell-container-init.sh"
+
+  token-placeholder:
+    plugin: nil
+    override-build: |
+      # Create the mount point for the per-sandbox JWT token file that the
+      # driver bind-mounts read-only into each container via an LXD disk
+      # device. LXD needs the destination path to exist before it can bind-
+      # mount a file over it; the empty placeholder here is replaced by the
+      # real token at container-create time and is never read directly.
+      install -D -m 0600 /dev/null \
+        "$CRAFT_PART_INSTALL/etc/openshell/auth/sandbox.jwt"

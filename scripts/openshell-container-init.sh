@@ -31,7 +31,57 @@ fi
 chmod 0755 /sandbox
 
 # ---------------------------------------------------------------------------
-# 2. Set container hostname from OPENSHELL_SANDBOX_ID (or fall back to the
+# 2. Bring up eth0 via DHCP.
+#
+#    The image ships no systemd/netplan/NetworkManager, so nothing else in
+#    the container will ever request a lease: eth0 otherwise keeps only its
+#    kernel-assigned IPv6 link-local address, and the supervisor can never
+#    reach the gateway over IPv4 (Network is unreachable). Run dhclient as
+#    a background daemon (not -1/one-shot) so the lease renews for
+#    longer-lived sandboxes, then briefly poll for the address before
+#    moving on.
+# ---------------------------------------------------------------------------
+# Ubuntu 24.04 ships /etc/resolv.conf as a symlink to systemd-resolved's stub,
+# which doesn't exist when systemd is not PID 1. Replace with a static file
+# before any DNS is needed. Use the lxdbr0 host IP (from OPENSHELL_ENDPOINT,
+# which LXD injects as an env var before PID 1 starts) as the nameserver since
+# LXD's dnsmasq on the bridge provides DNS for the container network.
+if [ -L /etc/resolv.conf ] || ! [ -s /etc/resolv.conf ]; then
+    rm -f /etc/resolv.conf
+    _ns=""
+    if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
+        _ep="${OPENSHELL_ENDPOINT#http://}"
+        _ep="${_ep#https://}"
+        _ns="${_ep%%/*}"
+        _ns="${_ns%%:*}"
+    fi
+    if [ -n "$_ns" ]; then
+        printf 'nameserver %s\n' "$_ns" > /etc/resolv.conf
+    else
+        printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf
+    fi
+fi
+
+if command -v dhclient >/dev/null 2>&1; then
+    dhclient eth0 2>/dev/null &
+elif command -v dhcpcd >/dev/null 2>&1; then
+    dhcpcd eth0 2>/dev/null &
+fi
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if ip -4 -o addr show eth0 2>/dev/null | grep -q 'inet '; then
+        break
+    fi
+    sleep 0.5
+done
+_eth0_addr=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}')
+if [ -n "$_eth0_addr" ]; then
+    ts "eth0 acquired IPv4: ${_eth0_addr}"
+else
+    ts "WARN: eth0 did not acquire an IPv4 address within 5s"
+fi
+
+# ---------------------------------------------------------------------------
+# 3. Set container hostname from OPENSHELL_SANDBOX_ID (or fall back to the
 #    kernel-assigned name, which LXD sets from the instance name).
 # ---------------------------------------------------------------------------
 if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
@@ -39,7 +89,7 @@ if [ -n "${OPENSHELL_SANDBOX_ID:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Source any injected environment file.
+# 4. Source any injected environment file.
 # ---------------------------------------------------------------------------
 if [ -f /srv/openshell-env.sh ]; then
     # shellcheck source=/dev/null
@@ -47,7 +97,7 @@ if [ -f /srv/openshell-env.sh ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Seed /etc/hosts with host.openshell.internal → the lxdbr0 host-side IP.
+# 5. Seed /etc/hosts with host.openshell.internal → the lxdbr0 host-side IP.
 #
 #    OPENSHELL_ENDPOINT is injected by the driver at create time as
 #    http://<host-lxdbr0-ip>:<port>/. Parse the hostname/IP from it so the
@@ -84,7 +134,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. Probe OPENSHELL_ENDPOINT reachability before handing off to the
+# 6. Probe OPENSHELL_ENDPOINT reachability before handing off to the
 #    supervisor, matching upstream's diagnostic pattern.
 # ---------------------------------------------------------------------------
 if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
@@ -102,7 +152,25 @@ if [ -n "${OPENSHELL_ENDPOINT:-}" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Exec-replace this wrapper with the supervisor using an explicit dynamic
+# 7. Log token file status before handing off to the supervisor.
+#
+#    The driver bind-mounts the per-sandbox JWT into the container at
+#    OPENSHELL_SANDBOX_TOKEN_FILE. Log whether it arrived so failed mounts
+#    are immediately visible in the console log without needing to exec in.
+# ---------------------------------------------------------------------------
+if [ -n "${OPENSHELL_SANDBOX_TOKEN_FILE:-}" ]; then
+    if [ -f "${OPENSHELL_SANDBOX_TOKEN_FILE}" ] && [ -s "${OPENSHELL_SANDBOX_TOKEN_FILE}" ]; then
+        _size=$(wc -c < "${OPENSHELL_SANDBOX_TOKEN_FILE}" 2>/dev/null || echo "?")
+        ts "token file present: ${OPENSHELL_SANDBOX_TOKEN_FILE} (${_size} bytes)"
+    elif [ -f "${OPENSHELL_SANDBOX_TOKEN_FILE}" ]; then
+        ts "WARN: token file is empty: ${OPENSHELL_SANDBOX_TOKEN_FILE} — file push may have failed"
+    else
+        ts "WARN: token file missing: ${OPENSHELL_SANDBOX_TOKEN_FILE} — supervisor will fail to authenticate"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
+# 8. Exec-replace this wrapper with the supervisor using an explicit dynamic
 #    linker path, matching upstream's technique. This avoids relying on the
 #    rootfs's own ld.so and makes openshell-sandbox PID 1.
 # ---------------------------------------------------------------------------
@@ -131,9 +199,12 @@ LIB_PATH="${LIB_PATH}:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
 LIB_PATH="${LIB_PATH}:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu"
 
 if [ -n "$LOADER" ]; then
-    ts "exec: ${LOADER} --library-path ${LIB_PATH} ${SUPERVISOR} --workdir /sandbox"
-    exec "$LOADER" --library-path "$LIB_PATH" "$SUPERVISOR" --workdir /sandbox
+    ts "exec: ${LOADER} --library-path ${LIB_PATH} ${SUPERVISOR} --workdir /sandbox --ssh-socket-path /tmp/openshell-relay.sock"
+    exec "$LOADER" --library-path "$LIB_PATH" "$SUPERVISOR" \
+        --workdir /sandbox \
+        --ssh-socket-path /tmp/openshell-relay.sock
 else
     ts "WARN: no explicit loader found; falling back to direct exec"
-    exec "$SUPERVISOR" --workdir /sandbox
+    exec "$SUPERVISOR" --workdir /sandbox \
+        --ssh-socket-path /tmp/openshell-relay.sock
 fi

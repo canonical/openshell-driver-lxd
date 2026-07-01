@@ -3,8 +3,20 @@
 //! Serde types mirroring LXD's REST API JSON shapes.
 
 use crate::error::LxdError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// LXD sends explicit JSON `null` (not a missing key) for several
+/// `InstanceState` maps once an instance is stopped. `#[serde(default)]`
+/// alone only covers a missing key, not an explicit `null`, so fields that
+/// can come back `null` also need this as their `deserialize_with`.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Envelope every LXD REST API response is wrapped in.
 ///
@@ -62,8 +74,12 @@ pub struct Instance {
 pub struct InstanceState {
     pub status: String,
     pub status_code: u16,
+    /// `null` rather than `{}` when the instance is stopped.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub disk: HashMap<String, InstanceStateDisk>,
     pub memory: InstanceStateMemory,
+    /// `null` rather than `{}` when the instance is stopped.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub network: HashMap<String, InstanceStateNetwork>,
     pub pid: i64,
     pub processes: i64,
@@ -153,4 +169,18 @@ pub struct Operation {
 pub struct LxdServerInfo {
     #[serde(default)]
     pub api_extensions: Vec<String>,
+}
+
+/// A managed network, as returned by `GET /1.0/networks/<name>`.
+///
+/// `config` keys of interest include `ipv4.address`/`ipv6.address`, which
+/// hold the bridge's own host-side address in CIDR form (e.g.
+/// `"10.0.0.1/24"`), not a bare IP.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Network {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub type_: String,
+    #[serde(default)]
+    pub config: HashMap<String, String>,
 }

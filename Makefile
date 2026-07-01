@@ -1,4 +1,4 @@
-.PHONY: build release check test fmt fmt-check clippy proto run clean
+.PHONY: build release check test fmt fmt-check clippy proto run clean sandbox-image e2e
 
 build:
 	cargo build --workspace
@@ -28,5 +28,13 @@ proto:
 run:
 	cargo run -p openshell-driver-lxd -- $(ARGS)
 
+# Builds the sandbox container image and publishes it to the local LXD
+# image store under the openshell-sandbox alias.
+sandbox-image:
+	./scripts/build-sandbox-image.sh
+
 clean:
 	cargo clean
+
+e2e: ## Run e2e tests against a real LXD daemon (requires OPENSHELL_REPO)
+	scripts/e2e-lxd.sh

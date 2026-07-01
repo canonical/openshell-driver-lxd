@@ -86,4 +86,38 @@ impl LxdClient {
             .await?
             .into_metadata()
     }
+
+    /// `POST /1.0/instances/<name>/files?path=<guest_path>`: write a file
+    /// directly into the container's overlay filesystem.
+    ///
+    /// The container does not need to be running; LXD accesses the overlay
+    /// directly for containers (not VMs). The file is created with
+    /// `uid=0 gid=0 mode=0400` inside the container — owned by container root,
+    /// read-only. This sidesteps the UID-mapping issue that arises when
+    /// bind-mounting a host file: a bind-mounted file owned by the host user
+    /// (e.g. UID 1000) appears inside an unprivileged container as the
+    /// overflow UID (65534/nobody), which container root cannot read.
+    pub async fn push_file_into_instance(
+        &self,
+        name: &str,
+        guest_path: &str,
+        content: &[u8],
+    ) -> Result<(), LxdError> {
+        let url = format!(
+            "/1.0/instances/{name}/files?path={guest_path}",
+        );
+        self.post_raw(
+            &url,
+            "application/octet-stream",
+            &[
+                ("X-LXD-uid", "0"),
+                ("X-LXD-gid", "0"),
+                ("X-LXD-mode", "0400"),
+                ("X-LXD-type", "file"),
+                ("X-LXD-write", "overwrite"),
+            ],
+            hyper::body::Bytes::copy_from_slice(content),
+        )
+        .await
+    }
 }

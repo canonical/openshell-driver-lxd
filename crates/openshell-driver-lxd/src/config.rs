@@ -17,6 +17,11 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default sandbox image alias.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
 
+/// Default OpenShell gateway gRPC port, injected into sandboxes as part of
+/// `OPENSHELL_ENDPOINT` so the supervisor can dial back for its policy.
+/// Matches `openshell-server`'s own `DEFAULT_SERVER_PORT`.
+pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -33,11 +38,13 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// Advertise support for GPU-backed sandboxes.
-    #[arg(long, default_value_t = false)]
-    pub gpu_support: bool,
-
     /// LXD image alias every sandbox is created from.
     #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     pub default_image: String,
+
+    /// Port the OpenShell gateway's gRPC server listens on, used to build
+    /// `OPENSHELL_ENDPOINT` for sandboxes (the gateway host is resolved from
+    /// the sandbox's own LXD bridge network at create time).
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
+    pub gateway_grpc_port: u16,
 }

@@ -124,4 +124,52 @@ impl LxdClient {
     ) -> Result<LxdResponse<T>, LxdError> {
         self.request(Method::DELETE, path, None).await
     }
+
+    /// POST raw bytes with arbitrary extra headers; parses success/failure from
+    /// the LXD response envelope without requiring `metadata` to be present.
+    /// Used for the file-push endpoint whose sync response has `metadata: null`.
+    pub(crate) async fn post_raw(
+        &self,
+        path: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(), LxdError> {
+        let stream = UnixStream::connect(&self.socket_path).await?;
+        let io = TokioIo::new(stream);
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+        tokio::task::spawn(async move {
+            if let Err(err) = conn.await {
+                tracing::warn!(%err, "lxd-client: connection closed with error");
+            }
+        });
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("Host", "localhost")
+            .header("Content-Type", content_type);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Full::new(body))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let parsed: serde_json::Value =
+                serde_json::from_slice(&resp_body).unwrap_or_default();
+            let message = parsed["error"]
+                .as_str()
+                .unwrap_or_else(|| parsed["message"].as_str().unwrap_or("unknown error"))
+                .to_string();
+            return Err(LxdError::Api {
+                status_code: status.as_u16(),
+                message,
+            });
+        }
+        Ok(())
+    }
 }

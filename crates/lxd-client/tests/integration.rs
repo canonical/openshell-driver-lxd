@@ -138,6 +138,15 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         .expect("get_instance should succeed after stop");
     assert_eq!(stopped.status, "Stopped");
 
+    // LXD returns `network`/`disk` as `null`, not `{}`, once an instance is
+    // stopped -- regression check for a real deserialization failure this
+    // tripped before `InstanceState` defaulted those fields.
+    let stopped_state = client
+        .get_instance_state(&name)
+        .await
+        .expect("get_instance_state should succeed after stop");
+    assert_eq!(stopped_state.status, "Stopped");
+
     let delete_op = client
         .delete_instance(&name)
         .await
@@ -204,6 +213,26 @@ async fn get_instance_unknown_name_returns_404() {
         LxdError::Api { status_code, .. } => assert_eq!(status_code, 404),
         other => panic!("expected LxdError::Api(404), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn get_network_returns_bridge_address() {
+    let client = client();
+
+    let network = client
+        .get_network("lxdbr0")
+        .await
+        .expect("get_network should succeed for the lxdbr0 bridge");
+
+    assert_eq!(network.name, "lxdbr0");
+    let ipv4 = network
+        .config
+        .get("ipv4.address")
+        .expect("lxdbr0 should have an ipv4.address config key");
+    assert!(
+        ipv4.contains('/'),
+        "expected CIDR notation (e.g. 10.0.0.1/24), got {ipv4}"
+    );
 }
 
 #[tokio::test]
