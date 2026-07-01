@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let listener = UnixListener::bind(&config.socket)?;
-    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o660))?;
+    fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
 
     info!(socket = %config.socket.display(), "Starting OpenShell LXD compute driver");
 
