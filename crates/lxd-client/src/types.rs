@@ -215,3 +215,19 @@ pub struct LxdEvent {
     /// Raw event payload; shape varies by `type_`.
     pub metadata: serde_json::Value,
 }
+
+/// A managed network, as returned by `GET /1.0/networks/<name>`.
+///
+/// `config` keys of interest: `ipv4.address` / `ipv6.address` hold the
+/// bridge's own host-side address in CIDR form (e.g. `"10.0.0.1/24"`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct Network {
+    /// Network name (e.g. `"lxdbr0"`).
+    pub name: String,
+    /// Network type (e.g. `"bridge"`, `"physical"`).
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Network configuration key/value pairs.
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+}
