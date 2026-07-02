@@ -12,7 +12,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lxd_client::{LxdClient, LxdEndpoint, LxdError};
 
@@ -76,10 +76,10 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         )
         .await
         .expect("create_instance should succeed");
-    client
-        .wait_operation(&create_op.id, Some(60))
+    tokio::time::timeout(Duration::from_secs(60), client.wait_operation(&create_op.id))
         .await
-        .expect("create operation should complete");
+        .expect("create operation should not time out")
+        .expect("create operation should complete successfully");
 
     let instance = client
         .get_instance(&name)
@@ -108,10 +108,10 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         .start_instance(&name)
         .await
         .expect("start_instance should succeed");
-    client
-        .wait_operation(&start_op.id, Some(60))
+    tokio::time::timeout(Duration::from_secs(60), client.wait_operation(&start_op.id))
         .await
-        .expect("start operation should complete");
+        .expect("start operation should not time out")
+        .expect("start operation should complete successfully");
 
     let running = client
         .get_instance(&name)
@@ -129,10 +129,10 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         .stop_instance(&name, true)
         .await
         .expect("stop_instance should succeed");
-    client
-        .wait_operation(&stop_op.id, Some(30))
+    tokio::time::timeout(Duration::from_secs(30), client.wait_operation(&stop_op.id))
         .await
-        .expect("stop operation should complete");
+        .expect("stop operation should not time out")
+        .expect("stop operation should complete successfully");
 
     let stopped = client
         .get_instance(&name)
@@ -144,10 +144,10 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         .delete_instance(&name)
         .await
         .expect("delete_instance should succeed");
-    client
-        .wait_operation(&delete_op.id, Some(30))
+    tokio::time::timeout(Duration::from_secs(30), client.wait_operation(&delete_op.id))
         .await
-        .expect("delete operation should complete");
+        .expect("delete operation should not time out")
+        .expect("delete operation should complete successfully");
 
     let err = client
         .get_instance(&name)
@@ -182,9 +182,9 @@ async fn create_instance_with_unknown_image_alias_fails() {
         .await
         .expect("create_instance call itself should succeed (LXD accepts the request and returns an operation)");
 
-    let err = client
-        .wait_operation(&create_op.id, Some(15))
+    let err = tokio::time::timeout(Duration::from_secs(15), client.wait_operation(&create_op.id))
         .await
+        .expect("wait_operation should not time out")
         .expect_err("waiting on the operation should fail: the image alias doesn't exist");
 
     match err {
@@ -212,9 +212,13 @@ async fn get_instance_unknown_name_returns_404() {
 async fn wait_operation_unknown_id_returns_404() {
     let client = client();
 
-    let err = client
-        .wait_operation("00000000-0000-0000-0000-000000000000", Some(5))
+    let err =
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.wait_operation("00000000-0000-0000-0000-000000000000"),
+        )
         .await
+        .expect("wait_operation should not hang on a 404")
         .expect_err("wait_operation should fail for an unknown id");
 
     match err {

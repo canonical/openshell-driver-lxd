@@ -7,29 +7,29 @@ use crate::error::LxdError;
 use crate::types::Operation;
 
 impl LxdClient {
-    /// `GET /1.0/operations/<id>/wait?timeout=<timeout_secs>`.
+    /// Block until the operation identified by `id` reaches a terminal state.
     ///
-    /// `operation_id` is the bare UUID from [`crate::types::Operation::id`],
-    /// not the full `/1.0/operations/<id>` path.
-    pub async fn wait_operation(
-        &self,
-        operation_id: &str,
-        timeout_secs: Option<u32>,
-    ) -> Result<Operation, LxdError> {
-        let path = match timeout_secs {
-            Some(timeout) => format!("/1.0/operations/{operation_id}/wait?timeout={timeout}"),
-            None => format!("/1.0/operations/{operation_id}/wait"),
-        };
+    /// Uses `?timeout=-1` so LXD blocks indefinitely server-side. Callers that
+    /// need a deadline should wrap this with [`tokio::time::timeout`]:
+    ///
+    /// ```ignore
+    /// tokio::time::timeout(Duration::from_secs(60), lxd.wait_operation(id)).await??;
+    /// ```
+    ///
+    /// `id` is the bare UUID from [`Operation::id`], not the full path.
+    pub async fn wait_operation(&self, id: &str) -> Result<Operation, LxdError> {
+        let op = self
+            .get::<Operation>(&format!("/1.0/operations/{id}/wait?timeout=-1"))
+            .await?
+            .into_metadata()?;
 
-        let operation = self.get::<Operation>(&path).await?.into_metadata()?;
-
-        if !operation.err.is_empty() {
+        if !op.err.is_empty() {
             return Err(LxdError::OperationFailed {
-                description: operation.description.clone(),
-                err: operation.err.clone(),
+                description: op.description,
+                err: op.err,
             });
         }
 
-        Ok(operation)
+        Ok(op)
     }
 }
