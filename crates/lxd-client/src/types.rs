@@ -3,8 +3,20 @@
 //! Serde types mirroring LXD's REST API JSON shapes.
 
 use crate::error::LxdError;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+
+/// LXD sends explicit JSON `null` (not a missing key) for several
+/// `InstanceState` maps when an instance is stopped. `#[serde(default)]`
+/// alone only handles a missing key, not an explicit `null`, so affected
+/// fields also need this helper as their `deserialize_with`.
+fn null_to_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Default + Deserialize<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
+}
 
 /// Envelope every LXD REST API response is wrapped in.
 ///
@@ -62,8 +74,12 @@ pub struct Instance {
 pub struct InstanceState {
     pub status: String,
     pub status_code: u16,
+    /// `null` rather than `{}` when the instance is stopped.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub disk: HashMap<String, InstanceStateDisk>,
     pub memory: InstanceStateMemory,
+    /// `null` rather than `{}` when the instance is stopped.
+    #[serde(default, deserialize_with = "null_to_default")]
     pub network: HashMap<String, InstanceStateNetwork>,
     pub pid: i64,
     pub processes: i64,
