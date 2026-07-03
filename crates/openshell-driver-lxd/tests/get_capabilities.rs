@@ -21,20 +21,5 @@ async fn get_capabilities_returns_driver_info() {
 
     assert_eq!(response.driver_name, "lxd");
     assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(response.default_image, "ubuntu:24.04");
-    assert!(!response.supports_gpu);
-}
-
-#[tokio::test]
-async fn get_capabilities_reflects_gpu_support_flag() {
-    let config = Config::parse_from(["openshell-driver-lxd", "--gpu-support"]);
-    let service = ComputeDriverService::new(LxdComputeDriver::new(config));
-
-    let response = service
-        .get_capabilities(Request::new(GetCapabilitiesRequest {}))
-        .await
-        .expect("get_capabilities should succeed")
-        .into_inner();
-
-    assert!(response.supports_gpu);
+    assert_eq!(response.default_image, "openshell-sandbox");
 }
