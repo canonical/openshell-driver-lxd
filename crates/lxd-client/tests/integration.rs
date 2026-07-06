@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use lxd_client::{LxdClient, LxdError};
+use lxd_client::{LxdClient, LxdEndpoint, LxdError};
 
 const TEST_IMAGE_ALIAS: &str = "lxd-client-test";
 const LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
@@ -22,7 +22,7 @@ const LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
 static NAME_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn client() -> LxdClient {
-    LxdClient::new(PathBuf::from(LXD_SOCKET))
+    LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(LXD_SOCKET))).unwrap()
 }
 
 /// Short, unique-enough LXD instance name for one test run.
