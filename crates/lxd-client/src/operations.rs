@@ -7,6 +7,16 @@ use crate::error::LxdError;
 use crate::types::Operation;
 
 impl LxdClient {
+    /// `GET /1.0/operations/<id>` — fetch the current state of an operation
+    /// without blocking.
+    ///
+    /// `id` is the bare UUID from [`Operation::id`], not the full path.
+    pub async fn get_operation(&self, id: &str) -> Result<Operation, LxdError> {
+        self.get::<Operation>(&format!("/1.0/operations/{id}"))
+            .await?
+            .into_metadata()
+    }
+
     /// Block until the operation identified by `id` reaches a terminal state.
     ///
     /// Uses `?timeout=-1` so LXD blocks indefinitely server-side. Callers that
