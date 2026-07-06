@@ -2,9 +2,12 @@
 
 //! Serde types mirroring LXD's REST API JSON shapes.
 
-use crate::error::LxdError;
-use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
+use std::str::FromStr;
+
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::error::LxdError;
 
 /// LXD sends explicit JSON `null` (not a missing key) for several
 /// `InstanceState` maps when an instance is stopped. `#[serde(default)]`
@@ -154,7 +157,7 @@ pub struct Operation {
     pub class: String,
     #[serde(default)]
     pub description: String,
-    pub status: String,
+    pub status: OperationStatus,
     pub status_code: u16,
     #[serde(default)]
     pub resources: HashMap<String, Vec<String>>,
@@ -162,6 +165,36 @@ pub struct Operation {
     pub err: String,
     #[serde(default)]
     pub location: String,
+}
+
+/// Lifecycle status of an [`Operation`], as reported by LXD's `status`
+/// field (also mirrored in the `status` key of
+/// `/1.0/events?type=operation` frames).
+///
+/// LXD reports several transient statuses beyond the ones any caller in
+/// this crate inspects (`Starting`, `Stopping`, `Aborting`, ...); any
+/// value that isn't one of the terminal/pending statuses handled here is
+/// always non-terminal, so [`OperationStatus::Other`] captures those
+/// without needing this enum to track LXD's full status list.
+#[derive(Clone, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
+pub enum OperationStatus {
+    Pending,
+    Running,
+    Success,
+    Failure,
+    Cancelled,
+    #[strum(default)]
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for OperationStatus {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Server info, as returned by `GET /1.0`.

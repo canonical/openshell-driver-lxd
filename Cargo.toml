@@ -49,3 +49,6 @@ webpki-roots = "0.26"
 
 # WebSocket (lxd-client event stream)
 tokio-tungstenite = "0.26"
+
+# Typed string enums (lxd-client operation status)
+strum = { version = "0.27", features = ["derive"] }

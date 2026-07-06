@@ -76,10 +76,13 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         )
         .await
         .expect("create_instance should succeed");
-    tokio::time::timeout(Duration::from_secs(60), client.wait_operation(&create_op.id))
-        .await
-        .expect("create operation should not time out")
-        .expect("create operation should complete successfully");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        client.wait_operation(&create_op.id),
+    )
+    .await
+    .expect("create operation should not time out")
+    .expect("create operation should complete successfully");
 
     let instance = client
         .get_instance(&name)
@@ -144,10 +147,13 @@ async fn create_get_list_start_stop_delete_lifecycle() {
         .delete_instance(&name)
         .await
         .expect("delete_instance should succeed");
-    tokio::time::timeout(Duration::from_secs(30), client.wait_operation(&delete_op.id))
-        .await
-        .expect("delete operation should not time out")
-        .expect("delete operation should complete successfully");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        client.wait_operation(&delete_op.id),
+    )
+    .await
+    .expect("delete operation should not time out")
+    .expect("delete operation should complete successfully");
 
     let err = client
         .get_instance(&name)
@@ -159,12 +165,6 @@ async fn create_get_list_start_stop_delete_lifecycle() {
     }
 }
 
-/// Verified directly against a real daemon, not assumed: when `/wait`
-/// observes an operation that already failed, LXD returns a top-level
-/// `error`-typed envelope (the real failure reason in `error_code`/
-/// `error`), not a `sync` response wrapping an `Operation` whose `err`
-/// field is set. A real creation failure surfaces as `LxdError::Api`,
-/// not `LxdError::OperationFailed`.
 #[tokio::test]
 async fn create_instance_with_unknown_image_alias_fails() {
     let client = client();
@@ -182,14 +182,17 @@ async fn create_instance_with_unknown_image_alias_fails() {
         .await
         .expect("create_instance call itself should succeed (LXD accepts the request and returns an operation)");
 
-    let err = tokio::time::timeout(Duration::from_secs(15), client.wait_operation(&create_op.id))
-        .await
-        .expect("wait_operation should not time out")
-        .expect_err("waiting on the operation should fail: the image alias doesn't exist");
+    let err = tokio::time::timeout(
+        Duration::from_secs(15),
+        client.wait_operation(&create_op.id),
+    )
+    .await
+    .expect("wait_operation should not time out")
+    .expect_err("waiting on the operation should fail: the image alias doesn't exist");
 
     match err {
-        LxdError::Api { .. } => {}
-        other => panic!("expected LxdError::Api, got {other:?}"),
+        LxdError::OperationFailed { .. } => {}
+        other => panic!("expected LxdError::OperationFailed, got {other:?}"),
     }
 }
 
@@ -212,14 +215,13 @@ async fn get_instance_unknown_name_returns_404() {
 async fn wait_operation_unknown_id_returns_404() {
     let client = client();
 
-    let err =
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            client.wait_operation("00000000-0000-0000-0000-000000000000"),
-        )
-        .await
-        .expect("wait_operation should not hang on a 404")
-        .expect_err("wait_operation should fail for an unknown id");
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client.wait_operation("00000000-0000-0000-0000-000000000000"),
+    )
+    .await
+    .expect("wait_operation should not hang on a 404")
+    .expect_err("wait_operation should fail for an unknown id");
 
     match err {
         LxdError::Api { status_code, .. } => assert_eq!(status_code, 404),
