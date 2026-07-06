@@ -51,4 +51,18 @@ pub enum LxdError {
     /// the expected shape.
     #[error("invalid JSON from LXD: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A TLS certificate, key, or configuration error.
+    #[error("TLS error: {reason}")]
+    Tls {
+        /// Why the TLS setup failed.
+        reason: String,
+    },
+
+    /// A WebSocket-level error (framing, protocol, or handshake failure).
+    #[error("WebSocket error: {reason}")]
+    WebSocket {
+        /// Why the WebSocket operation failed.
+        reason: String,
+    },
 }
