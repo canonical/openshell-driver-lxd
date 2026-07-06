@@ -170,3 +170,15 @@ pub struct LxdServerInfo {
     #[serde(default)]
     pub api_extensions: Vec<String>,
 }
+
+/// A single event frame from `GET /1.0/events`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LxdEvent {
+    /// ISO-8601 timestamp of the event.
+    pub timestamp: String,
+    /// Event type: `"operation"`, `"lifecycle"`, `"logging"`, etc.
+    #[serde(rename = "type")]
+    pub type_: String,
+    /// Raw event payload; shape varies by `type_`.
+    pub metadata: serde_json::Value,
+}
