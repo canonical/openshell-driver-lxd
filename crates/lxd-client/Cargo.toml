@@ -27,3 +27,4 @@ webpki-roots = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures = { workspace = true }
 strum = { workspace = true }
+urlencoding = { workspace = true }

@@ -388,6 +388,70 @@ impl LxdClient {
     ) -> Result<LxdResponse<T>, LxdError> {
         self.request(Method::DELETE, path, None).await
     }
+
+    /// POST raw bytes with arbitrary extra headers.
+    ///
+    /// Used for the file-push endpoint whose sync response has `metadata: null`
+    /// and therefore cannot go through the generic `request::<T>` path.
+    pub(crate) async fn post_raw(
+        &self,
+        path: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<(), LxdError> {
+        let (mut sender, host) = self.connect().await?;
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("Host", host)
+            .header("Content-Type", content_type);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Full::new(body))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        // Mirrors `request()`'s error handling: prefer the real code/message
+        // from LXD's envelope when present, falling back to the raw HTTP
+        // status for a non-JSON body (e.g. a proxy error page).
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        // LXD can return type="error" with 200 OK in edge cases; tolerate a
+        // body that isn't the LXD envelope shape rather than treating it as
+        // an error, since post_raw is also used for non-JSON-envelope bodies.
+        if !resp_body.is_empty() {
+            if let Ok(parsed) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body) {
+                if parsed.type_ == "error" {
+                    let message = parsed
+                        .error
+                        .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
+                    return Err(LxdError::Api {
+                        status_code: parsed.error_code,
+                        message,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for LxdClient {
