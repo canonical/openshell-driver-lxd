@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lxd_client::{LxdClient, LxdEndpoint, LxdError};
+use lxd_client::{LxdClient, LxdEndpoint, LxdError, LxdNetworkAclRule};
 
 const TEST_IMAGE_ALIAS: &str = "lxd-client-test";
 const LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
@@ -227,4 +227,90 @@ async fn wait_operation_unknown_id_returns_404() {
         LxdError::Api { status_code, .. } => assert_eq!(status_code, 404),
         other => panic!("expected LxdError::Api(404), got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn ensure_network_acl_create_update_delete() {
+    let client = client();
+    let acl_name = unique_name();
+
+    client
+        .ensure_network_acl(
+            &acl_name,
+            vec![LxdNetworkAclRule::allow_egress_tcp("10.0.0.0/8", 8080)],
+        )
+        .await
+        .expect("ensure_network_acl should create a new ACL");
+
+    // Idempotent: update the ruleset on an existing ACL.
+    client
+        .ensure_network_acl(
+            &acl_name,
+            vec![LxdNetworkAclRule::allow_egress_tcp("192.168.0.0/16", 443)],
+        )
+        .await
+        .expect("ensure_network_acl should update an existing ACL");
+
+    client
+        .delete_network_acl(&acl_name)
+        .await
+        .expect("delete_network_acl should succeed");
+}
+
+#[tokio::test]
+async fn delete_network_acl_nonexistent_is_ok() {
+    let client = client();
+
+    client
+        .delete_network_acl("lxdc-definitely-does-not-exist-acl")
+        .await
+        .expect("delete_network_acl on a nonexistent ACL should return Ok");
+}
+
+#[tokio::test]
+async fn push_file_into_stopped_instance() {
+    let client = client();
+    let name = unique_name();
+
+    let create_op = client
+        .create_instance(
+            &name,
+            TEST_IMAGE_ALIAS,
+            HashMap::new(),
+            sandbox_devices(),
+            vec![],
+            false,
+        )
+        .await
+        .expect("create_instance should succeed");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        client.wait_operation(&create_op.id),
+    )
+    .await
+    .expect("create should not time out")
+    .expect("create should succeed");
+
+    client
+        .push_file_into_instance(&name, "/etc/openshell-test", b"hello from test")
+        .await
+        .expect("push_file_into_instance should succeed on a stopped container");
+
+    // Verify overwrite works.
+    client
+        .push_file_into_instance(&name, "/etc/openshell-test", b"updated content")
+        .await
+        .expect("push_file_into_instance should overwrite an existing file");
+
+    let delete_op = client
+        .delete_instance(&name)
+        .await
+        .expect("delete_instance should succeed");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        client.wait_operation(&delete_op.id),
+    )
+    .await
+    .expect("delete should not time out")
+    .expect("delete should succeed");
 }
