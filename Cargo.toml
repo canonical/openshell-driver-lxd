@@ -19,7 +19,7 @@ prost-types = "0.14"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 futures = "0.3"
 
 # CLI

@@ -7,13 +7,16 @@ use std::pin::Pin;
 
 use computev1::pb::compute_driver_server::ComputeDriver;
 use computev1::pb::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest,
+    watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
+    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesRequest,
 };
 use futures::Stream;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use crate::driver::LxdComputeDriver;
@@ -22,12 +25,20 @@ use crate::error::DriverError;
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
     driver: LxdComputeDriver,
+    /// Published on every successful DeleteSandbox so WatchSandboxes can emit
+    /// Deleted events and the gateway immediately removes the sandbox from its
+    /// store rather than waiting for the next reconcile cycle.
+    deletion_tx: broadcast::Sender<String>,
 }
 
 impl ComputeDriverService {
     #[must_use]
     pub fn new(driver: LxdComputeDriver) -> Self {
-        Self { driver }
+        let (deletion_tx, _) = broadcast::channel(64);
+        Self {
+            driver,
+            deletion_tx,
+        }
     }
 }
 
@@ -110,8 +121,15 @@ impl ComputeDriver for ComputeDriverService {
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
         let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
-        let deleted = self.driver.delete_sandbox(name).await?.is_some();
-        Ok(Response::new(DeleteSandboxResponse { deleted }))
+        match self.driver.delete_sandbox(name).await? {
+            Some(sandbox_id) => {
+                if !sandbox_id.is_empty() {
+                    self.deletion_tx.send(sandbox_id).ok();
+                }
+                Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+            }
+            None => Ok(Response::new(DeleteSandboxResponse { deleted: false })),
+        }
     }
 
     type WatchSandboxesStream =
@@ -121,6 +139,17 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        Err(DriverError::Unimplemented("watch_sandboxes").into())
+        let rx = self.deletion_tx.subscribe();
+        let stream = BroadcastStream::new(rx).map(|result| match result {
+            Ok(sandbox_id) => Ok(WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                    WatchSandboxesDeletedEvent { sandbox_id },
+                )),
+            }),
+            Err(BroadcastStreamRecvError::Lagged(n)) => Err(Status::data_loss(format!(
+                "WatchSandboxes receiver lagged and missed {n} event(s); reconnect and re-list to resync"
+            ))),
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 }
