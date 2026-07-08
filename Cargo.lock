@@ -574,6 +574,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
+name = "lxd-client"
+version = "0.1.0"
+dependencies = [
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -645,6 +659,7 @@ dependencies = [
  "clap",
  "computev1",
  "futures",
+ "lxd-client",
  "prost-types",
  "thiserror",
  "tokio",
@@ -897,6 +912,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9a8e94ea7f378bd32cbbd37198a4a91436180c5bb472411e48b5ec2e2124ae9e"
 dependencies = [
  "serde_core",
+ "serde_derive",
 ]
 
 [[package]]

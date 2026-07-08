@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+name = "lxd-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Async HTTP client for the LXD REST API over a Unix domain socket"
+
+[dependencies]
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
