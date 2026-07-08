@@ -56,18 +56,29 @@ impl<T> LxdResponse<T> {
 /// `GET /1.0/instances/<name>` and `GET /1.0/instances?recursion=1`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Instance {
+    /// Instance name (unique within a project).
     pub name: String,
+    /// Human-readable description.
     pub description: String,
+    /// Current lifecycle status string (e.g. `"Running"`, `"Stopped"`).
     pub status: String,
+    /// Numeric LXD status code corresponding to `status`.
     pub status_code: u16,
+    /// CPU architecture (e.g. `"x86_64"`).
     #[serde(default)]
     pub architecture: String,
+    /// Whether the instance is ephemeral (deleted on stop).
     pub ephemeral: bool,
+    /// LXD profiles applied to the instance, in order.
     pub profiles: Vec<String>,
+    /// Raw LXD instance config keys (e.g. `limits.cpu`, `user.*`).
     pub config: HashMap<String, String>,
+    /// Device configuration map (device name to key/value config).
     pub devices: HashMap<String, HashMap<String, String>>,
+    /// Instance type: `"container"` or `"virtual-machine"`.
     #[serde(rename = "type")]
     pub type_: String,
+    /// LXD project the instance belongs to.
     pub project: String,
 }
 
@@ -75,24 +86,32 @@ pub struct Instance {
 /// `GET /1.0/instances/<name>/state`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceState {
+    /// Current lifecycle status string (e.g. `"Running"`, `"Stopped"`).
     pub status: String,
+    /// Numeric LXD status code corresponding to `status`.
     pub status_code: u16,
-    /// `null` rather than `{}` when the instance is stopped.
+    /// Per-device disk usage. `null` rather than `{}` when the instance is stopped.
     #[serde(default, deserialize_with = "null_to_default")]
     pub disk: HashMap<String, InstanceStateDisk>,
+    /// Memory usage summary.
     pub memory: InstanceStateMemory,
-    /// `null` rather than `{}` when the instance is stopped.
+    /// Per-interface network state. `null` rather than `{}` when the instance is stopped.
     #[serde(default, deserialize_with = "null_to_default")]
     pub network: HashMap<String, InstanceStateNetwork>,
+    /// PID of the instance's init process on the host, or `0` if stopped.
     pub pid: i64,
+    /// Number of processes running inside the instance.
     pub processes: i64,
+    /// CPU usage summary.
     pub cpu: InstanceStateCpu,
 }
 
 /// Disk usage for one device in [`InstanceState::disk`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceStateDisk {
+    /// Bytes used on the device.
     pub usage: i64,
+    /// Total capacity of the device in bytes, or `0` if unknown.
     #[serde(default)]
     pub total: i64,
 }
@@ -100,13 +119,18 @@ pub struct InstanceStateDisk {
 /// Memory usage section of [`InstanceState`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceStateMemory {
+    /// Current RSS memory usage in bytes.
     pub usage: i64,
+    /// Peak RSS memory usage in bytes.
     #[serde(default)]
     pub usage_peak: i64,
+    /// Total host memory available to the instance in bytes.
     #[serde(default)]
     pub total: i64,
+    /// Current swap usage in bytes.
     #[serde(default)]
     pub swap_usage: i64,
+    /// Peak swap usage in bytes.
     #[serde(default)]
     pub swap_usage_peak: i64,
 }
@@ -114,6 +138,7 @@ pub struct InstanceStateMemory {
 /// CPU usage section of [`InstanceState`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceStateCpu {
+    /// Cumulative CPU time used by the instance in nanoseconds.
     pub usage: i64,
 }
 
@@ -123,16 +148,22 @@ pub struct InstanceStateCpu {
 /// under `addresses`, not as a flat field on this struct.
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceStateNetwork {
+    /// IP addresses assigned to this interface.
     #[serde(default)]
     pub addresses: Vec<InstanceStateNetworkAddress>,
+    /// MAC address of the interface.
     #[serde(default)]
     pub hwaddr: String,
+    /// Host-side veth interface name.
     #[serde(default)]
     pub host_name: String,
+    /// MTU of the interface in bytes.
     #[serde(default)]
     pub mtu: i64,
+    /// Interface state: `"up"` or `"down"`.
     #[serde(default)]
     pub state: String,
+    /// Interface type (e.g. `"broadcast"`, `"loopback"`).
     #[serde(rename = "type", default)]
     pub type_: String,
 }
@@ -140,10 +171,14 @@ pub struct InstanceStateNetwork {
 /// A single address entry within [`InstanceStateNetwork::addresses`].
 #[derive(Debug, Clone, Deserialize)]
 pub struct InstanceStateNetworkAddress {
+    /// Address family: `"inet"` (IPv4) or `"inet6"` (IPv6).
     pub family: String,
+    /// The IP address as a string (e.g. `"10.0.0.5"`).
     pub address: String,
+    /// Prefix length as a string (e.g. `"24"`).
     #[serde(default)]
     pub netmask: String,
+    /// Address scope: `"global"`, `"link"`, or `"local"`.
     #[serde(default)]
     pub scope: String,
 }
@@ -152,17 +187,25 @@ pub struct InstanceStateNetworkAddress {
 /// instance endpoint and by `GET /1.0/operations/<id>/wait`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Operation {
+    /// Bare UUID of the operation (without the `/1.0/operations/` prefix).
     pub id: String,
+    /// Operation class: `"task"`, `"websocket"`, or `"token"`.
     #[serde(default)]
     pub class: String,
+    /// Human-readable description (e.g. `"Creating container"`).
     #[serde(default)]
     pub description: String,
+    /// Terminal status: `Success`, `Failure`, or intermediate `Running`.
     pub status: OperationStatus,
+    /// Numeric LXD status code corresponding to `status`.
     pub status_code: u16,
+    /// Resources affected by the operation (e.g. `{"instances": ["/1.0/instances/foo"]}`).
     #[serde(default)]
     pub resources: HashMap<String, Vec<String>>,
+    /// Error message if the operation failed; empty string on success.
     #[serde(default)]
     pub err: String,
+    /// Cluster member the operation is running on.
     #[serde(default)]
     pub location: String,
 }
@@ -200,6 +243,7 @@ impl<'de> Deserialize<'de> for OperationStatus {
 /// Server info, as returned by `GET /1.0`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LxdServerInfo {
+    /// List of API extension names supported by this LXD server.
     #[serde(default)]
     pub api_extensions: Vec<String>,
 }
