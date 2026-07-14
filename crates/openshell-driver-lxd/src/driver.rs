@@ -3,6 +3,7 @@
 //! Core LXD compute driver logic, independent of the gRPC transport.
 
 use computev1::pb::GetCapabilitiesResponse;
+use lxd_client::LxdClient;
 
 use crate::config::Config;
 
@@ -12,12 +13,13 @@ const DRIVER_NAME: &str = "lxd";
 #[derive(Debug, Clone)]
 pub struct LxdComputeDriver {
     config: Config,
+    lxd: LxdClient,
 }
 
 impl LxdComputeDriver {
     #[must_use]
-    pub fn new(config: Config) -> Self {
-        Self { config }
+    pub fn new(config: Config, lxd: LxdClient) -> Self {
+        Self { config, lxd }
     }
 
     /// Report driver capabilities and defaults.
@@ -33,14 +35,20 @@ impl LxdComputeDriver {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use clap::Parser;
+    use lxd_client::LxdEndpoint;
 
     use super::*;
+    use crate::config::DEFAULT_LXD_SOCKET;
 
     #[test]
     fn capabilities_reports_static_fields() {
         let config = Config::parse_from(["openshell-driver-lxd"]);
-        let driver = LxdComputeDriver::new(config);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+        let driver = LxdComputeDriver::new(config, lxd);
 
         let response = driver.capabilities();
 
