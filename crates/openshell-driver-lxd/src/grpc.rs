@@ -96,16 +96,22 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("stop_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
+        self.driver.stop_sandbox(name).await?;
+        Ok(Response::new(StopSandboxResponse {}))
     }
 
     async fn delete_sandbox(
         &self,
-        _request: Request<DeleteSandboxRequest>,
+        request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("delete_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
+        let deleted = self.driver.delete_sandbox(name).await?.is_some();
+        Ok(Response::new(DeleteSandboxResponse { deleted }))
     }
 
     type WatchSandboxesStream =

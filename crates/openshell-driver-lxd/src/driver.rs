@@ -212,6 +212,64 @@ impl LxdComputeDriver {
         let port = self.config.gateway_grpc_port;
         Ok(format!("http://{host_ip}:{port}"))
     }
+
+    pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
+        self.get_managed_instance(name).await?;
+
+        let op = match self.lxd.stop_instance(name, false).await {
+            // LXD returns 400 with "not running" when the instance is already stopped.
+            Err(LxdError::Api {
+                status_code: 400,
+                ref message,
+            }) if message.contains("not running") || message.contains("already stopped") => {
+                return Ok(())
+            }
+            other => other?,
+        };
+        self.lxd.wait_operation(&op.id).await?;
+        Ok(())
+    }
+
+    /// Deletes a sandbox by instance name, idempotently.
+    ///
+    /// Returns `Some(sandbox_id)` (the `user.openshell.sandbox_id` from the
+    /// instance config, used by the gRPC layer to broadcast a WatchSandboxes
+    /// Deleted event) if the sandbox was deleted, or `None` if it was not
+    /// found — the caller may retry safely.
+    pub async fn delete_sandbox(&self, name: &str) -> Result<Option<String>, DriverError> {
+        let instance = match self.lxd.get_instance(name).await {
+            Ok(i) => i,
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let Some(sandbox_id) = instance.config.get(mapping::KEY_SANDBOX_ID).cloned() else {
+            // Not driver-managed: treat as not found rather than deleting an
+            // arbitrary LXD instance the caller happened to name correctly.
+            return Ok(None);
+        };
+
+        // Force-stop before deleting; LXD rejects deletion of running instances.
+        match self.lxd.stop_instance(name, true).await {
+            Ok(op) => {
+                self.lxd.wait_operation(&op.id).await?;
+            }
+            Err(LxdError::Api {
+                status_code: 400, ..
+            }) => {} // already stopped
+            Err(e) => return Err(e.into()),
+        }
+
+        let op = match self.lxd.delete_instance(name).await {
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => return Ok(None),
+            other => other?,
+        };
+        self.wait_operation(&op.id).await?;
+        Ok(Some(sandbox_id))
+    }
 }
 
 #[cfg(test)]
