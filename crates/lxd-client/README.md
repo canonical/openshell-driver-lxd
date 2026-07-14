@@ -40,11 +40,25 @@ let lxd = LxdClient::new(LxdEndpoint::Https(LxdHttpsConfig {
 - `get_instance(name)` / `get_instance_state(name)` / `list_instances()`
 - `start_instance(name)` / `stop_instance(name, force)`
 - `delete_instance(name)`
+- `push_file_into_instance(name, guest_path, content)` — writes directly into the container overlay; container need not be running
 
 **Operation waiting** (`operations.rs`)
 
 - `get_operation(id)` — non-blocking fetch of current operation state
 - `wait_operation(id)` — subscribes to `GET /1.0/events?type=operation` via WebSocket and waits for the terminal event; falls back to REST long-poll if WebSocket is unavailable; reconciles on reconnect to close the subscribe/check race
+
+**Event streaming** (`events.rs`)
+
+- `subscribe_events(types)` — opens a WebSocket to `GET /1.0/events?type=<types>` and returns a `Stream<Item = Result<LxdEvent, LxdError>>`
+
+**Networks** (`networks.rs`)
+
+- `get_network(name)`
+
+**Network ACLs** (`acls.rs`)
+
+- `ensure_network_acl(name, egress)` — idempotent create-or-replace
+- `delete_network_acl(name)` — 404 treated as success
 
 **Resource quantity conversion** (`resources.rs`)
 
