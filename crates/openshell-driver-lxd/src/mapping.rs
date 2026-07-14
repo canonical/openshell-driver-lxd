@@ -227,7 +227,7 @@ fn storage_pool(template: &DriverSandboxTemplate) -> &str {
     struct_get_str(template.driver_config.as_ref(), "storage_pool").unwrap_or(DEFAULT_STORAGE_POOL)
 }
 
-fn is_valid_label_key(key: &str) -> bool {
+pub(crate) fn is_valid_label_key(key: &str) -> bool {
     !key.is_empty()
         && key
             .chars()
@@ -252,4 +252,27 @@ fn struct_get_str_list(s: Option<&Struct>, key: &str) -> Vec<String> {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_create_devices_omits_gpu_by_default() {
+        let devices = build_create_devices(&DriverSandboxTemplate::default(), false);
+
+        assert!(!devices.contains_key("gpu0"));
+        assert!(devices.contains_key("root"));
+        assert!(devices.contains_key("eth0"));
+    }
+
+    #[test]
+    fn build_create_devices_attaches_gpu_when_requested() {
+        let devices = build_create_devices(&DriverSandboxTemplate::default(), true);
+
+        let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
+        assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
+        assert_eq!(gpu0.get("gputype"), Some(&"physical".to_string()));
+    }
 }

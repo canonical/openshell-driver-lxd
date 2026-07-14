@@ -31,6 +31,14 @@ impl ComputeDriverService {
     }
 }
 
+fn resolve_name<'a>(sandbox_name: &'a str, _sandbox_id: &'a str) -> Result<&'a str, Status> {
+    if !sandbox_name.is_empty() {
+        Ok(sandbox_name)
+    } else {
+        Err(DriverError::InvalidArgument("sandbox_name is required".to_string()).into())
+    }
+}
+
 #[tonic::async_trait]
 impl ComputeDriver for ComputeDriverService {
     async fn get_capabilities(
@@ -42,30 +50,48 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn validate_sandbox_create(
         &self,
-        _request: Request<ValidateSandboxCreateRequest>,
+        request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        Err(DriverError::Unimplemented("validate_sandbox_create").into())
+        let sandbox = request.into_inner().sandbox.ok_or_else(|| {
+            Status::from(DriverError::InvalidArgument(
+                "sandbox is required".to_string(),
+            ))
+        })?;
+        self.driver.validate_sandbox_create(&sandbox).await?;
+        Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
     async fn get_sandbox(
         &self,
-        _request: Request<GetSandboxRequest>,
+        request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("get_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
+        let sandbox = self.driver.get_sandbox(name).await?;
+        Ok(Response::new(GetSandboxResponse {
+            sandbox: Some(sandbox),
+        }))
     }
 
     async fn list_sandboxes(
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Err(DriverError::Unimplemented("list_sandboxes").into())
+        let sandboxes = self.driver.list_sandboxes().await?;
+        Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
     async fn create_sandbox(
         &self,
-        _request: Request<CreateSandboxRequest>,
+        request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("create_sandbox").into())
+        let sandbox = request.into_inner().sandbox.ok_or_else(|| {
+            Status::from(DriverError::InvalidArgument(
+                "sandbox is required".to_string(),
+            ))
+        })?;
+        self.driver.create_sandbox(&sandbox).await?;
+        Ok(Response::new(CreateSandboxResponse {}))
     }
 
     async fn stop_sandbox(
