@@ -1,36 +1,295 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-//! Raw HTTP transport over the LXD REST API Unix domain socket.
+//! Raw HTTP transport over the LXD REST API.
 //!
-//! Opens a fresh HTTP/1.1 connection per request.
+//! Opens a fresh HTTP/1.1 connection per request, over either a Unix domain
+//! socket (local LXD snap) or HTTPS+mTLS (remote LXD cluster).
 
+use std::fmt;
 use std::path::PathBuf;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
-use hyper::{Method, Request};
+use hyper::{Method, Request, Uri};
 use hyper_util::rt::TokioIo;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 
 use crate::error::LxdError;
 use crate::types::LxdResponse;
 
-/// Async client for the LXD REST API, talking exclusively over a Unix
-/// domain socket.
+/// A unified raw transport stream used for WebSocket connections.
+///
+/// Both variants implement [`AsyncRead`] + [`AsyncWrite`] + [`Unpin`], allowing
+/// `tokio_tungstenite::client_async` to work over either transport without
+/// generics bubbling up into the public API.
+pub(crate) enum RawStream {
+    /// Local LXD daemon over a Unix domain socket.
+    Unix(UnixStream),
+    /// Remote LXD cluster; TLS handshake already completed.
+    Tls(Box<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>),
+}
+
+impl RawStream {
+    fn as_read(&mut self) -> Pin<&mut (dyn AsyncRead + Unpin)> {
+        match self {
+            RawStream::Unix(s) => Pin::new(s),
+            RawStream::Tls(s) => Pin::new(s),
+        }
+    }
+
+    fn as_write(&mut self) -> Pin<&mut (dyn AsyncWrite + Unpin)> {
+        match self {
+            RawStream::Unix(s) => Pin::new(s),
+            RawStream::Tls(s) => Pin::new(s),
+        }
+    }
+}
+
+impl Unpin for RawStream {}
+
+impl AsyncRead for RawStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.get_mut().as_read().poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for RawStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.get_mut().as_write().poll_write(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().as_write().poll_flush(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.get_mut().as_write().poll_shutdown(cx)
+    }
+}
+
+/// Transport endpoint for [`LxdClient`].
 #[derive(Debug, Clone)]
+pub enum LxdEndpoint {
+    /// Local LXD daemon over a Unix domain socket.
+    UnixSocket(PathBuf),
+    /// Remote LXD cluster over HTTPS with mutual TLS.
+    Https(LxdHttpsConfig),
+}
+
+/// Configuration for HTTPS+mTLS connections to a remote LXD cluster.
+#[derive(Debug, Clone)]
+pub struct LxdHttpsConfig {
+    /// LXD HTTPS endpoint, e.g. `"https://10.0.0.1:8443"`.
+    pub url: String,
+    /// Path to the PEM-encoded client certificate for mTLS.
+    pub client_cert: PathBuf,
+    /// Path to the PEM-encoded client private key for mTLS.
+    pub client_key: PathBuf,
+    /// Path to a PEM-encoded CA certificate to verify the server cert.
+    /// `None` uses the webpki CA bundle.
+    pub server_ca: Option<PathBuf>,
+}
+
+impl LxdHttpsConfig {
+    /// Parses and validates `url`, requiring a host component.
+    ///
+    /// Called once at [`LxdClient::new`] so a malformed URL fails fast at
+    /// construction rather than silently connecting to a fallback host.
+    pub(crate) fn parsed_url(&self) -> Result<Uri, LxdError> {
+        let uri: Uri = self.url.parse().map_err(|e| LxdError::Tls {
+            reason: format!("invalid LXD URL {:?}: {e}", self.url),
+        })?;
+        if uri.host().is_none() {
+            return Err(LxdError::Tls {
+                reason: format!("LXD URL {:?} has no host", self.url),
+            });
+        }
+        Ok(uri)
+    }
+
+    pub(crate) fn host_port(&self) -> Result<String, LxdError> {
+        let uri = self.parsed_url()?;
+        let host = uri.host().ok_or_else(|| LxdError::Tls {
+            reason: format!("LXD URL {:?} has no host", self.url),
+        })?;
+        let port = uri.port_u16().unwrap_or(8443);
+        if host.contains(':') {
+            Ok(format!("[{host}]:{port}")) // re-bracket IPv6 for TcpStream::connect
+        } else {
+            Ok(format!("{host}:{port}"))
+        }
+    }
+
+    fn hostname(&self) -> Result<String, LxdError> {
+        // Uri::host() strips IPv6 brackets automatically
+        let uri = self.parsed_url()?;
+        let host = uri.host().ok_or_else(|| LxdError::Tls {
+            reason: format!("LXD URL {:?} has no host", self.url),
+        })?;
+        Ok(host.to_string())
+    }
+
+    pub(crate) fn server_name(&self) -> Result<rustls::pki_types::ServerName<'static>, LxdError> {
+        rustls::pki_types::ServerName::try_from(self.hostname()?).map_err(|e| LxdError::Tls {
+            reason: format!("invalid server name: {e}"),
+        })
+    }
+
+    pub(crate) fn build_connector(&self) -> Result<tokio_rustls::TlsConnector, LxdError> {
+        use std::fs::File;
+        use std::io::BufReader;
+        use std::sync::Arc;
+
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        use rustls_pemfile::{certs, private_key};
+
+        let cert_file = File::open(&self.client_cert).map_err(|e| LxdError::Tls {
+            reason: format!("cannot open client cert: {e}"),
+        })?;
+        let client_certs: Vec<CertificateDer<'static>> = certs(&mut BufReader::new(cert_file))
+            .collect::<Result<_, _>>()
+            .map_err(|e| LxdError::Tls {
+                reason: format!("invalid client cert PEM: {e}"),
+            })?;
+
+        let key_file = File::open(&self.client_key).map_err(|e| LxdError::Tls {
+            reason: format!("cannot open client key: {e}"),
+        })?;
+        let key: PrivateKeyDer<'static> = private_key(&mut BufReader::new(key_file))
+            .map_err(|e| LxdError::Tls {
+                reason: format!("invalid client key PEM: {e}"),
+            })?
+            .ok_or_else(|| LxdError::Tls {
+                reason: "no private key in PEM file".into(),
+            })?;
+
+        let root_store = if let Some(ca_path) = &self.server_ca {
+            let ca_file = File::open(ca_path).map_err(|e| LxdError::Tls {
+                reason: format!("cannot open server CA: {e}"),
+            })?;
+            let ca_certs: Vec<CertificateDer<'static>> = certs(&mut BufReader::new(ca_file))
+                .collect::<Result<_, _>>()
+                .map_err(|e| LxdError::Tls {
+                    reason: format!("invalid server CA PEM: {e}"),
+                })?;
+            let mut store = rustls::RootCertStore::empty();
+            for cert in ca_certs {
+                store.add(cert).map_err(|e| LxdError::Tls {
+                    reason: format!("invalid CA cert: {e}"),
+                })?;
+            }
+            store
+        } else {
+            let mut store = rustls::RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            store
+        };
+
+        let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| LxdError::Tls {
+            reason: format!("TLS protocol error: {e}"),
+        })?
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(client_certs, key)
+        .map_err(|e| LxdError::Tls {
+            reason: format!("TLS cert error: {e}"),
+        })?;
+
+        Ok(tokio_rustls::TlsConnector::from(Arc::new(tls_config)))
+    }
+}
+
+/// Async client for the LXD REST API.
+///
+/// Opens a fresh connection per request. Use [`LxdEndpoint::UnixSocket`] for a
+/// local LXD snap installation, or [`LxdEndpoint::Https`] for a remote LXD
+/// cluster over HTTPS+mTLS.
+#[derive(Clone)]
 pub struct LxdClient {
-    socket_path: PathBuf,
+    endpoint: LxdEndpoint,
+    /// Pre-built TLS connector, cached at construction to avoid re-reading cert
+    /// files on every request.
+    tls_connector: Option<tokio_rustls::TlsConnector>,
 }
 
 impl LxdClient {
-    /// Creates a client for the LXD REST API socket at `socket_path`.
+    /// Creates a client for the given [`LxdEndpoint`].
     ///
-    /// Performs no I/O; the socket is connected fresh for every request.
-    #[must_use]
-    pub fn new(socket_path: PathBuf) -> Self {
-        Self { socket_path }
+    /// For [`LxdEndpoint::UnixSocket`] this is infallible in practice.
+    /// For [`LxdEndpoint::Https`] this validates the URL and reads cert files
+    /// from disk once to build the [`tokio_rustls::TlsConnector`]; subsequent
+    /// requests reuse it.
+    pub fn new(endpoint: LxdEndpoint) -> Result<Self, LxdError> {
+        let tls_connector = match &endpoint {
+            LxdEndpoint::UnixSocket(_) => None,
+            LxdEndpoint::Https(config) => {
+                config.parsed_url()?;
+                Some(config.build_connector()?)
+            }
+        };
+        Ok(Self {
+            endpoint,
+            tls_connector,
+        })
+    }
+
+    /// WebSocket scheme for the configured endpoint (`"ws"` or `"wss"`).
+    pub(crate) fn ws_scheme(&self) -> &'static str {
+        match &self.endpoint {
+            LxdEndpoint::UnixSocket(_) => "ws",
+            LxdEndpoint::Https(_) => "wss",
+        }
+    }
+
+    /// Opens a raw transport connection without layering HTTP on top.
+    ///
+    /// Used by [`crate::events`] to hand a connected stream to
+    /// `tokio_tungstenite::client_async` for the WebSocket upgrade.
+    pub(crate) async fn connect_raw(&self) -> Result<(RawStream, String), LxdError> {
+        match &self.endpoint {
+            LxdEndpoint::UnixSocket(socket_path) => {
+                let stream = UnixStream::connect(socket_path).await?;
+                Ok((RawStream::Unix(stream), "localhost".to_string()))
+            }
+            LxdEndpoint::Https(config) => {
+                use tokio::net::TcpStream;
+                let connector = self.tls_connector.as_ref().ok_or_else(|| LxdError::Tls {
+                    reason: "internal error: no TLS connector for Https endpoint".to_string(),
+                })?;
+                let host = config.host_port()?;
+                let tcp = TcpStream::connect(&host).await?;
+                let server_name = config.server_name()?;
+                let tls = connector
+                    .connect(server_name, tcp)
+                    .await
+                    .map_err(LxdError::Io)?;
+                Ok((RawStream::Tls(Box::new(tls)), host))
+            }
+        }
+    }
+
+    /// Opens a fresh connection and returns an HTTP/1.1 sender plus the value
+    /// to use for the `Host` header.
+    async fn connect(
+        &self,
+    ) -> Result<(hyper::client::conn::http1::SendRequest<Full<Bytes>>, String), LxdError> {
+        let (raw, host) = self.connect_raw().await?;
+        let sender = do_handshake(TokioIo::new(raw)).await?;
+        Ok((sender, host))
     }
 
     /// Sends a request and deserializes the LXD response envelope's
@@ -44,15 +303,7 @@ impl LxdClient {
         path: &str,
         body: Option<Value>,
     ) -> Result<LxdResponse<T>, LxdError> {
-        let stream = UnixStream::connect(&self.socket_path).await?;
-        let io = TokioIo::new(stream);
-        let (mut sender, conn) = hyper::client::conn::http1::handshake(io).await?;
-
-        tokio::task::spawn(async move {
-            if let Err(err) = conn.await {
-                tracing::warn!(%err, "lxd-client: connection closed with error");
-            }
-        });
+        let (mut sender, host) = self.connect().await?;
 
         let body_bytes = match &body {
             Some(value) => serde_json::to_vec(value)?,
@@ -62,7 +313,7 @@ impl LxdClient {
         let mut builder = Request::builder()
             .method(method)
             .uri(path)
-            .header("Host", "localhost");
+            .header("Host", host);
         if body.is_some() {
             builder = builder.header("Content-Type", "application/json");
         }
@@ -72,22 +323,35 @@ impl LxdClient {
         let status = response.status();
         let body = response.into_body().collect().await?.to_bytes();
 
+        // Check HTTP status first so a non-JSON body (e.g. a proxy 502) surfaces
+        // as LxdError::Api with the real HTTP code rather than LxdError::Json.
+        if !status.is_success() {
+            let (status_code, message) =
+                serde_json::from_slice::<LxdResponse<serde_json::Value>>(&body)
+                    .ok()
+                    .filter(|r| r.type_ == "error")
+                    .map(|r| {
+                        let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                        // LXD's error envelope puts the real code in `error_code`.
+                        (r.error_code, msg)
+                    })
+                    .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
         let parsed: LxdResponse<T> = serde_json::from_slice(&body)?;
 
-        if parsed.type_ == "error" || !status.is_success() {
+        // LXD can return type="error" with 200 OK in edge cases.
+        if parsed.type_ == "error" {
             let message = parsed
                 .error
                 .clone()
-                .unwrap_or_else(|| format!("HTTP {status}"));
-            // LXD's error envelope reports the real numeric code in
-            // `error_code`, not `status_code` (which is left 0 for errors).
-            let status_code = if parsed.type_ == "error" {
-                parsed.error_code
-            } else {
-                status.as_u16()
-            };
+                .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
             return Err(LxdError::Api {
-                status_code,
+                status_code: parsed.error_code,
                 message,
             });
         }
@@ -124,4 +388,27 @@ impl LxdClient {
     ) -> Result<LxdResponse<T>, LxdError> {
         self.request(Method::DELETE, path, None).await
     }
+}
+
+impl fmt::Debug for LxdClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LxdClient")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
+
+async fn do_handshake<IO>(
+    io: IO,
+) -> Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>, LxdError>
+where
+    IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
+    tokio::task::spawn(async move {
+        if let Err(err) = conn.await {
+            tracing::warn!(%err, "lxd-client: connection closed with error");
+        }
+    });
+    Ok(sender)
 }

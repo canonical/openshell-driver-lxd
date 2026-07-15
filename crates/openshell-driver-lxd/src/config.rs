@@ -25,7 +25,8 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_SOCKET)]
     pub socket: PathBuf,
 
-    /// Path to the LXD REST API Unix domain socket.
+    /// Path to the LXD REST API Unix domain socket (local snap installation).
+    /// Ignored when --lxd-url is set.
     #[arg(long, default_value = DEFAULT_LXD_SOCKET)]
     pub lxd_socket: PathBuf,
 
@@ -36,4 +37,22 @@ pub struct Config {
     /// LXD image alias every sandbox is created from.
     #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     pub default_image: String,
+
+    /// Remote LXD HTTPS endpoint (e.g. https://10.0.0.1:8443).
+    /// When set, --lxd-socket is ignored and HTTPS+mTLS is used instead.
+    #[arg(long, requires_all = ["lxd_client_cert", "lxd_client_key"])]
+    pub lxd_url: Option<String>,
+
+    /// PEM client certificate for mTLS to a remote LXD (requires --lxd-url).
+    #[arg(long, requires_all = ["lxd_url", "lxd_client_key"])]
+    pub lxd_client_cert: Option<PathBuf>,
+
+    /// PEM client private key for mTLS to a remote LXD (requires --lxd-url).
+    #[arg(long, requires_all = ["lxd_url", "lxd_client_cert"])]
+    pub lxd_client_key: Option<PathBuf>,
+
+    /// PEM CA certificate to verify the remote LXD server cert.
+    /// Omit to use the built-in webpki CA bundle.
+    #[arg(long, requires = "lxd_url")]
+    pub lxd_server_ca: Option<PathBuf>,
 }
