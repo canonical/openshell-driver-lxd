@@ -1,4 +1,4 @@
-.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy proto sync-proto run clean
+.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy proto sync-proto run clean sandbox-image
 
 build:
 	cargo build --workspace
@@ -52,6 +52,11 @@ sync-proto:
 
 run:
 	cargo run -p openshell-driver-lxd -- $(ARGS)
+
+# Builds the sandbox container image and publishes it to the local LXD
+# image store under the openshell-sandbox alias.
+sandbox-image:
+	./scripts/build-sandbox-image.sh
 
 clean:
 	cargo clean
