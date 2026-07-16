@@ -1,4 +1,4 @@
-.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy proto sync-proto run clean sandbox-image
+.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean sandbox-image
 
 build:
 	cargo build --workspace
@@ -26,6 +26,18 @@ fmt-check:
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# Lints the shell scripts under scripts/.
+shellcheck:
+	shellcheck scripts/*.sh
+
+# Builds the API docs, treating warnings (e.g. broken intra-doc links) as
+# errors so documentation stays valid.
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
+# Runs all static checks: formatting, linting, shell linting, and docs.
+static-checks: fmt-check clippy shellcheck doc
 
 # Builds computev1 (and runs proto codegen if inputs changed).
 proto:
