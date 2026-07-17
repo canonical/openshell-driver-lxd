@@ -1,4 +1,4 @@
-.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean sandbox-image
+.PHONY: build release check test test-lxd-client test-driver setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean sandbox-image
 
 build:
 	cargo build --workspace
@@ -9,8 +9,14 @@ release:
 check:
 	cargo check --workspace --all-targets
 
-test: setup-lxd-test-env
-	cargo test --workspace
+test: test-lxd-client test-driver
+
+test-lxd-client: setup-lxd-test-env
+	cargo test -p lxd-client
+
+test-driver:
+	lxc image info openshell-sandbox >/dev/null 2>&1 || $(MAKE) sandbox-image
+	cargo test -p openshell-driver-lxd
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
