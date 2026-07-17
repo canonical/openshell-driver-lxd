@@ -23,6 +23,6 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --component rustfmt,clippy
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
       - name: Run static checks
         run: make static-checks
