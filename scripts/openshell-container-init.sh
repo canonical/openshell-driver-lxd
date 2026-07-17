@@ -25,9 +25,7 @@ ts() {
 #    matching upstream's convention).
 # ---------------------------------------------------------------------------
 mkdir -p /sandbox
-if ! chown 10001:10001 /sandbox 2>/dev/null; then
-    ts "WARN: chown /sandbox to 10001:10001 failed (user may not exist yet)"
-fi
+chown 10001:10001 /sandbox
 chmod 0755 /sandbox
 
 # ---------------------------------------------------------------------------
