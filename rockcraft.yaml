@@ -1,0 +1,64 @@
+name: openshell-container-image
+base: ubuntu@24.04
+adopt-info: openshell-sandbox
+version: git
+summary: OpenShell container image for LXD sandboxes
+description: |
+  Ubuntu Noble container image for OpenShell sandboxes, including the
+  openshell-sandbox supervisor and a container-adapted init wrapper.
+  Produced as an OCI rock and converted to a native LXD image by CI.
+
+platforms:
+  amd64:
+  arm64:
+
+parts:
+  users:
+    plugin: nil
+    override-overlay: |
+      groupadd --gid 10001 sandbox
+      useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin sandbox
+
+  openshell-sandbox:
+    plugin: nil
+    source:
+      - to amd64: https://github.com/NVIDIA/OpenShell/releases/download/v0.0.66/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
+      - to arm64: https://github.com/NVIDIA/OpenShell/releases/download/v0.0.66/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
+    source-type: tar
+    source-checksum:
+      - to amd64: sha256/ee991be552c57d2b372d11eed081bb1278ed41747f80837b3ec7861f877f11a3
+      - to arm64: sha256/3090fbf5aeb5b7670f03e0817f67a7d180268f85c226fc090ddc366794b061df
+    stage-packages:
+      - ca-certificates
+      - curl
+      - iproute2
+      - dhcpcd
+      - nftables
+      - python3
+      - sqlite3
+    override-pull: |
+      craftctl default
+      craftctl set version=v0.0.66
+    override-build: |
+      install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
+        "$CRAFT_PART_INSTALL/opt/openshell/bin/openshell-sandbox"
+
+  scripts:
+    plugin: nil
+    source: scripts
+    override-build: |
+      install -D -m 0755 openshell-container-init.sh \
+        "$CRAFT_PART_INSTALL/opt/openshell/bin/openshell-container-init.sh"
+
+  token-placeholder:
+    plugin: nil
+    override-build: |
+      # Create the mount point for the per-sandbox JWT token file. The
+      # driver pushes the real token into this path via the LXD files API
+      # (POST /1.0/instances/<name>/files, see push_file_into_instance in
+      # lxd-client) before starting the instance; LXD's file-push API needs
+      # the destination path to already exist. The empty placeholder here is
+      # overwritten by the real token at container-create time and is never
+      # read directly.
+      install -D -m 0600 /dev/null \
+        "$CRAFT_PART_INSTALL/etc/openshell/auth/sandbox.jwt"

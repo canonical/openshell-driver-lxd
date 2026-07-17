@@ -1,4 +1,4 @@
-.PHONY: build release check test setup-lxd-test-env fmt fmt-check clippy proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean sandbox-image
 
 build:
 	cargo build --workspace
@@ -9,8 +9,14 @@ release:
 check:
 	cargo check --workspace --all-targets
 
-test: setup-lxd-test-env
-	cargo test --workspace
+test: test-lxd-client test-driver
+
+test-lxd-client: setup-lxd-test-env
+	cargo test -p lxd-client
+
+test-driver:
+	lxc image info openshell-sandbox >/dev/null 2>&1 || $(MAKE) sandbox-image
+	cargo test -p openshell-driver-lxd
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
@@ -26,6 +32,18 @@ fmt-check:
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# Lints the shell scripts under scripts/.
+shellcheck:
+	shellcheck scripts/*.sh
+
+# Builds the API docs, treating warnings (e.g. broken intra-doc links) as
+# errors so documentation stays valid.
+doc:
+	RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
+
+# Runs all static checks: formatting, linting, shell linting, and docs.
+static-checks: fmt-check clippy shellcheck doc
 
 # Builds computev1 (and runs proto codegen if inputs changed).
 proto:
@@ -52,6 +70,11 @@ sync-proto:
 
 run:
 	cargo run -p openshell-driver-lxd -- $(ARGS)
+
+# Builds the sandbox container image and publishes it to the local LXD
+# image store under the openshell-sandbox alias.
+sandbox-image:
+	./scripts/build-sandbox-image.sh
 
 clean:
 	cargo clean
