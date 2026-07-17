@@ -20,14 +20,20 @@ parts:
       useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin sandbox
 
   openshell-sandbox:
-    plugin: nil
-    source:
-      - to amd64: https://github.com/NVIDIA/OpenShell/releases/download/v0.0.66/openshell-sandbox-x86_64-unknown-linux-gnu.tar.gz
-      - to arm64: https://github.com/NVIDIA/OpenShell/releases/download/v0.0.66/openshell-sandbox-aarch64-unknown-linux-gnu.tar.gz
-    source-type: tar
-    source-checksum:
-      - to amd64: sha256/ee991be552c57d2b372d11eed081bb1278ed41747f80837b3ec7861f877f11a3
-      - to arm64: sha256/3090fbf5aeb5b7670f03e0817f67a7d180268f85c226fc090ddc366794b061df
+    plugin: rust
+    source: https://github.com/NVIDIA/OpenShell.git
+    source-commit: d556748771c41cbbd4e4dd7cd9030c798afe2b7d # v0.0.86
+    source-subdir: crates/openshell-sandbox
+    build-packages:
+      - pkg-config
+      - libssl-dev
+      - protobuf-compiler
+      - libprotobuf-dev
+      - libclang-dev
+      - cmake
+      - build-essential
+      - clang
+      - libz3-dev
     stage-packages:
       - ca-certificates
       - curl
@@ -38,10 +44,9 @@ parts:
       - sqlite3
     override-pull: |
       craftctl default
-      craftctl set version=v0.0.66
-    override-build: |
-      install -D -m 0755 "$CRAFT_PART_SRC/openshell-sandbox" \
-        "$CRAFT_PART_INSTALL/opt/openshell/bin/openshell-sandbox"
+      craftctl set version=v0.0.86
+    organize:
+      bin/openshell-sandbox: opt/openshell/bin/openshell-sandbox
 
   scripts:
     plugin: nil
