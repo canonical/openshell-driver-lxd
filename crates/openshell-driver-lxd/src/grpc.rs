@@ -42,12 +42,31 @@ impl ComputeDriverService {
     }
 }
 
-fn resolve_name<'a>(sandbox_name: &'a str, _sandbox_id: &'a str) -> Result<&'a str, Status> {
+/// Resolves the instance name a request should act on. Prefers
+/// `sandbox_name` (the common case); when it's empty, falls back to
+/// looking up the instance whose `user.openshell.sandbox_id` config key
+/// matches `sandbox_id` — both fields exist on these requests precisely so
+/// callers can address a sandbox by either.
+async fn resolve_name(
+    driver: &LxdComputeDriver,
+    sandbox_name: &str,
+    sandbox_id: &str,
+) -> Result<String, Status> {
     if !sandbox_name.is_empty() {
-        Ok(sandbox_name)
-    } else {
-        Err(DriverError::InvalidArgument("sandbox_name is required".to_string()).into())
+        return Ok(sandbox_name.to_string());
     }
+    if sandbox_id.is_empty() {
+        return Err(DriverError::InvalidArgument(
+            "sandbox_name or sandbox_id is required".to_string(),
+        )
+        .into());
+    }
+    driver
+        .find_name_by_sandbox_id(sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            Status::not_found(format!("no sandbox found with sandbox_id {sandbox_id:?}"))
+        })
 }
 
 #[tonic::async_trait]
@@ -77,8 +96,8 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
-        let sandbox = self.driver.get_sandbox(name).await?;
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let sandbox = self.driver.get_sandbox(&name).await?;
         Ok(Response::new(GetSandboxResponse {
             sandbox: Some(sandbox),
         }))
@@ -110,8 +129,8 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
-        self.driver.stop_sandbox(name).await?;
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        self.driver.stop_sandbox(&name).await?;
         Ok(Response::new(StopSandboxResponse {}))
     }
 
@@ -120,8 +139,8 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&req.sandbox_name, &req.sandbox_id)?;
-        match self.driver.delete_sandbox(name).await? {
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        match self.driver.delete_sandbox(&name).await? {
             Some(sandbox_id) => {
                 if !sandbox_id.is_empty() {
                     self.deletion_tx.send(sandbox_id).ok();

@@ -140,6 +140,73 @@ async fn get_sandbox_unknown_name_returns_not_found() {
 }
 
 #[tokio::test]
+async fn get_sandbox_by_id_only_resolves_name() {
+    let service = service();
+    let name = unique_name();
+
+    service
+        .create_sandbox(Request::new(CreateSandboxRequest {
+            sandbox: Some(sandbox(&name)),
+        }))
+        .await
+        .expect("create_sandbox should succeed");
+
+    // The fixture sets DriverSandbox.id == name, so this exercises the
+    // sandbox_id-only fallback path in resolve_name: no sandbox_name is
+    // given, only sandbox_id, matching how a caller that only has the
+    // gateway-assigned ID would address the sandbox.
+    let got = service
+        .get_sandbox(Request::new(GetSandboxRequest {
+            sandbox_id: name.clone(),
+            sandbox_name: String::new(),
+        }))
+        .await
+        .expect("get_sandbox by id alone should succeed")
+        .into_inner()
+        .sandbox
+        .expect("response should carry a sandbox");
+    assert_eq!(got.name, name);
+
+    service
+        .delete_sandbox(Request::new(DeleteSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("delete_sandbox should succeed");
+}
+
+#[tokio::test]
+async fn get_sandbox_unknown_id_returns_not_found() {
+    let service = service();
+
+    let status = service
+        .get_sandbox(Request::new(GetSandboxRequest {
+            sandbox_id: "definitely-does-not-exist".to_string(),
+            sandbox_name: String::new(),
+        }))
+        .await
+        .expect_err("get_sandbox should fail for an unknown id");
+
+    assert_eq!(status.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn get_sandbox_empty_name_and_id_returns_invalid_argument() {
+    let service = service();
+
+    let status = service
+        .get_sandbox(Request::new(GetSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: String::new(),
+        }))
+        .await
+        .expect_err("get_sandbox should fail when both name and id are empty");
+
+    assert_eq!(status.code(), Code::InvalidArgument);
+}
+
+#[tokio::test]
 async fn unmanaged_instance_is_treated_as_not_found() {
     let service = service();
     let raw_lxd = raw_lxd_client();

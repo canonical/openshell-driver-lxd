@@ -155,6 +155,21 @@ impl LxdComputeDriver {
             .collect())
     }
 
+    /// Resolves an instance name from a gateway-assigned `sandbox_id` by
+    /// scanning driver-managed instances for a config match. Used as a
+    /// fallback when a request supplies only `sandbox_id`, not
+    /// `sandbox_name` — LXD itself has no by-id lookup, only by-name.
+    pub async fn find_name_by_sandbox_id(
+        &self,
+        sandbox_id: &str,
+    ) -> Result<Option<String>, DriverError> {
+        let instances = self.lxd.list_instances().await?;
+        Ok(instances
+            .into_iter()
+            .find(|i| i.config.get(mapping::KEY_SANDBOX_ID).map(String::as_str) == Some(sandbox_id))
+            .map(|i| i.name))
+    }
+
     pub async fn create_sandbox(&self, sandbox: &DriverSandbox) -> Result<(), DriverError> {
         self.validate_sandbox_create(sandbox).await?;
 
