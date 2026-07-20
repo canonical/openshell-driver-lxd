@@ -180,13 +180,30 @@ impl LxdComputeDriver {
         self.wait_operation(&op.id).await?;
 
         if has_token {
-            self.lxd
+            if let Err(push_err) = self
+                .lxd
                 .push_file_into_instance(
                     &sandbox.name,
                     mapping::GUEST_SANDBOX_TOKEN_PATH,
                     spec.sandbox_token.as_bytes(),
                 )
-                .await?;
+                .await
+            {
+                // The instance is stopped but unstarted; delete it rather than
+                // leaving an orphaned container.
+                let cleanup = async {
+                    let op = self.lxd.delete_instance(&sandbox.name).await?;
+                    self.wait_operation(&op.id).await
+                };
+                if let Err(e) = cleanup.await {
+                    tracing::warn!(
+                        name = %sandbox.name,
+                        %e,
+                        "failed to clean up instance after token push failure"
+                    );
+                }
+                return Err(push_err.into());
+            }
         }
 
         let op = self.lxd.start_instance(&sandbox.name).await?;
