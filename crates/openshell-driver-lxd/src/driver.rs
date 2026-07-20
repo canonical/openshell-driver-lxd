@@ -304,6 +304,9 @@ impl LxdComputeDriver {
                 }
             }
             Err(e) if is_already_stopped(&e) => {}
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => return Ok(None),
             Err(e) => return Err(e.into()),
         }
 
