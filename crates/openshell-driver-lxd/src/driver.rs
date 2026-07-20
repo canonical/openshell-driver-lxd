@@ -164,11 +164,16 @@ impl LxdComputeDriver {
         let devices = mapping::build_create_devices(template, gpu.is_some());
         let profiles = mapping::build_profiles(template);
 
-        let image = if template.image.is_empty() {
-            &self.config.default_image
-        } else {
-            &template.image
-        };
+        // v1: always use the configured default image; template.image is
+        // accepted by ValidateSandboxCreate but not yet consulted.
+        if !template.image.is_empty() {
+            tracing::debug!(
+                image = %template.image,
+                default = %self.config.default_image,
+                "template.image is ignored in v1; using default image"
+            );
+        }
+        let image = &self.config.default_image;
 
         // Create the instance stopped so we can push the token file before the
         // supervisor starts — avoids a race where the supervisor reads
