@@ -36,8 +36,10 @@ chmod 0755 /sandbox
 #    kernel-assigned IPv6 link-local address, and the supervisor can never
 #    reach the gateway over IPv4 (Network is unreachable). Run dhclient as
 #    a background daemon (not -1/one-shot) so the lease renews for
-#    longer-lived sandboxes, then briefly poll for the address before
-#    moving on.
+#    longer-lived sandboxes, then poll for the address before moving on.
+#    dhcpcd measured ~8s to acquire a lease on lxdbr0 in testing; poll for
+#    up to 20s so the supervisor doesn't start (and give up on policy
+#    fetch) before the lease actually lands.
 # ---------------------------------------------------------------------------
 # Ubuntu 24.04 ships /etc/resolv.conf as a symlink to systemd-resolved's stub,
 # which doesn't exist when systemd is not PID 1. Replace with a static file
@@ -71,7 +73,7 @@ if command -v dhclient >/dev/null 2>&1; then
 elif command -v dhcpcd >/dev/null 2>&1; then
     dhcpcd eth0 2>/dev/null &
 fi
-for _ in 1 2 3 4 5 6 7 8 9 10; do
+for _ in $(seq 1 40); do
     if ip -4 -o addr show eth0 2>/dev/null | grep -q 'inet '; then
         break
     fi
@@ -81,7 +83,7 @@ _eth0_addr=$(ip -4 -o addr show eth0 2>/dev/null | awk '{print $4}') || true
 if [ -n "$_eth0_addr" ]; then
     ts "eth0 acquired IPv4: ${_eth0_addr}"
 else
-    ts "WARN: eth0 did not acquire an IPv4 address within 5s"
+    ts "WARN: eth0 did not acquire an IPv4 address within 20s"
 fi
 
 # ---------------------------------------------------------------------------
