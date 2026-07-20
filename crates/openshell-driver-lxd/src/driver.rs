@@ -13,6 +13,30 @@ use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
 
+/// Returns true if `err` indicates the instance was already stopped.
+///
+/// Covers both cases: LXD rejects the stop request synchronously with a
+/// 400, or accepts it and the operation fails asynchronously once it
+/// discovers the instance already reached the target state.
+fn is_already_stopped(err: &LxdError) -> bool {
+    let message = match err {
+        LxdError::Api {
+            status_code: 400,
+            message,
+        } => message,
+        LxdError::OperationFailed { err, .. } => err,
+        LxdError::Api { .. }
+        | LxdError::InvalidQuantity { .. }
+        | LxdError::Io(_)
+        | LxdError::Hyper(_)
+        | LxdError::Http(_)
+        | LxdError::Json(_)
+        | LxdError::Tls { .. }
+        | LxdError::WebSocket { .. } => return false,
+    };
+    message.contains("not running") || message.contains("already stopped")
+}
+
 /// LXD compute driver.
 #[derive(Debug, Clone)]
 pub struct LxdComputeDriver {
@@ -239,16 +263,14 @@ impl LxdComputeDriver {
         self.get_managed_instance(name).await?;
 
         let op = match self.lxd.stop_instance(name, false).await {
-            // LXD returns 400 with "not running" when the instance is already stopped.
-            Err(LxdError::Api {
-                status_code: 400,
-                ref message,
-            }) if message.contains("not running") || message.contains("already stopped") => {
-                return Ok(())
-            }
+            Err(e) if is_already_stopped(&e) => return Ok(()),
             other => other?,
         };
-        self.lxd.wait_operation(&op.id).await?;
+        if let Err(e) = self.wait_operation(&op.id).await {
+            if !matches!(&e, DriverError::Lxd(lxd_err) if is_already_stopped(lxd_err)) {
+                return Err(e);
+            }
+        }
         Ok(())
     }
 
@@ -275,11 +297,13 @@ impl LxdComputeDriver {
         // Force-stop before deleting; LXD rejects deletion of running instances.
         match self.lxd.stop_instance(name, true).await {
             Ok(op) => {
-                self.lxd.wait_operation(&op.id).await?;
+                if let Err(e) = self.wait_operation(&op.id).await {
+                    if !matches!(&e, DriverError::Lxd(lxd_err) if is_already_stopped(lxd_err)) {
+                        return Err(e);
+                    }
+                }
             }
-            Err(LxdError::Api {
-                status_code: 400, ..
-            }) => {} // already stopped
+            Err(e) if is_already_stopped(&e) => {}
             Err(e) => return Err(e.into()),
         }
 
