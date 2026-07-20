@@ -9,7 +9,7 @@ use lxd_client::{LxdClient, LxdEndpoint, LxdHttpsConfig};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use openshell_driver_lxd::config::Config;
@@ -73,6 +73,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!(socket = %config.socket.display(), "Starting OpenShell LXD compute driver");
 
     let lxd = LxdClient::new(endpoint)?;
+
+    // Fail fast with a clear diagnostic rather than letting the first
+    // create_sandbox call surface an opaque LXD 404. Only the check itself
+    // failing (e.g. LXD not reachable yet) is non-fatal here — that failure
+    // mode is already surfaced clearly wherever it's next hit.
+    match lxd.image_alias_exists(&config.default_image).await {
+        Ok(false) => {
+            error!(
+                image = %config.default_image,
+                "default sandbox image alias not found in LXD; run `make sandbox-image` \
+                 (or import it under this alias) before starting the driver"
+            );
+            std::process::exit(1);
+        }
+        Ok(true) => {}
+        Err(e) => {
+            warn!(
+                image = %config.default_image,
+                %e,
+                "could not verify default sandbox image alias exists; continuing anyway"
+            );
+        }
+    }
+
     let driver = LxdComputeDriver::new(config, lxd);
     let service = ComputeDriverService::new(driver);
 
