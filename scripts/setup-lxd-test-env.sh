@@ -32,7 +32,7 @@ if ! lxc network show lxdbr0 >/dev/null 2>&1; then
     lxc network create lxdbr0
 fi
 
-if ! lxc image alias show "${IMAGE_ALIAS}" >/dev/null 2>&1; then
+if ! lxc image info "local:${IMAGE_ALIAS}" >/dev/null 2>&1; then
     echo "Staging ${IMAGE_SOURCE} as image alias ${IMAGE_ALIAS}..."
     lxc image copy "${IMAGE_SOURCE}" local: --alias "${IMAGE_ALIAS}"
 fi

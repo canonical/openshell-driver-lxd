@@ -56,7 +56,7 @@ sudo "$LXD_CONVERT" --type container \
     --non-interactive
 
 echo "==> lxc publish --alias $ALIAS"
-lxc publish "$BUILD_INSTANCE" --alias "$ALIAS" \
+lxc publish "$BUILD_INSTANCE" --alias "$ALIAS" --compression none \
     description="OpenShell sandbox container image"
 lxc delete "$BUILD_INSTANCE"
 
