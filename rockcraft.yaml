@@ -17,7 +17,15 @@ parts:
     plugin: nil
     override-overlay: |
       groupadd --gid 10001 sandbox
-      useradd --uid 10001 --gid 10001 --create-home --shell /usr/sbin/nologin sandbox
+      # HOME must be /sandbox. The supervisor's Landlock baseline permits
+      # /sandbox and /tmp read-write but nothing under /home, so a home
+      # directory elsewhere makes every shell fail to read its own dotfiles
+      # ("Permission denied" on .profile/.bashrc). Matches upstream's
+      # convention in openshell-vm-sandbox-init.sh. /sandbox itself is
+      # created and chowned at boot by openshell-container-init.sh, so
+      # --no-create-home is correct here.
+      useradd --uid 10001 --gid 10001 --home-dir /sandbox --no-create-home \
+          --shell /bin/sh sandbox
 
   openshell-sandbox:
     plugin: rust
