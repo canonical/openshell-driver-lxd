@@ -47,6 +47,7 @@ fn sandbox(name: &str) -> DriverSandbox {
         id: name.to_string(),
         name: name.to_string(),
         namespace: "default".to_string(),
+        workspace: "test-workspace".to_string(),
         spec: Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
                 image: "ignored-in-v1".to_string(),
@@ -82,6 +83,7 @@ async fn create_get_list_stop_delete_lifecycle() {
         .expect("response should carry a sandbox");
     assert_eq!(got.name, name);
     assert_eq!(got.namespace, "default");
+    assert_eq!(got.workspace, "test-workspace");
     assert_eq!(got.id, name);
 
     let listed = service

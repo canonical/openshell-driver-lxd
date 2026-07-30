@@ -16,6 +16,7 @@ use crate::error::DriverError;
 
 pub(crate) const KEY_SANDBOX_ID: &str = "user.openshell.sandbox_id";
 const KEY_NAMESPACE: &str = "user.openshell.namespace";
+const KEY_WORKSPACE: &str = "user.openshell.workspace";
 const LABEL_PREFIX: &str = "user.openshell.label.";
 const ENV_PREFIX: &str = "environment.";
 const DEFAULT_STORAGE_POOL: &str = "default";
@@ -48,6 +49,11 @@ pub fn instance_to_driver_sandbox(instance: &Instance) -> DriverSandbox {
         namespace: instance
             .config
             .get(KEY_NAMESPACE)
+            .cloned()
+            .unwrap_or_default(),
+        workspace: instance
+            .config
+            .get(KEY_WORKSPACE)
             .cloned()
             .unwrap_or_default(),
         spec: None,
@@ -105,6 +111,7 @@ pub fn build_create_config(
 
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
+    config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
     config.insert(KEY_RAW_LXC.to_string(), RAW_LXC_INIT_CMD.to_string());
     // The supervisor installs its own seccomp BPF filter around the agent
     // process and uses clone/unshare for namespace setup. security.nesting

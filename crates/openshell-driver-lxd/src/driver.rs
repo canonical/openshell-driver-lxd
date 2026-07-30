@@ -362,6 +362,7 @@ mod tests {
             id: "id".to_string(),
             name: "name".to_string(),
             namespace: "default".to_string(),
+            workspace: "default".to_string(),
             spec: Some(spec),
             status: None,
         }
