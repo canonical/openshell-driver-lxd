@@ -22,6 +22,13 @@ OpenShell gateway
                             └── LXD VM
 ```
 
+## Demo
+
+Creating an LXD-backed sandbox end to end — the driver and gateway logs on top,
+the `openshell` CLI driving them below.
+
+![Launching an LXD-backed OpenShell sandbox](demo.gif)
+
 ## Requirements
 
 - Rust (stable, see `rust-toolchain.toml`)
