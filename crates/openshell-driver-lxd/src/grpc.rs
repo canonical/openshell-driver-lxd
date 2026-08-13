@@ -7,13 +7,16 @@ use std::pin::Pin;
 
 use computev1::pb::compute_driver_server::ComputeDriver;
 use computev1::pb::{
-    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest, GetSandboxResponse,
-    ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest, StopSandboxResponse,
-    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesEvent,
-    WatchSandboxesRequest,
+    watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
+    DeleteSandboxResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
+    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
+    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
+    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesRequest,
 };
 use futures::Stream;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tokio_stream::StreamExt;
 use tonic::{Request, Response, Status};
 
 use crate::driver::LxdComputeDriver;
@@ -22,13 +25,48 @@ use crate::error::DriverError;
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
     driver: LxdComputeDriver,
+    /// Published on every successful DeleteSandbox so WatchSandboxes can emit
+    /// Deleted events and the gateway immediately removes the sandbox from its
+    /// store rather than waiting for the next reconcile cycle.
+    deletion_tx: broadcast::Sender<String>,
 }
 
 impl ComputeDriverService {
     #[must_use]
     pub fn new(driver: LxdComputeDriver) -> Self {
-        Self { driver }
+        let (deletion_tx, _) = broadcast::channel(64);
+        Self {
+            driver,
+            deletion_tx,
+        }
     }
+}
+
+/// Resolves the instance name a request should act on. Prefers
+/// `sandbox_name` (the common case); when it's empty, falls back to
+/// looking up the instance whose `user.openshell.sandbox_id` config key
+/// matches `sandbox_id` — both fields exist on these requests precisely so
+/// callers can address a sandbox by either.
+async fn resolve_name(
+    driver: &LxdComputeDriver,
+    sandbox_name: &str,
+    sandbox_id: &str,
+) -> Result<String, Status> {
+    if !sandbox_name.is_empty() {
+        return Ok(sandbox_name.to_string());
+    }
+    if sandbox_id.is_empty() {
+        return Err(DriverError::InvalidArgument(
+            "sandbox_name or sandbox_id is required".to_string(),
+        )
+        .into());
+    }
+    driver
+        .find_name_by_sandbox_id(sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            Status::not_found(format!("no sandbox found with sandbox_id {sandbox_id:?}"))
+        })
 }
 
 #[tonic::async_trait]
@@ -42,44 +80,75 @@ impl ComputeDriver for ComputeDriverService {
 
     async fn validate_sandbox_create(
         &self,
-        _request: Request<ValidateSandboxCreateRequest>,
+        request: Request<ValidateSandboxCreateRequest>,
     ) -> Result<Response<ValidateSandboxCreateResponse>, Status> {
-        Err(DriverError::Unimplemented("validate_sandbox_create").into())
+        let sandbox = request.into_inner().sandbox.ok_or_else(|| {
+            Status::from(DriverError::InvalidArgument(
+                "sandbox is required".to_string(),
+            ))
+        })?;
+        self.driver.validate_sandbox_create(&sandbox).await?;
+        Ok(Response::new(ValidateSandboxCreateResponse {}))
     }
 
     async fn get_sandbox(
         &self,
-        _request: Request<GetSandboxRequest>,
+        request: Request<GetSandboxRequest>,
     ) -> Result<Response<GetSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("get_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let sandbox = self.driver.get_sandbox(&name).await?;
+        Ok(Response::new(GetSandboxResponse {
+            sandbox: Some(sandbox),
+        }))
     }
 
     async fn list_sandboxes(
         &self,
         _request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Err(DriverError::Unimplemented("list_sandboxes").into())
+        let sandboxes = self.driver.list_sandboxes().await?;
+        Ok(Response::new(ListSandboxesResponse { sandboxes }))
     }
 
     async fn create_sandbox(
         &self,
-        _request: Request<CreateSandboxRequest>,
+        request: Request<CreateSandboxRequest>,
     ) -> Result<Response<CreateSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("create_sandbox").into())
+        let sandbox = request.into_inner().sandbox.ok_or_else(|| {
+            Status::from(DriverError::InvalidArgument(
+                "sandbox is required".to_string(),
+            ))
+        })?;
+        self.driver.create_sandbox(&sandbox).await?;
+        Ok(Response::new(CreateSandboxResponse {}))
     }
 
     async fn stop_sandbox(
         &self,
-        _request: Request<StopSandboxRequest>,
+        request: Request<StopSandboxRequest>,
     ) -> Result<Response<StopSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("stop_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        self.driver.stop_sandbox(&name).await?;
+        Ok(Response::new(StopSandboxResponse {}))
     }
 
     async fn delete_sandbox(
         &self,
-        _request: Request<DeleteSandboxRequest>,
+        request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Err(DriverError::Unimplemented("delete_sandbox").into())
+        let req = request.into_inner();
+        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        match self.driver.delete_sandbox(&name).await? {
+            Some(sandbox_id) => {
+                if !sandbox_id.is_empty() {
+                    self.deletion_tx.send(sandbox_id).ok();
+                }
+                Ok(Response::new(DeleteSandboxResponse { deleted: true }))
+            }
+            None => Ok(Response::new(DeleteSandboxResponse { deleted: false })),
+        }
     }
 
     type WatchSandboxesStream =
@@ -89,6 +158,17 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        Err(DriverError::Unimplemented("watch_sandboxes").into())
+        let rx = self.deletion_tx.subscribe();
+        let stream = BroadcastStream::new(rx).map(|result| match result {
+            Ok(sandbox_id) => Ok(WatchSandboxesEvent {
+                payload: Some(watch_sandboxes_event::Payload::Deleted(
+                    WatchSandboxesDeletedEvent { sandbox_id },
+                )),
+            }),
+            Err(BroadcastStreamRecvError::Lagged(n)) => Err(Status::data_loss(format!(
+                "WatchSandboxes receiver lagged and missed {n} event(s); reconnect and re-list to resync"
+            ))),
+        });
+        Ok(Response::new(Box::pin(stream)))
     }
 }

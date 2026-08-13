@@ -7,6 +7,7 @@ mod acls;
 mod client;
 mod error;
 mod events;
+mod images;
 mod instances;
 mod networks;
 mod operations;

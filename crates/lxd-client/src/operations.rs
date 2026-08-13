@@ -103,7 +103,10 @@ impl LxdClient {
                     // Io/WebSocket: reconnect. Json: skip the bad frame and keep
                     // draining — a single malformed frame should not abort the wait.
                     Err(LxdError::Io(_) | LxdError::WebSocket { .. }) => break 'stream,
-                    Err(LxdError::Json(_)) => continue,
+                    Err(LxdError::Json(e)) => {
+                        tracing::warn!(%e, "malformed event frame received from LXD; skipping");
+                        continue;
+                    }
                     Err(e) => return Err(e),
                 }
             }

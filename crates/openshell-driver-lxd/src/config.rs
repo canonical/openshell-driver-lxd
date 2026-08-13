@@ -17,6 +17,12 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default sandbox image alias.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
 
+/// Default gRPC port the gateway listens on.
+pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
+
+/// Default deadline, in seconds, for waiting on an LXD operation to complete.
+pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -55,4 +61,15 @@ pub struct Config {
     /// Omit to use the built-in webpki CA bundle.
     #[arg(long, requires = "lxd_url")]
     pub lxd_server_ca: Option<PathBuf>,
+
+    /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
+    /// sandboxes. The host is resolved from the sandbox's own LXD bridge
+    /// network at create time.
+    #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
+    pub gateway_grpc_port: u16,
+
+    /// Deadline, in seconds, to wait for an LXD operation to complete before
+    /// failing the RPC with DeadlineExceeded.
+    #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
+    pub operation_timeout_secs: u64,
 }

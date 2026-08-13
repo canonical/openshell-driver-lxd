@@ -5,10 +5,11 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
 use clap::Parser;
 use computev1::pb::compute_driver_server::ComputeDriverServer;
+use lxd_client::{LxdClient, LxdEndpoint, LxdHttpsConfig};
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
-use tracing::info;
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use openshell_driver_lxd::config::Config;
@@ -50,9 +51,53 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = UnixListener::bind(&config.socket)?;
     fs::set_permissions(&config.socket, fs::Permissions::from_mode(0o600))?;
 
+    let endpoint = if let Some(url) = config.lxd_url.clone() {
+        let client_cert = config
+            .lxd_client_cert
+            .clone()
+            .ok_or("--lxd-client-cert is required when --lxd-url is set")?;
+        let client_key = config
+            .lxd_client_key
+            .clone()
+            .ok_or("--lxd-client-key is required when --lxd-url is set")?;
+        LxdEndpoint::Https(LxdHttpsConfig {
+            url,
+            client_cert,
+            client_key,
+            server_ca: config.lxd_server_ca.clone(),
+        })
+    } else {
+        LxdEndpoint::UnixSocket(config.lxd_socket.clone())
+    };
+
     info!(socket = %config.socket.display(), "Starting OpenShell LXD compute driver");
 
-    let driver = LxdComputeDriver::new(config);
+    let lxd = LxdClient::new(endpoint)?;
+
+    // Fail fast with a clear diagnostic rather than letting the first
+    // create_sandbox call surface an opaque LXD 404. Only the check itself
+    // failing (e.g. LXD not reachable yet) is non-fatal here — that failure
+    // mode is already surfaced clearly wherever it's next hit.
+    match lxd.image_alias_exists(&config.default_image).await {
+        Ok(false) => {
+            error!(
+                image = %config.default_image,
+                "default sandbox image alias not found in LXD; run `make sandbox-image` \
+                 (or import it under this alias) before starting the driver"
+            );
+            std::process::exit(1);
+        }
+        Ok(true) => {}
+        Err(e) => {
+            warn!(
+                image = %config.default_image,
+                %e,
+                "could not verify default sandbox image alias exists; continuing anyway"
+            );
+        }
+    }
+
+    let driver = LxdComputeDriver::new(config, lxd);
     let service = ComputeDriverService::new(driver);
 
     Server::builder()

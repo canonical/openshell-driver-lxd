@@ -18,6 +18,17 @@ pub enum DriverError {
     /// The LXD REST API call failed.
     #[error("LXD error: {0}")]
     Lxd(#[from] LxdError),
+
+    /// Waiting for an LXD operation to complete exceeded the configured
+    /// deadline.
+    #[error("timed out waiting for LXD operation to complete")]
+    Timeout,
+
+    /// The named LXD instance exists but isn't managed by this driver (no
+    /// `user.openshell.sandbox_id` marker), so it's not found from the
+    /// driver's perspective.
+    #[error("not found: {0}")]
+    NotFound(String),
 }
 
 impl From<DriverError> for Status {
@@ -45,6 +56,10 @@ impl From<DriverError> for Status {
                 ))
             }
             DriverError::Lxd(lxd_err) => Status::internal(lxd_err.to_string()),
+            DriverError::Timeout => {
+                Status::deadline_exceeded("timed out waiting for LXD operation to complete")
+            }
+            DriverError::NotFound(msg) => Status::not_found(msg),
         }
     }
 }

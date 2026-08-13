@@ -49,21 +49,39 @@ static-checks: fmt-check clippy shellcheck doc
 proto:
 	cargo build -p computev1
 
-# Sync proto/compute_driver.proto with upstream NVIDIA/OpenShell main.
+# Proto files vendored from upstream NVIDIA/OpenShell. compute_driver.proto is
+# the driver contract itself; options.proto defines the custom field and method
+# options it imports (e.g. the `secret` field option on sandbox_token) and must
+# be resolvable on protoc's include path for codegen to succeed.
+UPSTREAM_PROTOS := compute_driver.proto options.proto
+
+# Sync proto/ with upstream NVIDIA/OpenShell main.
 sync-proto:
-	$(eval UPSTREAM := $(shell gh api repos/NVIDIA/OpenShell/contents/proto/compute_driver.proto --jq '.content' | base64 -d > /tmp/compute_driver_upstream.proto && echo /tmp/compute_driver_upstream.proto))
-	@if diff -q /tmp/compute_driver_upstream.proto proto/compute_driver.proto > /dev/null 2>&1; then \
-		echo "proto is already in sync with upstream main"; \
+	@changed=""; \
+	for p in $(UPSTREAM_PROTOS); do \
+		gh api repos/NVIDIA/OpenShell/contents/proto/$$p --jq '.content' \
+			| base64 -d > /tmp/openshell_upstream_$$p; \
+		if [ ! -s /tmp/openshell_upstream_$$p ]; then \
+			echo "ERROR: failed to fetch proto/$$p from upstream" >&2; \
+			exit 1; \
+		fi; \
+		if ! diff -q /tmp/openshell_upstream_$$p proto/$$p > /dev/null 2>&1; then \
+			cp /tmp/openshell_upstream_$$p proto/$$p; \
+			changed="$$changed proto/$$p"; \
+		fi; \
+	done; \
+	if [ -z "$$changed" ]; then \
+		echo "protos are already in sync with upstream main"; \
 	else \
-		cp /tmp/compute_driver_upstream.proto proto/compute_driver.proto && \
+		echo "==> updated:$$changed"; \
 		cargo build --workspace && \
 		if [ -t 0 ]; then \
-			read -r -p "Would you like to commit changes to proto/compute_driver.proto (Y/n)? " answer; \
+			read -r -p "Would you like to commit changes to$$changed (Y/n)? " answer; \
 			if [ "$${answer:-y}" = "y" ] || [ "$${answer:-y}" = "Y" ]; then \
-				git commit -S -s -m "chore(proto): sync compute_driver.proto with upstream main" -- proto/compute_driver.proto; \
+				git commit -S -s -m "chore(proto): sync protos with upstream main" --$$changed; \
 			fi; \
 		else \
-			echo "==> proto/compute_driver.proto has been updated; please commit the change" >&2; \
+			echo "==>$$changed updated; please commit the change" >&2; \
 			exit 1; \
 		fi; \
 	fi
