@@ -12,4 +12,5 @@ fn help_lists_socket_flag() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("--socket"), "stdout was:\n{stdout}");
+    assert!(stdout.contains("--project"), "stdout was:\n{stdout}");
 }

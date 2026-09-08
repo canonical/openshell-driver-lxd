@@ -17,6 +17,9 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default sandbox image alias.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
 
+/// Default LXD project. LXD always has a `default` project.
+pub const DEFAULT_PROJECT: &str = "default";
+
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
@@ -43,6 +46,12 @@ pub struct Config {
     /// LXD image alias every sandbox is created from.
     #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     pub default_image: String,
+
+    /// LXD project to target for all instances, images, networks, and
+    /// operations. The project must already exist; the driver will not create
+    /// it.
+    #[arg(long, default_value = DEFAULT_PROJECT)]
+    pub project: String,
 
     /// Remote LXD HTTPS endpoint (e.g. https://10.0.0.1:8443).
     /// When set, --lxd-socket is ignored and HTTPS+mTLS is used instead.
