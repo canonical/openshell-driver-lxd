@@ -268,6 +268,45 @@ async fn delete_network_acl_nonexistent_is_ok() {
 }
 
 #[tokio::test]
+async fn project_exists_true_for_default_project() {
+    let client = client();
+    assert!(
+        client
+            .project_exists("default")
+            .await
+            .expect("project_exists should succeed"),
+        "default project should exist"
+    );
+}
+
+#[tokio::test]
+async fn project_exists_false_for_nonexistent_project() {
+    let client = client();
+    let name = unique_name();
+    assert!(
+        !client
+            .project_exists(&format!("{name}-missing"))
+            .await
+            .expect("project_exists should succeed"),
+        "random project name should not exist"
+    );
+}
+
+#[tokio::test]
+async fn project_exists_with_non_default_project_client() {
+    let client = LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(LXD_SOCKET)))
+        .unwrap()
+        .with_project("default");
+    assert!(
+        client
+            .project_exists("default")
+            .await
+            .expect("project_exists should succeed"),
+        "default project should exist when client targets default"
+    );
+}
+
+#[tokio::test]
 async fn push_file_into_stopped_instance() {
     let client = client();
     let name = unique_name();

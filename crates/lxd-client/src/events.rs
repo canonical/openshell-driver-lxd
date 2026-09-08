@@ -29,7 +29,8 @@ impl LxdClient {
         let (raw, host) = self.connect_raw().await?;
         let scheme = self.ws_scheme();
         let type_param = types.join(",");
-        let url = format!("{scheme}://{host}/1.0/events?type={type_param}");
+        let path = self.decorate_path(&format!("/1.0/events?type={type_param}"));
+        let url = format!("{scheme}://{host}{path}");
 
         let (ws, _) = tokio_tungstenite::client_async(url, raw)
             .await

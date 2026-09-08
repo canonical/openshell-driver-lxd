@@ -11,6 +11,7 @@ mod images;
 mod instances;
 mod networks;
 mod operations;
+mod projects;
 pub mod resources;
 mod types;
 
