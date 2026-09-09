@@ -20,15 +20,25 @@ pub const DEFAULT_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 
 static OCI_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Strict OCI reference grammar:
-    // [domain[:port]/]path[:tag][@sha256:digest]
+    // [docker://][domain[:port]/]path[:tag][@sha256:digest]
     // Rejects whitespace, control characters, shell metacharacters.
-    Regex::new(r"^(?:(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*)(?::[a-zA-Z0-9_.-]+)?(?:@sha256:[a-fA-F0-9]{64})?$")
+    Regex::new(r"^(?:docker://)?(?:(?:[a-zA-Z0-9.-]+(?::[0-9]+)?/)?(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*)(?::[a-zA-Z0-9_.-]+)?(?:@sha256:[a-fA-F0-9]{64})?$")
         .expect("valid regex")
 });
+
+/// Strips an optional `docker://` transport prefix from a reference.
+///
+/// skopeo accepts both bare OCI references and `docker://`-prefixed ones, but
+/// the importer always constructs its own `docker://` target, so any user-supplied
+/// scheme must be removed before building that target.
+pub fn strip_docker_scheme(reference: &str) -> &str {
+    reference.strip_prefix("docker://").unwrap_or(reference)
+}
 
 /// Validates an OCI reference against a strict grammar.
 ///
 /// Disallows shell metacharacters, whitespace, control characters, or invalid formats.
+/// An optional leading `docker://` transport prefix is accepted.
 pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
     if reference.is_empty() {
         return Err(DriverError::InvalidArgument(
@@ -57,9 +67,12 @@ pub fn cache_alias_with_prefix(prefix: &str, digest: &str) -> String {
     format!("{prefix}{clean}")
 }
 
-/// Returns `reference` with any trailing `:tag` and/or `@sha256:<hex>` suffix stripped,
-/// leaving just `[registry-host[:port]/]path`.
+/// Returns `reference` with any leading `docker://` scheme and any trailing
+/// `:tag` and/or `@sha256:<hex>` suffix stripped, leaving just
+/// `[registry-host[:port]/]path`.
 pub fn repo_path(reference: &str) -> &str {
+    let reference = strip_docker_scheme(reference);
+
     // Strip trailing @sha256:<hex>
     let without_digest = if let Some(idx) = reference.rfind("@sha256:") {
         &reference[..idx]
@@ -238,7 +251,8 @@ impl SkopeoImporter {
 impl OciImporter for SkopeoImporter {
     async fn resolve_digest(&self, reference: &str) -> Result<String, DriverError> {
         let arch = host_oci_arch();
-        let target = format!("docker://{reference}");
+        let bare = strip_docker_scheme(reference);
+        let target = format!("docker://{bare}");
 
         let cmd = tokio::process::Command::new(&self.skopeo_path)
             .args([
@@ -491,6 +505,9 @@ mod tests {
         assert!(validate_reference(&full_digest).is_ok());
         let tagged_and_digested = format!("registry.example.com/app:v1@sha256:{}", "ab".repeat(32));
         assert!(validate_reference(&tagged_and_digested).is_ok());
+        // Optional docker:// transport prefix is accepted.
+        assert!(validate_reference("docker://ubuntu:22.04").is_ok());
+        assert!(validate_reference("docker://registry.example.com/org/sandbox:latest").is_ok());
 
         // Invalid references (shell injection / malformed)
         assert!(validate_reference("").is_err());
@@ -522,6 +539,17 @@ mod tests {
                 "registry.example.com:5000/foo:v1@sha256:{digest_hex}"
             )),
             "registry.example.com:5000/foo"
+        );
+        // docker:// scheme is stripped along with tag/digest suffixes.
+        assert_eq!(
+            repo_path("docker://registry.example.com/org/sandbox:latest"),
+            "registry.example.com/org/sandbox"
+        );
+        assert_eq!(
+            repo_path(&format!(
+                "docker://registry.example.com/org/sandbox@sha256:{digest_hex}"
+            )),
+            "registry.example.com/org/sandbox"
         );
     }
 
@@ -713,5 +741,12 @@ mod tests {
                 "ff".repeat(32)
             )
         );
+
+        // A user-supplied docker:// scheme must not produce a doubled scheme.
+        let ref_with_scheme = "docker://registry.example.com/org/app:v1.2.3";
+        let repo_with_scheme = repo_path(ref_with_scheme);
+        assert_eq!(repo_with_scheme, "registry.example.com/org/app");
+        let copy_source_with_scheme = format!("docker://{repo_with_scheme}@{resolved_digest}");
+        assert_eq!(copy_source_with_scheme, copy_source);
     }
 }
