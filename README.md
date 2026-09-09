@@ -34,12 +34,12 @@ the `openshell` CLI driving them below.
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
 - [LXD](https://github.com/canonical/lxd), initialized with a `default` storage pool and an `lxdbr0` network
+- `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 
 ## Quickstart
 
-This walks through building the driver, publishing the sandbox image, and
-wiring both up to a real OpenShell gateway so you can create a sandbox
-end-to-end.
+This walks through building the driver and wiring it up to a real OpenShell
+gateway so you can create a sandbox end-to-end.
 
 1. **Install and initialize LXD**, if you haven't already:
 
@@ -48,27 +48,25 @@ end-to-end.
    lxd init --auto
    ```
 
-2. **Build and publish the sandbox container image** under the
-   `openshell-sandbox` alias (this drives `scripts/build-sandbox-image.sh`):
-
-   ```sh
-   make sandbox-image
-   ```
-
-3. **Build and run the driver:**
+2. **Build and run the driver:**
 
    ```sh
    make build
    ./target/debug/openshell-driver-lxd \
        --socket /tmp/openshell-driver.sock \
-       --default-image openshell-sandbox \
        --gateway-grpc-port 17670
    ```
+
+   No sandbox image needs to be pre-built or pre-loaded: the driver pulls the
+   default image (`--default-image`, the upstream
+   `ghcr.io/nvidia/openshell/supervisor:latest`) from the registry and imports
+   it into LXD on first use, caching it by content digest. Pass
+   `--default-image <oci-ref>` to boot from a different image.
 
    `--gateway-grpc-port` must match the port the gateway is told to listen on
    below — the driver uses it to construct each sandbox's `OPENSHELL_ENDPOINT`.
 
-4. **Start an OpenShell gateway pointed at the driver's socket**, using the
+3. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. A plaintext gateway still enforces request
    authentication by default, so for local/dev use also pass a `--config`
    file disabling it:
@@ -95,7 +93,7 @@ end-to-end.
    shortcut — **not** for production use; see
    [Security limitations](#security-limitations).
 
-5. **Register the gateway with the CLI and create a sandbox:**
+4. **Register the gateway with the CLI and create a sandbox:**
 
    ```sh
    openshell gateway add http://127.0.0.1:17670 --local --name lxd-demo
@@ -120,9 +118,6 @@ end-to-end.
   default seccomp deny list (`kexec_load`, `open_by_handle_at`,
   `init_module`, `delete_module`), not a syscall allowlist scoped to what the
   supervisor actually needs.
-- **Every sandbox runs the same fixed base image**, regardless of
-  `template.image` in the request — per-template image selection isn't
-  consulted yet.
 - **`Ready=True` reflects LXD container status, not confirmed
   supervisor-to-gateway connectivity.** A sandbox can report `Ready=True` as
   soon as the LXD container reaches `Running`, before the supervisor inside
@@ -130,12 +125,34 @@ end-to-end.
   needs a guest-to-driver signal that containers don't provide; the fix lands
   with a planned microVM + `lxd-agent`-over-vsock transition, not before.
 
+## Images and Caching
+
+The driver supports per-sandbox OCI images specified via `template.image` in the
+gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
+`ghcr.io/org/custom-sandbox:v1`).
+
+- **Contract:** `template.image` must be a purpose-built OpenShell sandbox OCI image
+  bundling the OpenShell supervisor as init and conforming to the supervisor contract.
+- **Digest-pinned resolution and caching:** On `create_sandbox`, the driver validates
+  the OCI reference and queries its registry digest for the host architecture. It maps
+  the digest to a local LXD image alias (e.g. `openshell-oci-<64-hex-sha256>`).
+  If the alias is already present in LXD, it is reused immediately.
+  If not cached, the driver pulls the image by digest using `skopeo`, unpacks it with
+  `umoci`, packs it into squashfs and metadata archives, and imports it via LXD's
+  split image REST API.
+- **Tag mutation:** Because the cache is keyed on content digest rather than tag,
+  if a tag points to a new digest, the driver will automatically pull and import the new
+  image on first use.
+- **Fallback:** If `template.image` is omitted or empty, the sandbox falls back to
+  `--default-image` (default: the upstream `ghcr.io/nvidia/openshell/supervisor:latest`),
+  which is resolved and imported through the same on-demand path.
+- **Configuration flags:**
+  - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
+  - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
+
 ## Known limitations
 
 - GPU requests attach every host GPU; an exact requested `count` isn't honored.
-- No image auto-import — `make sandbox-image` (or an equivalent manual
-  import) is a prerequisite; the driver only fails fast if the alias is
-  missing at startup, it doesn't build or fetch one.
 - `lxd-client` opens a fresh connection per request; no connection pooling.
 - No MicroCloud / multi-node cluster scheduling — single LXD daemon only.
 - Not yet packaged as a snap for production distribution (see [Snap](#snap)

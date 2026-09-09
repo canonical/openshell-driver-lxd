@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean sandbox-image
+.PHONY: build release check test test-lxd-client test-driver setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -14,8 +14,11 @@ test: test-lxd-client test-driver
 test-lxd-client: setup-lxd-test-env
 	cargo test -p lxd-client
 
+# Runs the driver integration tests. These boot real sandboxes on a live LXD
+# and need `skopeo`, `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus
+# outbound access to ghcr.io: the driver pulls and imports the upstream
+# OpenShell supervisor image on demand — no image is pre-built or pre-loaded.
 test-driver:
-	lxc image info openshell-sandbox >/dev/null 2>&1 || $(MAKE) sandbox-image
 	cargo test -p openshell-driver-lxd
 
 # Provisions LXD for lxd-client's integration tests (see
@@ -88,11 +91,6 @@ sync-proto:
 
 run:
 	cargo run -p openshell-driver-lxd -- $(ARGS)
-
-# Builds the sandbox container image and publishes it to the local LXD
-# image store under the openshell-sandbox alias.
-sandbox-image:
-	./scripts/build-sandbox-image.sh
 
 clean:
 	cargo clean

@@ -26,14 +26,14 @@ const DEFAULT_NETWORK: &str = "lxdbr0";
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
 pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
-/// LXD containers built from rockcraft rocks have no traditional init
-/// system (the rock's own entrypoint is Pebble), so every sandbox needs an
-/// explicit `lxc.init.cmd` override pointing at the container-adapted init
-/// wrapper baked into the image. Publishing an instance to an image does
-/// *not* carry this kind of instance config forward, so it has to be set on
-/// every create, not just once on the image.
+/// The upstream OpenShell supervisor image declares the supervisor binary as
+/// its OCI entrypoint (`/openshell-sandbox`), but LXD system containers ignore
+/// OCI entrypoints and run their own init, so every sandbox needs an explicit
+/// `lxc.init.cmd` override pointing at the supervisor. Publishing an instance
+/// to an image does *not* carry this kind of instance config forward, so it
+/// has to be set on every create, not just once on the image.
 const KEY_RAW_LXC: &str = "raw.lxc";
-const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /opt/openshell/bin/openshell-container-init.sh";
+const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /openshell-sandbox";
 
 /// Maps an [`Instance`] to a [`DriverSandbox`] observation. `spec` is left
 /// unset, per the proto's own doc comment: "Drivers may omit this in observed

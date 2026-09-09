@@ -4,4 +4,5 @@ pub mod config;
 pub mod driver;
 pub mod error;
 pub mod grpc;
+pub mod image;
 pub(crate) mod mapping;

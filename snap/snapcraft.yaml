@@ -21,6 +21,10 @@ parts:
     build-packages:
     - protobuf-compiler
     - libprotobuf-dev
+    stage-packages:
+    - skopeo
+    - umoci
+    - squashfs-tools
     source: .
     rust-path:
     - crates/openshell-driver-lxd
