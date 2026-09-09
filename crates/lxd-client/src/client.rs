@@ -389,6 +389,64 @@ impl LxdClient {
         self.request(Method::DELETE, path, None).await
     }
 
+    /// POST raw bytes with arbitrary extra headers and return the deserialized response.
+    ///
+    /// Used for endpoints like image imports where the request payload is multipart/form-data
+    /// or binary data, but the response is LXD's standard JSON envelope.
+    pub(crate) async fn post_raw_response<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        let (mut sender, host) = self.connect().await?;
+
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("Host", host)
+            .header("Content-Type", content_type);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Full::new(body))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        let parsed: LxdResponse<T> = serde_json::from_slice(&resp_body)?;
+
+        if parsed.type_ == "error" {
+            let message = parsed
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
+            return Err(LxdError::Api {
+                status_code: parsed.error_code,
+                message,
+            });
+        }
+
+        Ok(parsed)
+    }
+
     /// POST raw bytes with arbitrary extra headers.
     ///
     /// Used for the file-push endpoint whose sync response has `metadata: null`
