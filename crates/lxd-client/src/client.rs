@@ -213,6 +213,9 @@ impl LxdHttpsConfig {
     }
 }
 
+/// Default LXD project. LXD always has a `default` project.
+pub const DEFAULT_PROJECT: &str = "default";
+
 /// Async client for the LXD REST API.
 ///
 /// Opens a fresh connection per request. Use [`LxdEndpoint::UnixSocket`] for a
@@ -247,7 +250,7 @@ impl LxdClient {
         Ok(Self {
             endpoint,
             tls_connector,
-            project: "default".to_string(),
+            project: DEFAULT_PROJECT.to_string(),
         })
     }
 
@@ -265,12 +268,12 @@ impl LxdClient {
     /// Uses `?` when the path has no query string and `&` when it already has
     /// one. This is the single choke point for project scoping on the wire.
     pub(crate) fn decorate_path(&self, path: &str) -> String {
-        use urlencoding::encode;
-        let encoded = encode(&self.project);
-        if path.contains('?') {
-            format!("{path}&project={encoded}")
-        } else {
-            format!("{path}?project={encoded}")
+        let base = url::Url::parse("http://localhost").expect("valid base URL");
+        let mut url = base.join(path).expect("valid relative path");
+        url.query_pairs_mut().append_pair("project", &self.project);
+        match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_string(),
         }
     }
 
@@ -555,7 +558,7 @@ mod tests {
         let client = test_client().with_project("my project");
         assert_eq!(
             client.decorate_path("/1.0/instances"),
-            "/1.0/instances?project=my%20project"
+            "/1.0/instances?project=my+project"
         );
     }
 
@@ -568,6 +571,6 @@ mod tests {
     #[test]
     fn new_defaults_to_default_project() {
         let client = test_client();
-        assert_eq!(client.project, "default");
+        assert_eq!(client.project, DEFAULT_PROJECT);
     }
 }

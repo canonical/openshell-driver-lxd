@@ -17,8 +17,8 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// Default sandbox image alias.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
 
-/// Default LXD project. LXD always has a `default` project.
-pub const DEFAULT_PROJECT: &str = "default";
+/// Default LXD project. Re-exported from `lxd_client`.
+pub use lxd_client::DEFAULT_PROJECT;
 
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
