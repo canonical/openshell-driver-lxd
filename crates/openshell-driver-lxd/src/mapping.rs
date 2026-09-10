@@ -26,14 +26,15 @@ const DEFAULT_NETWORK: &str = "lxdbr0";
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
 pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
-/// The upstream OpenShell supervisor image declares the supervisor binary as
-/// its OCI entrypoint (`/openshell-sandbox`), but LXD system containers ignore
-/// OCI entrypoints and run their own init, so every sandbox needs an explicit
-/// `lxc.init.cmd` override pointing at the supervisor. Publishing an instance
-/// to an image does *not* carry this kind of instance config forward, so it
-/// has to be set on every create, not just once on the image.
+/// LXD system containers ignore OCI entrypoints and run their own init. To ensure
+/// network interfaces (lo, eth0) are brought up and an IPv4 lease is obtained
+/// via DHCP before the supervisor starts, `lxc.init.cmd` is pointed at the
+/// injected init script (`/openshell-init.sh`) which performs one-shot network
+/// initialization and then exec-replaces itself into `/openshell-sandbox`.
+/// Publishing an instance to an image does *not* carry this kind of instance config
+/// forward, so it has to be set on every create, not just once on the image.
 const KEY_RAW_LXC: &str = "raw.lxc";
-const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /openshell-sandbox";
+pub(crate) const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /openshell-init.sh";
 
 /// Maps an [`Instance`] to a [`DriverSandbox`] observation. `spec` is left
 /// unset, per the proto's own doc comment: "Drivers may omit this in observed
@@ -281,5 +282,10 @@ mod tests {
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
         assert_eq!(gpu0.get("gputype"), Some(&"physical".to_string()));
+    }
+
+    #[test]
+    fn raw_lxc_init_cmd_points_to_injected_init_script() {
+        assert_eq!(RAW_LXC_INIT_CMD, "lxc.init.cmd = /openshell-init.sh");
     }
 }

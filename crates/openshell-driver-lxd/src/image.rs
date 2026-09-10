@@ -18,6 +18,12 @@ use crate::error::DriverError;
 /// Default prefix for digest-derived LXD image aliases.
 pub const DEFAULT_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 
+/// Canonical path inside the guest rootfs for the injected PID 1 init script.
+pub(crate) const GUEST_INIT_SCRIPT_PATH: &str = "/openshell-init.sh";
+
+/// Bundled POSIX/busybox init script injected into converted rootfs images.
+const INIT_SCRIPT_CONTENTS: &str = include_str!("../assets/openshell-init.sh");
+
 static OCI_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Strict OCI reference grammar:
     // [docker://][domain[:port]/]path[:tag][@sha256:digest]
@@ -361,6 +367,9 @@ impl OciImporter for SkopeoImporter {
             )));
         }
 
+        // Inject the minimal init script before repacking with mksquashfs.
+        inject_init_script(&rootfs_dest)?;
+
         // 3. mksquashfs <rootfs_dest> <squashfs_path> -noappend
         let cmd = tokio::process::Command::new(&self.mksquashfs_path)
             .args([
@@ -472,6 +481,40 @@ async fn create_metadata_tar_xz(dir: &Path, metadata_yaml: &str) -> Result<Vec<u
     tokio::fs::read(&tar_path)
         .await
         .map_err(|e| DriverError::ImageImport(format!("failed to read metadata.tar.xz: {e}")))
+}
+
+/// Injects the bundled init script into the unpacked rootfs at `GUEST_INIT_SCRIPT_PATH`
+/// with executable permissions (`0755`).
+fn inject_init_script(rootfs_dest: &Path) -> Result<(), DriverError> {
+    let script_path = rootfs_dest.join(GUEST_INIT_SCRIPT_PATH.trim_start_matches('/'));
+    if let Some(parent) = script_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            DriverError::ImageImport(format!(
+                "failed to create parent directory for init script: {e}"
+            ))
+        })?;
+    }
+    std::fs::write(&script_path, INIT_SCRIPT_CONTENTS).map_err(|e| {
+        DriverError::ImageImport(format!(
+            "failed to write init script to {}: {e}",
+            script_path.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).map_err(
+            |e| {
+                DriverError::ImageImport(format!(
+                    "failed to set permissions on init script {}: {e}",
+                    script_path.display()
+                ))
+            },
+        )?;
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -748,5 +791,30 @@ mod tests {
         assert_eq!(repo_with_scheme, "registry.example.com/org/app");
         let copy_source_with_scheme = format!("docker://{repo_with_scheme}@{resolved_digest}");
         assert_eq!(copy_source_with_scheme, copy_source);
+    }
+
+    #[test]
+    fn test_inject_init_script() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+
+        inject_init_script(&rootfs).unwrap();
+
+        let expected_path = rootfs.join(GUEST_INIT_SCRIPT_PATH.trim_start_matches('/'));
+        assert!(expected_path.exists());
+        let contents = std::fs::read_to_string(&expected_path).unwrap();
+        assert!(!contents.is_empty());
+        assert_eq!(contents, INIT_SCRIPT_CONTENTS);
+
+        #[cfg(unix)]
+        {
+            let metadata = std::fs::metadata(&expected_path).unwrap();
+            let mode = metadata.permissions().mode() & 0o777;
+            assert_eq!(mode, 0o755);
+        }
     }
 }
