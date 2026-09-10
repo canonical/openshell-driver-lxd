@@ -2,15 +2,17 @@
 
 //! Core LXD compute driver logic, independent of the gRPC transport.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
 use lxd_client::{LxdClient, LxdError};
+use tokio::sync::Mutex;
 
 use crate::config::Config;
 use crate::error::DriverError;
-use crate::image::{ImageCache, SkopeoImporter};
+use crate::image::{digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
@@ -45,6 +47,7 @@ pub struct LxdComputeDriver {
     config: Config,
     lxd: LxdClient,
     image_cache: ImageCache,
+    supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl LxdComputeDriver {
@@ -55,7 +58,7 @@ impl LxdComputeDriver {
             config.skopeo_path.clone(),
             config.umoci_path.clone(),
             config.mksquashfs_path.clone(),
-            Duration::from_secs(config.operation_timeout_secs),
+            Duration::from_secs(config.image_pull_timeout_secs),
         ));
         let image_cache = ImageCache::new(
             lxd.clone(),
@@ -71,6 +74,7 @@ impl LxdComputeDriver {
             config,
             lxd,
             image_cache,
+            supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -236,7 +240,53 @@ impl LxdComputeDriver {
                 "GpuResourceRequirements.count is ignored in v1; attaching all host GPUs"
             );
         }
-        let devices = mapping::build_create_devices(template, gpu.is_some());
+        // Resolve supervisor binary and digest
+        let (binary_path, digest) = match &self.config.supervisor_bin {
+            Some(path) => (path.clone(), digest_of_file(path)?),
+            None => self
+                .image_cache
+                .extract_supervisor_binary(
+                    &self.config.supervisor_image,
+                    &self.config.supervisor_cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+                })?,
+        };
+
+        // Ensure digest-keyed custom storage volume exists on supervisor_storage_pool
+        let volume_name = mapping::supervisor_volume_name(&digest);
+        let vol_lock = {
+            let mut locks = self.supervisor_volume_locks.lock().await;
+            locks
+                .entry(digest.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = vol_lock.lock().await;
+            self.lxd
+                .ensure_supervisor_volume(
+                    &self.config.supervisor_storage_pool,
+                    &volume_name,
+                    &binary_path,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "supervisor binary volume provisioning failed on pool {:?}: {e}",
+                        self.config.supervisor_storage_pool
+                    ))
+                })?;
+        }
+
+        let devices = mapping::build_create_devices(
+            template,
+            gpu.is_some(),
+            &self.config.supervisor_storage_pool,
+            &volume_name,
+        );
         let profiles = mapping::build_profiles(template);
 
         let image_alias = if template.image.is_empty() {
@@ -518,6 +568,20 @@ mod tests {
         ) -> Result<(), DriverError> {
             *self.imported_alias.lock().unwrap() = Some(alias.to_string());
             Ok(())
+        }
+
+        async fn extract_supervisor_binary(
+            &self,
+            _reference: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<(std::path::PathBuf, String), DriverError> {
+            let target_dir = cache_dir.join("test-digest");
+            let binary_path = target_dir.join("openshell-sandbox");
+            if !binary_path.exists() {
+                std::fs::create_dir_all(&target_dir).unwrap();
+                std::fs::write(&binary_path, b"mock-supervisor").unwrap();
+            }
+            Ok((binary_path, self.digest.clone()))
         }
     }
 

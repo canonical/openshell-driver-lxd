@@ -26,11 +26,25 @@ const DEFAULT_NETWORK: &str = "lxdbr0";
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
 pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
+/// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
+pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
+
+/// Guest-side executable path of the supervisor binary inside the mounted volume directory.
+#[allow(dead_code)]
+pub(crate) const GUEST_SUPERVISOR_BIN_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
+
+/// Deterministic LXD custom storage volume name for the given supervisor binary digest.
+pub(crate) fn supervisor_volume_name(digest: &str) -> String {
+    let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
+    format!("openshell-supervisor-{clean}")
+}
+
 /// LXD system containers ignore OCI entrypoints and run their own init. To ensure
 /// network interfaces (lo, eth0) are brought up and an IPv4 lease is obtained
 /// via DHCP before the supervisor starts, `lxc.init.cmd` is pointed at the
 /// injected init script (`/openshell-init.sh`) which performs one-shot network
-/// initialization and then exec-replaces itself into `/openshell-sandbox`.
+/// initialization and then exec-replaces itself into `/opt/openshell/bin/openshell-sandbox`
+/// (mounted from a custom storage volume disk device).
 /// Publishing an instance to an image does *not* carry this kind of instance config
 /// forward, so it has to be set on every create, not just once on the image.
 const KEY_RAW_LXC: &str = "raw.lxc";
@@ -186,10 +200,12 @@ pub fn build_create_config(
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
 /// the configured (or default) storage pool, a NIC on the configured (or
-/// default) network, and an optional GPU device.
+/// default) network, a read-only supervisor disk volume, and an optional GPU device.
 pub fn build_create_devices(
     template: &DriverSandboxTemplate,
     gpu: bool,
+    supervisor_pool: &str,
+    supervisor_volume: &str,
 ) -> HashMap<String, HashMap<String, String>> {
     let mut devices = HashMap::new();
 
@@ -203,6 +219,14 @@ pub fn build_create_devices(
     eth0.insert("type".to_string(), "nic".to_string());
     eth0.insert("network".to_string(), network(template).to_string());
     devices.insert("eth0".to_string(), eth0);
+
+    let mut supervisor = HashMap::new();
+    supervisor.insert("type".to_string(), "disk".to_string());
+    supervisor.insert("pool".to_string(), supervisor_pool.to_string());
+    supervisor.insert("source".to_string(), supervisor_volume.to_string());
+    supervisor.insert("path".to_string(), GUEST_SUPERVISOR_BIN_DIR.to_string());
+    supervisor.insert("readonly".to_string(), "true".to_string());
+    devices.insert("supervisor".to_string(), supervisor);
 
     if gpu {
         let mut gpu0 = HashMap::new();
@@ -268,16 +292,19 @@ mod tests {
 
     #[test]
     fn build_create_devices_omits_gpu_by_default() {
-        let devices = build_create_devices(&DriverSandboxTemplate::default(), false);
+        let devices =
+            build_create_devices(&DriverSandboxTemplate::default(), false, "default", "vol1");
 
         assert!(!devices.contains_key("gpu0"));
         assert!(devices.contains_key("root"));
         assert!(devices.contains_key("eth0"));
+        assert!(devices.contains_key("supervisor"));
     }
 
     #[test]
     fn build_create_devices_attaches_gpu_when_requested() {
-        let devices = build_create_devices(&DriverSandboxTemplate::default(), true);
+        let devices =
+            build_create_devices(&DriverSandboxTemplate::default(), true, "default", "vol1");
 
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
@@ -285,7 +312,33 @@ mod tests {
     }
 
     #[test]
-    fn raw_lxc_init_cmd_points_to_injected_init_script() {
+    fn build_create_devices_attaches_supervisor_volume() {
+        let digest = "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
+        let vol_name = supervisor_volume_name(digest);
+        let devices = build_create_devices(
+            &DriverSandboxTemplate::default(),
+            false,
+            "custom-pool",
+            &vol_name,
+        );
+
+        let sup = devices
+            .get("supervisor")
+            .expect("supervisor device should be present");
+        assert_eq!(sup.get("type"), Some(&"disk".to_string()));
+        assert_eq!(sup.get("pool"), Some(&"custom-pool".to_string()));
+        assert_eq!(sup.get("source"), Some(&vol_name));
+        assert_eq!(sup.get("path"), Some(&GUEST_SUPERVISOR_BIN_DIR.to_string()));
+        assert_eq!(sup.get("readonly"), Some(&"true".to_string()));
+    }
+
+    #[test]
+    fn guest_supervisor_paths_and_init_cmd_contract() {
         assert_eq!(RAW_LXC_INIT_CMD, "lxc.init.cmd = /openshell-init.sh");
+        assert_eq!(GUEST_SUPERVISOR_BIN_DIR, "/opt/openshell/bin");
+        assert_eq!(
+            GUEST_SUPERVISOR_BIN_PATH,
+            format!("{GUEST_SUPERVISOR_BIN_DIR}/openshell-sandbox")
+        );
     }
 }

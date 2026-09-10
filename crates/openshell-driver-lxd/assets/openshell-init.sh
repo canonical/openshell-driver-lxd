@@ -49,4 +49,4 @@ fi
 mkdir -p /sandbox
 
 # Exec-replace PID 1 with the supervisor
-exec /openshell-sandbox --workdir /sandbox "$@"
+exec /opt/openshell/bin/openshell-sandbox --workdir /sandbox "$@"

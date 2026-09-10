@@ -314,3 +314,42 @@ async fn push_file_into_stopped_instance() {
     .expect("delete should not time out")
     .expect("delete should succeed");
 }
+
+#[tokio::test]
+async fn ensure_supervisor_volume_lifecycle_and_idempotency() {
+    let client = client();
+    let vol_name = format!("test-sup-vol-{}", unique_name());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let bin_path = temp_dir.path().join("openshell-sandbox");
+    tokio::fs::write(&bin_path, b"dummy-supervisor-binary")
+        .await
+        .unwrap();
+
+    // 1. Initial creation
+    client
+        .ensure_supervisor_volume("default", &vol_name, &bin_path)
+        .await
+        .expect("initial ensure_supervisor_volume should succeed");
+
+    // Check volume exists
+    let exists = client
+        .storage_pool_volume_exists("default", "custom", &vol_name)
+        .await
+        .expect("storage_pool_volume_exists should succeed");
+    assert!(exists);
+
+    // 2. Second call is an idempotent no-op (short circuits on exists check)
+    client
+        .ensure_supervisor_volume("default", &vol_name, &bin_path)
+        .await
+        .expect("second ensure_supervisor_volume should succeed idempotently");
+
+    // Clean up volume
+    if let Ok(op) = client
+        .delete_storage_pool_volume("default", "custom", &vol_name)
+        .await
+    {
+        let _ = client.wait_operation(&op.id).await;
+    }
+}

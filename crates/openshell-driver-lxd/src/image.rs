@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use lxd_client::LxdClient;
 use regex::Regex;
+use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 
 use crate::error::DriverError;
@@ -117,6 +118,29 @@ pub fn host_lxd_arch() -> &'static str {
 /// (what `skopeo --override-arch` expects when selecting an image from a
 /// multi-arch index). This differs from [`host_lxd_arch`]: e.g. LXD calls
 /// amd64 `x86_64`, but OCI image indexes use `amd64`.
+/// Computes a `sha256:<hex>` digest of the file's bytes at the given path.
+pub fn digest_of_file(path: &Path) -> Result<String, DriverError> {
+    let bytes = std::fs::read(path).map_err(|e| {
+        DriverError::ImageImport(format!(
+            "failed to read supervisor binary at {}: {e}",
+            path.display()
+        ))
+    })?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    let digest_hex = hex_digest(&hasher.finalize());
+    Ok(format!("sha256:{digest_hex}"))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        use std::fmt::Write;
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 pub fn host_oci_arch() -> &'static str {
     match std::env::consts::ARCH {
         "x86_64" => "amd64",
@@ -137,6 +161,13 @@ pub trait OciImporter: Send + Sync {
 
     /// Imports the image identified by `digest` and registers it in LXD under `alias`.
     async fn import(&self, reference: &str, digest: &str, alias: &str) -> Result<(), DriverError>;
+
+    /// Extracts the supervisor binary from `reference` into `cache_dir`, returning the host binary path and image digest.
+    async fn extract_supervisor_binary(
+        &self,
+        reference: &str,
+        cache_dir: &Path,
+    ) -> Result<(PathBuf, String), DriverError>;
 }
 
 /// Abstraction over checking if an image alias exists in LXD.
@@ -223,6 +254,17 @@ impl ImageCache {
         tracing::info!(reference = %reference, digest = %digest, alias = %alias, "image cache miss; importing");
         self.importer.import(reference, &digest, &alias).await?;
         Ok(alias)
+    }
+
+    /// Extracts the supervisor binary from `reference` into `cache_dir`, returning the host binary path and image digest.
+    pub async fn extract_supervisor_binary(
+        &self,
+        reference: &str,
+        cache_dir: &Path,
+    ) -> Result<(PathBuf, String), DriverError> {
+        self.importer
+            .extract_supervisor_binary(reference, cache_dir)
+            .await
     }
 }
 
@@ -347,6 +389,7 @@ impl OciImporter for SkopeoImporter {
         let cmd = tokio::process::Command::new(&self.umoci_path)
             .args([
                 "unpack",
+                "--rootless",
                 "--image",
                 &format!("{}:img", oci_dest.display()),
                 &bundle_dest.display().to_string(),
@@ -447,6 +490,141 @@ impl OciImporter for SkopeoImporter {
             })?;
 
         Ok(())
+    }
+
+    async fn extract_supervisor_binary(
+        &self,
+        reference: &str,
+        cache_dir: &Path,
+    ) -> Result<(PathBuf, String), DriverError> {
+        validate_reference(reference)?;
+        let digest = self.resolve_digest(reference).await?;
+        let clean_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
+        let target_dir = cache_dir.join(clean_digest);
+        let binary_path = target_dir.join("openshell-sandbox");
+
+        if binary_path.exists() {
+            tracing::debug!(path = %binary_path.display(), "supervisor binary cache hit");
+            return Ok((binary_path, digest));
+        }
+
+        tracing::info!(
+            reference = %reference,
+            digest = %digest,
+            "supervisor binary cache miss; extracting"
+        );
+
+        let oci_arch = host_oci_arch();
+        let repo = repo_path(reference);
+        let copy_source = format!("docker://{repo}@{digest}");
+
+        let temp_dir = tempfile::Builder::new()
+            .prefix("openshell-supervisor-extract-")
+            .tempdir()
+            .map_err(|e| DriverError::ImageImport(format!("failed to create temp dir: {e}")))?;
+        let temp_path = temp_dir.path();
+
+        let oci_dest = temp_path.join("oci");
+        let bundle_dest = temp_path.join("bundle");
+        let rootfs_dest = bundle_dest.join("rootfs");
+
+        // 1. skopeo copy docker://<repo>@<digest> oci:<temp_path>/oci:img
+        let oci_tag_arg = format!("oci:{}:img", oci_dest.display());
+        let cmd = tokio::process::Command::new(&self.skopeo_path)
+            .args([
+                "copy",
+                "--override-os",
+                "linux",
+                "--override-arch",
+                oci_arch,
+                &copy_source,
+                &oci_tag_arg,
+            ])
+            .output();
+
+        let output = tokio::time::timeout(self.timeout, cmd)
+            .await
+            .map_err(|_| {
+                DriverError::ImageImport(format!("skopeo copy timed out for {copy_source:?}"))
+            })?
+            .map_err(|e| DriverError::ImageImport(format!("failed to execute skopeo copy: {e}")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DriverError::ImageImport(format!(
+                "skopeo copy failed for {copy_source:?}: {stderr}"
+            )));
+        }
+
+        // 2. umoci unpack --image <temp_path>/oci:img <temp_path>/bundle
+        let cmd = tokio::process::Command::new(&self.umoci_path)
+            .args([
+                "unpack",
+                "--rootless",
+                "--image",
+                &format!("{}:img", oci_dest.display()),
+                &bundle_dest.display().to_string(),
+            ])
+            .output();
+
+        let output = tokio::time::timeout(self.timeout, cmd)
+            .await
+            .map_err(|_| {
+                DriverError::ImageImport(format!("umoci unpack timed out for {reference}"))
+            })?
+            .map_err(|e| {
+                DriverError::ImageImport(format!("failed to execute umoci unpack: {e}"))
+            })?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(DriverError::ImageImport(format!(
+                "umoci unpack failed for {reference}: {stderr}"
+            )));
+        }
+
+        let extracted_source = rootfs_dest.join("openshell-sandbox");
+        if !extracted_source.exists() {
+            return Err(DriverError::ImageImport(format!(
+                "image {reference:?} does not contain /openshell-sandbox"
+            )));
+        }
+
+        tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
+            DriverError::ImageImport(format!(
+                "failed to create supervisor cache directory {}: {e}",
+                target_dir.display()
+            ))
+        })?;
+
+        let temp_target = target_dir.join(format!(".openshell-sandbox.tmp.{}", std::process::id()));
+        tokio::fs::copy(&extracted_source, &temp_target)
+            .await
+            .map_err(|e| {
+                DriverError::ImageImport(format!(
+                    "failed to copy extracted supervisor binary to {}: {e}",
+                    temp_target.display()
+                ))
+            })?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ =
+                tokio::fs::set_permissions(&temp_target, std::fs::Permissions::from_mode(0o755))
+                    .await;
+        }
+
+        tokio::fs::rename(&temp_target, &binary_path)
+            .await
+            .map_err(|e| {
+                DriverError::ImageImport(format!(
+                    "failed to commit extracted supervisor binary to {}: {e}",
+                    binary_path.display()
+                ))
+            })?;
+
+        Ok((binary_path, digest))
     }
 }
 
@@ -615,6 +793,7 @@ mod tests {
     struct MockImporter {
         digest_to_return: String,
         import_calls: std::sync::atomic::AtomicUsize,
+        extract_calls: std::sync::atomic::AtomicUsize,
         recorded_repo_digest: std::sync::Mutex<Vec<(String, String)>>,
         import_delay: Duration,
     }
@@ -642,6 +821,31 @@ mod tests {
             }
             Ok(())
         }
+
+        async fn extract_supervisor_binary(
+            &self,
+            _reference: &str,
+            cache_dir: &Path,
+        ) -> Result<(PathBuf, String), DriverError> {
+            self.extract_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let clean = self
+                .digest_to_return
+                .strip_prefix("sha256:")
+                .unwrap_or(&self.digest_to_return);
+            let target_dir = cache_dir.join(clean);
+            let binary_path = target_dir.join("openshell-sandbox");
+            if binary_path.exists() {
+                return Ok((binary_path, self.digest_to_return.clone()));
+            }
+            std::fs::create_dir_all(&target_dir).map_err(|e| {
+                DriverError::ImageImport(format!("failed to create cache dir: {e}"))
+            })?;
+            std::fs::write(&binary_path, b"mock-supervisor-binary").map_err(|e| {
+                DriverError::ImageImport(format!("failed to write mock binary: {e}"))
+            })?;
+            Ok((binary_path, self.digest_to_return.clone()))
+        }
     }
 
     struct MockAliasChecker {
@@ -662,6 +866,7 @@ mod tests {
         let importer = Arc::new(MockImporter {
             digest_to_return: digest.clone(),
             import_calls: std::sync::atomic::AtomicUsize::new(0),
+            extract_calls: std::sync::atomic::AtomicUsize::new(0),
             recorded_repo_digest: std::sync::Mutex::new(Vec::new()),
             import_delay: Duration::from_millis(50),
         });
@@ -733,6 +938,16 @@ mod tests {
                     .unwrap()
                     .insert(alias.to_string());
                 Ok(())
+            }
+
+            async fn extract_supervisor_binary(
+                &self,
+                reference: &str,
+                cache_dir: &Path,
+            ) -> Result<(PathBuf, String), DriverError> {
+                self.inner
+                    .extract_supervisor_binary(reference, cache_dir)
+                    .await
             }
         }
 
@@ -816,5 +1031,69 @@ mod tests {
             let mode = metadata.permissions().mode() & 0o777;
             assert_eq!(mode, 0o755);
         }
+    }
+
+    #[tokio::test]
+    async fn extract_supervisor_binary_cache_hit_and_miss() {
+        let digest_hex = "ee".repeat(32);
+        let digest = format!("sha256:{digest_hex}");
+        let importer = Arc::new(MockImporter {
+            digest_to_return: digest.clone(),
+            import_calls: std::sync::atomic::AtomicUsize::new(0),
+            extract_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorded_repo_digest: std::sync::Mutex::new(Vec::new()),
+            import_delay: Duration::ZERO,
+        });
+
+        let alias_checker = Arc::new(MockAliasChecker {
+            existing_aliases: std::sync::Mutex::new(std::collections::HashSet::new()),
+        });
+
+        let cache =
+            ImageCache::with_checker(alias_checker, importer.clone(), "test-oci-".to_string());
+
+        let temp_cache_dir = tempfile::tempdir().unwrap();
+
+        // 1. First extraction is a cache miss
+        let (bin_path1, dig1) = cache
+            .extract_supervisor_binary(
+                "ghcr.io/nvidia/openshell/supervisor:latest",
+                temp_cache_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dig1, digest);
+        assert!(bin_path1.exists());
+        assert_eq!(
+            importer
+                .extract_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // 2. Second extraction for same digest is a cache hit (calls extract_supervisor_binary on importer, but hits file check)
+        let (bin_path2, dig2) = cache
+            .extract_supervisor_binary(
+                "ghcr.io/nvidia/openshell/supervisor:latest",
+                temp_cache_dir.path(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dig2, digest);
+        assert_eq!(bin_path1, bin_path2);
+    }
+
+    #[test]
+    fn test_digest_of_file() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file_path = temp_dir.path().join("test_bin");
+        std::fs::write(&file_path, b"hello supervisor").unwrap();
+
+        let digest = digest_of_file(&file_path).unwrap();
+        // SHA-256("hello supervisor") = 13698ec9ad86f380ac98b76b758f96f23ed83b0107115f4dfee415be8a26fe38
+        assert_eq!(
+            digest,
+            "sha256:13698ec9ad86f380ac98b76b758f96f23ed83b0107115f4dfee415be8a26fe38"
+        );
     }
 }

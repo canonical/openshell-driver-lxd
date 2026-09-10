@@ -12,6 +12,7 @@ mod instances;
 mod networks;
 mod operations;
 pub mod resources;
+pub mod storage;
 mod types;
 
 pub use acls::{AclAction, AclProtocol, AclState, LxdNetworkAclRule};

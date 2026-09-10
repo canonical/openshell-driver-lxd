@@ -19,6 +19,18 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// `template.image`), so no image needs to be pre-built or pre-loaded.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
+/// Default supervisor OCI image to extract the supervisor binary from.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = DEFAULT_SANDBOX_IMAGE;
+
+/// Default host cache directory for extracted supervisor binaries.
+pub const DEFAULT_SUPERVISOR_CACHE_DIR: &str = "/var/cache/openshell/lxd-supervisor";
+
+/// Default LXD storage pool for supervisor custom storage volumes.
+pub const DEFAULT_SUPERVISOR_STORAGE_POOL: &str = "default";
+
+/// Default deadline, in seconds, for pulling and importing OCI images.
+pub const DEFAULT_IMAGE_PULL_TIMEOUT_SECS: u64 = 300;
+
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
@@ -49,6 +61,28 @@ pub struct Config {
     /// `template.image` is empty. Resolved and imported on demand.
     #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     pub default_image: String,
+
+    /// OCI image reference to extract the OpenShell supervisor binary from.
+    #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
+    pub supervisor_image: String,
+
+    /// Optional path to a pre-extracted OpenShell supervisor binary on the host.
+    /// When set, skips extracting the binary from the supervisor OCI image.
+    #[arg(long)]
+    pub supervisor_bin: Option<PathBuf>,
+
+    /// Host cache directory where extracted supervisor binaries are stored,
+    /// keyed by content digest.
+    #[arg(long, default_value = DEFAULT_SUPERVISOR_CACHE_DIR)]
+    pub supervisor_cache_dir: PathBuf,
+
+    /// LXD storage pool where supervisor custom storage volumes are created.
+    #[arg(long, default_value = DEFAULT_SUPERVISOR_STORAGE_POOL)]
+    pub supervisor_storage_pool: String,
+
+    /// Deadline, in seconds, for pulling and importing OCI images before failing.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
+    pub image_pull_timeout_secs: u64,
 
     /// Prefix for digest-derived LXD image aliases.
     #[arg(long, default_value = DEFAULT_IMAGE_CACHE_ALIAS_PREFIX)]

@@ -57,7 +57,12 @@ async fn ensure_sandbox_image_alias() -> String {
 }
 
 fn service() -> ComputeDriverService {
-    let config = Config::parse_from(["openshell-driver-lxd"]);
+    let cache_dir = std::env::temp_dir().join("openshell-test-supervisor-cache");
+    let config = Config::parse_from([
+        "openshell-driver-lxd",
+        "--supervisor-cache-dir",
+        cache_dir.to_str().unwrap(),
+    ]);
     ComputeDriverService::new(LxdComputeDriver::new(config, raw_lxd_client()))
 }
 
@@ -112,6 +117,22 @@ async fn create_get_list_stop_delete_lifecycle() {
     assert_eq!(got.namespace, "default");
     assert_eq!(got.workspace, "test-workspace");
     assert_eq!(got.id, name);
+
+    // Verify via raw LxdClient that the instance has the supervisor custom storage volume attached
+    let raw_instance = raw_lxd_client()
+        .get_instance(&name)
+        .await
+        .expect("get_instance via raw client should succeed");
+    let supervisor_dev = raw_instance
+        .devices
+        .get("supervisor")
+        .expect("supervisor disk device should be present on created sandbox");
+    assert_eq!(supervisor_dev.get("type"), Some(&"disk".to_string()));
+    assert_eq!(
+        supervisor_dev.get("path"),
+        Some(&"/opt/openshell/bin".to_string())
+    );
+    assert_eq!(supervisor_dev.get("readonly"), Some(&"true".to_string()));
 
     let listed = service
         .list_sandboxes(Request::new(ListSandboxesRequest {}))

@@ -147,8 +147,22 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   `--default-image` (default: the upstream `ghcr.io/nvidia/openshell/supervisor:latest`),
   which is resolved and imported through the same on-demand path.
 - **Configuration flags:**
+  - `--supervisor-image`: OCI image reference to extract the OpenShell supervisor binary from (default: `ghcr.io/nvidia/openshell/supervisor:latest`).
+  - `--supervisor-bin`: optional path to a pre-extracted supervisor binary on the host (bypasses extraction).
+  - `--supervisor-cache-dir`: host directory for caching extracted supervisor binaries by content digest (default: `/var/cache/openshell/lxd-supervisor`).
+  - `--supervisor-storage-pool`: LXD storage pool where supervisor custom storage volumes are created (default: `default`).
+  - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
+
+### Supervisor Binary Delivery via Custom Storage Volume
+
+Upstream Docker and Podman drivers extract the supervisor binary (`/openshell-sandbox`) to a host cache and bind-mount it into sandboxes. For LXD, a host-path bind mount fails in clustered or distributed storage environments (e.g. Ceph) where containers may run on cluster nodes different from the driver host.
+
+`openshell-driver-lxd` instead packages the supervisor binary into a digest-keyed LXD custom storage volume (`openshell-supervisor-<digest>`) on `--supervisor-storage-pool`, following the pattern established in `canonical/workshop` (`lxd_backend_sdk.go`):
+- **Volume layout & Mount distinction:** A `content-type: filesystem` storage volume is a filesystem tree. The volume contains `openshell-sandbox` at its root and is attached to each sandbox container as a read-only `disk` device mounted at directory `/opt/openshell/bin`. The injected guest init script (`/openshell-init.sh`) execs the binary at `/opt/openshell/bin/openshell-sandbox`.
+- **Clustered LXD safety:** Because the disk device refers to a named storage-pool volume rather than a local host path, LXD manages replication and cluster-wide attachment automatically.
+- **Idempotency & Race safety:** Volume creation is serialized in-process per digest and handles existing volume conflicts idempotently. Subsequent sandboxes reusing the same supervisor binary digest share the volume.
 
 ## Known limitations
 
