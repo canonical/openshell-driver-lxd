@@ -2,6 +2,7 @@
 
 //! Core LXD compute driver logic, independent of the gRPC transport.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
@@ -9,6 +10,7 @@ use lxd_client::{LxdClient, LxdError};
 
 use crate::config::Config;
 use crate::error::DriverError;
+use crate::image::{ImageCache, SkopeoImporter};
 use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
@@ -42,12 +44,46 @@ fn is_already_stopped(err: &LxdError) -> bool {
 pub struct LxdComputeDriver {
     config: Config,
     lxd: LxdClient,
+    image_cache: ImageCache,
 }
 
 impl LxdComputeDriver {
     #[must_use]
     pub fn new(config: Config, lxd: LxdClient) -> Self {
-        Self { config, lxd }
+        let importer = Arc::new(SkopeoImporter::new(
+            lxd.clone(),
+            config.skopeo_path.clone(),
+            config.umoci_path.clone(),
+            config.mksquashfs_path.clone(),
+            Duration::from_secs(config.operation_timeout_secs),
+        ));
+        let image_cache = ImageCache::new(
+            lxd.clone(),
+            importer,
+            config.image_cache_alias_prefix.clone(),
+        );
+        Self::with_image_cache(config, lxd, image_cache)
+    }
+
+    #[must_use]
+    pub fn with_image_cache(config: Config, lxd: LxdClient, image_cache: ImageCache) -> Self {
+        Self {
+            config,
+            lxd,
+            image_cache,
+        }
+    }
+
+    /// Best-effort pre-warm of the default sandbox image so the first
+    /// `create_sandbox` need not block on a registry pull, and so a bad
+    /// default reference or an unreachable registry surfaces at startup
+    /// rather than on the first request. Importing requires the external
+    /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
+    /// otherwise ignored — the same import is retried on first use.
+    pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
+        self.image_cache
+            .resolve_alias(&self.config.default_image)
+            .await
     }
 
     /// Report driver capabilities and defaults.
@@ -203,23 +239,27 @@ impl LxdComputeDriver {
         let devices = mapping::build_create_devices(template, gpu.is_some());
         let profiles = mapping::build_profiles(template);
 
-        // v1: always use the configured default image; template.image is
-        // accepted by ValidateSandboxCreate but not yet consulted.
-        if !template.image.is_empty() {
-            tracing::debug!(
-                image = %template.image,
-                default = %self.config.default_image,
-                "template.image is ignored in v1; using default image"
-            );
-        }
-        let image = &self.config.default_image;
+        let image_alias = if template.image.is_empty() {
+            self.image_cache
+                .resolve_alias(&self.config.default_image)
+                .await?
+        } else {
+            self.image_cache.resolve_alias(&template.image).await?
+        };
 
         // Create the instance stopped so we can push the token file before the
         // supervisor starts — avoids a race where the supervisor reads
         // OPENSHELL_SANDBOX_TOKEN_FILE before it has been written.
         let op = self
             .lxd
-            .create_instance(&sandbox.name, image, config, devices, profiles, false)
+            .create_instance(
+                &sandbox.name,
+                &image_alias,
+                config,
+                devices,
+                profiles,
+                false,
+            )
             .await?;
         self.wait_operation(&op.id).await?;
 
@@ -394,7 +434,10 @@ mod tests {
 
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.default_image, "openshell-sandbox");
+        assert_eq!(
+            response.default_image,
+            "ghcr.io/nvidia/openshell/supervisor:latest"
+        );
     }
 
     #[tokio::test]
@@ -443,5 +486,88 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .await
             .expect("omitted gpu.count should be accepted");
+    }
+
+    struct MockAliasChecker {
+        exists: bool,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::ImageAliasChecker for MockAliasChecker {
+        async fn image_alias_exists(&self, _alias: &str) -> Result<bool, DriverError> {
+            Ok(self.exists)
+        }
+    }
+
+    struct MockImporter {
+        digest: String,
+        imported_alias: std::sync::Mutex<Option<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::OciImporter for MockImporter {
+        async fn resolve_digest(&self, _reference: &str) -> Result<String, DriverError> {
+            Ok(self.digest.clone())
+        }
+
+        async fn import(
+            &self,
+            _reference: &str,
+            _digest: &str,
+            alias: &str,
+        ) -> Result<(), DriverError> {
+            *self.imported_alias.lock().unwrap() = Some(alias.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_resolves_image_or_defaults() {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+
+        let digest_hex = "ee".repeat(32);
+        let importer = Arc::new(MockImporter {
+            digest: format!("sha256:{digest_hex}"),
+            imported_alias: std::sync::Mutex::new(None),
+        });
+        let checker = Arc::new(MockAliasChecker { exists: true });
+        let cache =
+            ImageCache::with_checker(checker, importer, config.image_cache_alias_prefix.clone());
+
+        let driver = LxdComputeDriver::with_image_cache(config, lxd, cache);
+
+        // 1. Empty template.image falls back to default_image, which is now
+        //    itself an OCI reference resolved through the same import path.
+        let empty_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _sb_empty = sandbox_with_spec(empty_spec);
+        assert_eq!(
+            driver.config.default_image,
+            "ghcr.io/nvidia/openshell/supervisor:latest"
+        );
+
+        // 2. Non-empty template.image resolves to the digest-derived alias
+        let custom_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "registry.example.com/custom:v1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sb_custom = sandbox_with_spec(custom_spec);
+        let template = sb_custom.spec.unwrap().template.unwrap();
+        let resolved = driver
+            .image_cache
+            .resolve_alias(&template.image)
+            .await
+            .unwrap();
+        assert_eq!(resolved, format!("openshell-oci-{digest_hex}"));
     }
 }

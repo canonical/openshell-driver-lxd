@@ -16,7 +16,7 @@ use crate::types::{Operation, OperationStatus};
 const RECONCILE_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 enum Reconciled {
-    Done(Result<Operation, LxdError>),
+    Done(Box<Result<Operation, LxdError>>),
     Pending,
 }
 
@@ -65,7 +65,7 @@ impl LxdClient {
             // Reconcile: the operation may have reached a terminal state while
             // we were connecting the WebSocket.
             if let Reconciled::Done(outcome) = self.reconcile_operation(id).await? {
-                return outcome;
+                return *outcome;
             }
 
             // Drain the event stream until we see a terminal event for this operation.
@@ -113,7 +113,7 @@ impl LxdClient {
 
             // Stream ended (cleanly or with an error); reconcile before retrying.
             if let Reconciled::Done(outcome) = self.reconcile_operation(id).await? {
-                return outcome;
+                return *outcome;
             }
 
             // Always sleep before re-subscribing to avoid a busy-loop when LXD
@@ -128,16 +128,18 @@ impl LxdClient {
     /// so the outer loop retries rather than propagating a transient failure.
     async fn reconcile_operation(&self, id: &str) -> Result<Reconciled, LxdError> {
         match self.get_operation(id).await {
-            Ok(op) if op.status == OperationStatus::Success => Ok(Reconciled::Done(Ok(op))),
+            Ok(op) if op.status == OperationStatus::Success => {
+                Ok(Reconciled::Done(Box::new(Ok(op))))
+            }
             Ok(op)
                 if op.status == OperationStatus::Failure
                     || op.status == OperationStatus::Cancelled
                     || !op.err.is_empty() =>
             {
-                Ok(Reconciled::Done(Err(LxdError::OperationFailed {
+                Ok(Reconciled::Done(Box::new(Err(LxdError::OperationFailed {
                     description: op.description,
                     err: op.err,
-                })))
+                }))))
             }
             Ok(_) => Ok(Reconciled::Pending),
             Err(LxdError::Io(_) | LxdError::Hyper(_)) => Ok(Reconciled::Pending),

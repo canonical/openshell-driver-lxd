@@ -14,14 +14,19 @@ pub const DEFAULT_LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
 /// Default tracing log level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default sandbox image alias.
-pub const DEFAULT_SANDBOX_IMAGE: &str = "openshell-sandbox";
+/// Default sandbox image: the upstream OpenShell supervisor OCI image. It is
+/// resolved and imported on demand through the OCI import path (like any
+/// `template.image`), so no image needs to be pre-built or pre-loaded.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
 /// Default deadline, in seconds, for waiting on an LXD operation to complete.
 pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
+
+/// Default prefix for digest-derived LXD image aliases.
+pub const DEFAULT_IMAGE_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
@@ -40,9 +45,26 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_LOG_LEVEL)]
     pub log_level: String,
 
-    /// LXD image alias every sandbox is created from.
+    /// OCI image reference every sandbox is created from when the request's
+    /// `template.image` is empty. Resolved and imported on demand.
     #[arg(long, default_value = DEFAULT_SANDBOX_IMAGE)]
     pub default_image: String,
+
+    /// Prefix for digest-derived LXD image aliases.
+    #[arg(long, default_value = DEFAULT_IMAGE_CACHE_ALIAS_PREFIX)]
+    pub image_cache_alias_prefix: String,
+
+    /// Optional path override for the skopeo binary.
+    #[arg(long)]
+    pub skopeo_path: Option<PathBuf>,
+
+    /// Optional path override for the umoci binary.
+    #[arg(long)]
+    pub umoci_path: Option<PathBuf>,
+
+    /// Optional path override for the mksquashfs binary.
+    #[arg(long)]
+    pub mksquashfs_path: Option<PathBuf>,
 
     /// Remote LXD HTTPS endpoint (e.g. https://10.0.0.1:8443).
     /// When set, --lxd-socket is ignored and HTTPS+mTLS is used instead.

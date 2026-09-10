@@ -4,14 +4,17 @@
 //! through the gRPC service, driven in-process (no socket needed, mirroring
 //! `tests/get_capabilities.rs`).
 //!
-//! Requires a running LXD with a `default` storage pool, an `lxdbr0`
-//! network, and a published `openshell-sandbox` image alias (locally: `make
-//! sandbox-image`; CI builds and imports the same image via the
-//! container-image job).
+//! Requires a running LXD with a `default` storage pool and an `lxdbr0`
+//! network. The sandbox image is the upstream OpenShell supervisor image,
+//! which the driver pulls and imports on demand via `skopeo`/`umoci`/
+//! `mksquashfs` — no image needs to be pre-built or pre-loaded. The test
+//! host must therefore have those tools installed and outbound access to
+//! `ghcr.io`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use computev1::pb::compute_driver_server::ComputeDriver;
@@ -23,10 +26,34 @@ use lxd_client::{LxdClient, LxdEndpoint};
 use openshell_driver_lxd::config::{Config, DEFAULT_LXD_SOCKET};
 use openshell_driver_lxd::driver::LxdComputeDriver;
 use openshell_driver_lxd::grpc::ComputeDriverService;
+use openshell_driver_lxd::image::{ImageCache, SkopeoImporter};
 use tonic::{Code, Request};
+
+/// Upstream OpenShell supervisor image, imported on demand by the driver.
+const SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
 fn raw_lxd_client() -> LxdClient {
     LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap()
+}
+
+/// Imports [`SANDBOX_IMAGE`] through the same code path the driver uses and
+/// returns the resulting local LXD image alias. Lets tests that create
+/// instances directly via the raw client (bypassing the driver) still boot
+/// from a real, present image without depending on any pre-built alias.
+async fn ensure_sandbox_image_alias() -> String {
+    let config = Config::parse_from(["openshell-driver-lxd"]);
+    let importer = Arc::new(SkopeoImporter::new(
+        raw_lxd_client(),
+        None,
+        None,
+        None,
+        Duration::from_secs(config.operation_timeout_secs),
+    ));
+    let cache = ImageCache::new(raw_lxd_client(), importer, config.image_cache_alias_prefix);
+    cache
+        .resolve_alias(SANDBOX_IMAGE)
+        .await
+        .expect("importing the upstream sandbox image should succeed")
 }
 
 fn service() -> ComputeDriverService {
@@ -50,7 +77,7 @@ fn sandbox(name: &str) -> DriverSandbox {
         workspace: "test-workspace".to_string(),
         spec: Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
-                image: "ignored-in-v1".to_string(),
+                image: String::new(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -213,6 +240,7 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     let service = service();
     let raw_lxd = raw_lxd_client();
     let name = unique_name();
+    let image_alias = ensure_sandbox_image_alias().await;
 
     // Created directly via lxd-client, bypassing create_sandbox, so it never
     // gets the user.openshell.sandbox_id marker. Still needs the "default"
@@ -222,7 +250,7 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     let create_op = raw_lxd
         .create_instance(
             &name,
-            "openshell-sandbox",
+            &image_alias,
             HashMap::new(),
             HashMap::new(),
             vec!["default".to_string()],

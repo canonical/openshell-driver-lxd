@@ -104,6 +104,13 @@ impl LxdClient {
         guest_path: &str,
         content: &[u8],
     ) -> Result<(), LxdError> {
+        // LXD's file-push API does not create missing parent directories, so
+        // create each ancestor first. The old purpose-built sandbox image
+        // shipped the token directory as a placeholder; with arbitrary base
+        // images (e.g. the upstream supervisor image) it may not exist.
+        self.create_parent_dirs_in_instance(name, guest_path)
+            .await?;
+
         let encoded_path = encode(guest_path);
         self.post_raw(
             &format!("/1.0/instances/{name}/files?path={encoded_path}"),
@@ -118,5 +125,45 @@ impl LxdClient {
             hyper::body::Bytes::copy_from_slice(content),
         )
         .await
+    }
+
+    /// Creates every ancestor directory of `guest_path` inside the container,
+    /// shallowest first, tolerating directories that already exist. Uses the
+    /// LXD files API with `X-LXD-type: directory`; the container need not be
+    /// running (same overlay-access rules as file push).
+    async fn create_parent_dirs_in_instance(
+        &self,
+        name: &str,
+        guest_path: &str,
+    ) -> Result<(), LxdError> {
+        let mut prefix = String::new();
+        let components: Vec<&str> = guest_path.split('/').filter(|c| !c.is_empty()).collect();
+        // Skip the last component: it is the file itself, not a directory.
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            prefix.push('/');
+            prefix.push_str(component);
+            let encoded_path = encode(&prefix);
+            let result = self
+                .post_raw(
+                    &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                    "application/octet-stream",
+                    &[
+                        ("X-LXD-uid", "0"),
+                        ("X-LXD-gid", "0"),
+                        ("X-LXD-mode", "0755"),
+                        ("X-LXD-type", "directory"),
+                    ],
+                    hyper::body::Bytes::new(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                // A directory that already exists is fine; LXD reports it with
+                // a 500/"already exists" style error. Anything else propagates.
+                Err(LxdError::Api { message, .. }) if message.contains("exists") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
     }
 }
