@@ -29,6 +29,9 @@ pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.j
 /// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
 pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
 
+/// Guest-side directory where the digest-keyed DHCP client storage volume is mounted.
+pub(crate) const GUEST_DHCP_CLIENT_DIR: &str = "/opt/openshell/net";
+
 /// Guest-side executable path of the supervisor binary inside the mounted volume directory.
 #[allow(dead_code)]
 pub(crate) const GUEST_SUPERVISOR_BIN_PATH: &str = "/opt/openshell/bin/openshell-sandbox";
@@ -37,6 +40,12 @@ pub(crate) const GUEST_SUPERVISOR_BIN_PATH: &str = "/opt/openshell/bin/openshell
 pub(crate) fn supervisor_volume_name(digest: &str) -> String {
     let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
     format!("openshell-supervisor-{clean}")
+}
+
+/// Deterministic LXD custom storage volume name for the given DHCP client digest.
+pub(crate) fn dhcp_client_volume_name(digest: &str) -> String {
+    let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
+    format!("openshell-dhcp-client-{clean}")
 }
 
 /// LXD system containers ignore OCI entrypoints and run their own init. To ensure
@@ -200,12 +209,15 @@ pub fn build_create_config(
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
 /// the configured (or default) storage pool, a NIC on the configured (or
-/// default) network, a read-only supervisor disk volume, and an optional GPU device.
+/// default) network, a read-only supervisor disk volume, a read-only DHCP client
+/// disk volume, and an optional GPU device.
 pub fn build_create_devices(
     template: &DriverSandboxTemplate,
     gpu: bool,
     supervisor_pool: &str,
     supervisor_volume: &str,
+    dhcp_client_pool: &str,
+    dhcp_client_volume: &str,
 ) -> HashMap<String, HashMap<String, String>> {
     let mut devices = HashMap::new();
 
@@ -227,6 +239,14 @@ pub fn build_create_devices(
     supervisor.insert("path".to_string(), GUEST_SUPERVISOR_BIN_DIR.to_string());
     supervisor.insert("readonly".to_string(), "true".to_string());
     devices.insert("supervisor".to_string(), supervisor);
+
+    let mut dhcp_client = HashMap::new();
+    dhcp_client.insert("type".to_string(), "disk".to_string());
+    dhcp_client.insert("pool".to_string(), dhcp_client_pool.to_string());
+    dhcp_client.insert("source".to_string(), dhcp_client_volume.to_string());
+    dhcp_client.insert("path".to_string(), GUEST_DHCP_CLIENT_DIR.to_string());
+    dhcp_client.insert("readonly".to_string(), "true".to_string());
+    devices.insert("dhcp-client".to_string(), dhcp_client);
 
     if gpu {
         let mut gpu0 = HashMap::new();
@@ -291,20 +311,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_dhcp_client_volume_name() {
+        assert_eq!(
+            dhcp_client_volume_name("sha256:abc123def456"),
+            "openshell-dhcp-client-abc123def456"
+        );
+        assert_eq!(
+            dhcp_client_volume_name("abc123def456"),
+            "openshell-dhcp-client-abc123def456"
+        );
+    }
+
+    #[test]
     fn build_create_devices_omits_gpu_by_default() {
-        let devices =
-            build_create_devices(&DriverSandboxTemplate::default(), false, "default", "vol1");
+        let devices = build_create_devices(
+            &DriverSandboxTemplate::default(),
+            false,
+            "default",
+            "vol1",
+            "default",
+            "dhcp-vol1",
+        );
 
         assert!(!devices.contains_key("gpu0"));
         assert!(devices.contains_key("root"));
         assert!(devices.contains_key("eth0"));
         assert!(devices.contains_key("supervisor"));
+        assert!(devices.contains_key("dhcp-client"));
     }
 
     #[test]
     fn build_create_devices_attaches_gpu_when_requested() {
-        let devices =
-            build_create_devices(&DriverSandboxTemplate::default(), true, "default", "vol1");
+        let devices = build_create_devices(
+            &DriverSandboxTemplate::default(),
+            true,
+            "default",
+            "vol1",
+            "default",
+            "dhcp-vol1",
+        );
 
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
@@ -312,14 +357,17 @@ mod tests {
     }
 
     #[test]
-    fn build_create_devices_attaches_supervisor_volume() {
+    fn build_create_devices_attaches_supervisor_and_dhcp_client_volumes() {
         let digest = "sha256:11223344556677889900aabbccddeeff11223344556677889900aabbccddeeff";
-        let vol_name = supervisor_volume_name(digest);
+        let sup_vol_name = supervisor_volume_name(digest);
+        let dhcp_vol_name = dhcp_client_volume_name(digest);
         let devices = build_create_devices(
             &DriverSandboxTemplate::default(),
             false,
             "custom-pool",
-            &vol_name,
+            &sup_vol_name,
+            "custom-dhcp-pool",
+            &dhcp_vol_name,
         );
 
         let sup = devices
@@ -327,9 +375,18 @@ mod tests {
             .expect("supervisor device should be present");
         assert_eq!(sup.get("type"), Some(&"disk".to_string()));
         assert_eq!(sup.get("pool"), Some(&"custom-pool".to_string()));
-        assert_eq!(sup.get("source"), Some(&vol_name));
+        assert_eq!(sup.get("source"), Some(&sup_vol_name));
         assert_eq!(sup.get("path"), Some(&GUEST_SUPERVISOR_BIN_DIR.to_string()));
         assert_eq!(sup.get("readonly"), Some(&"true".to_string()));
+
+        let dhcp = devices
+            .get("dhcp-client")
+            .expect("dhcp-client device should be present");
+        assert_eq!(dhcp.get("type"), Some(&"disk".to_string()));
+        assert_eq!(dhcp.get("pool"), Some(&"custom-dhcp-pool".to_string()));
+        assert_eq!(dhcp.get("source"), Some(&dhcp_vol_name));
+        assert_eq!(dhcp.get("path"), Some(&GUEST_DHCP_CLIENT_DIR.to_string()));
+        assert_eq!(dhcp.get("readonly"), Some(&"true".to_string()));
     }
 
     #[test]
@@ -340,5 +397,6 @@ mod tests {
             GUEST_SUPERVISOR_BIN_PATH,
             format!("{GUEST_SUPERVISOR_BIN_DIR}/openshell-sandbox")
         );
+        assert_eq!(GUEST_DHCP_CLIENT_DIR, "/opt/openshell/net");
     }
 }

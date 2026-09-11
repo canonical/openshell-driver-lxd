@@ -166,4 +166,27 @@ impl LxdClient {
         }
         Ok(())
     }
+
+    /// `GET /1.0/instances/<name>/files?path=<guest_path>`: fetches a file from
+    /// an instance, returning its content and mode (e.g. `0o755`).
+    pub async fn get_file_from_instance(
+        &self,
+        name: &str,
+        guest_path: &str,
+    ) -> Result<(hyper::body::Bytes, u32), LxdError> {
+        let encoded_path = encode(guest_path);
+        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let (headers, body) = self.get_raw_with_headers(&path).await?;
+        let mode_str = headers
+            .get("X-LXD-mode")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0644");
+        let clean_mode = mode_str.trim_start_matches('0');
+        let mode = if clean_mode.is_empty() {
+            0
+        } else {
+            u32::from_str_radix(clean_mode, 8).unwrap_or(0)
+        };
+        Ok((body, mode))
+    }
 }

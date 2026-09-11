@@ -32,6 +32,10 @@ use tonic::{Code, Request};
 /// Upstream OpenShell supervisor image, imported on demand by the driver.
 const SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
 
+/// Sandbox base image known to have NO built-in DHCP client (neither udhcpc,
+/// dhclient, nor dhcpcd), exercising the driver's bundled fallback DHCP client.
+const NO_DHCP_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+
 fn raw_lxd_client() -> LxdClient {
     LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap()
 }
@@ -134,6 +138,17 @@ async fn create_get_list_stop_delete_lifecycle() {
     );
     assert_eq!(supervisor_dev.get("readonly"), Some(&"true".to_string()));
 
+    let dhcp_dev = raw_instance
+        .devices
+        .get("dhcp-client")
+        .expect("dhcp-client disk device should be present on created sandbox");
+    assert_eq!(dhcp_dev.get("type"), Some(&"disk".to_string()));
+    assert_eq!(
+        dhcp_dev.get("path"),
+        Some(&"/opt/openshell/net".to_string())
+    );
+    assert_eq!(dhcp_dev.get("readonly"), Some(&"true".to_string()));
+
     let listed = service
         .list_sandboxes(Request::new(ListSandboxesRequest {}))
         .await
@@ -172,6 +187,87 @@ async fn create_get_list_stop_delete_lifecycle() {
         .expect("deleting an already-gone sandbox should succeed, not error")
         .into_inner();
     assert!(!deleted_again.deleted);
+}
+
+#[tokio::test]
+async fn create_sandbox_fallback_dhcp_without_builtin_client() {
+    let service = service();
+    let name = unique_name();
+
+    let mut sb = sandbox(&name);
+    if let Some(spec) = sb.spec.as_mut() {
+        if let Some(template) = spec.template.as_mut() {
+            template.image = NO_DHCP_SANDBOX_IMAGE.to_string();
+        }
+    }
+
+    service
+        .create_sandbox(Request::new(CreateSandboxRequest { sandbox: Some(sb) }))
+        .await
+        .expect("create_sandbox with no-DHCP base image should succeed");
+
+    let got = service
+        .get_sandbox(Request::new(GetSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("get_sandbox should succeed")
+        .into_inner()
+        .sandbox
+        .expect("response should carry a sandbox");
+    assert_eq!(got.name, name);
+
+    let status = got.status.expect("sandbox should have status");
+    let ready_cond = status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "Ready")
+        .expect("sandbox should have Ready condition");
+    assert_eq!(
+        ready_cond.status, "True",
+        "sandbox with no built-in DHCP client should reach Ready via fallback DHCP client"
+    );
+
+    // Verify via raw LxdClient that eth0 acquired an IPv4 lease
+    let mut has_ipv4 = false;
+    for _ in 0..20 {
+        if let Ok(raw_state) = raw_lxd_client().get_instance_state(&name).await {
+            if let Some(eth0_net) = raw_state.network.get("eth0") {
+                if eth0_net
+                    .addresses
+                    .iter()
+                    .any(|a| a.family == "inet" && a.scope == "global" && !a.address.is_empty())
+                {
+                    has_ipv4 = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        has_ipv4,
+        "eth0 must have acquired an IPv4 address via the bundled fallback DHCP client"
+    );
+
+    service
+        .stop_sandbox(Request::new(StopSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("stop_sandbox should succeed");
+
+    let deleted = service
+        .delete_sandbox(Request::new(DeleteSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("delete_sandbox should succeed")
+        .into_inner();
+    assert!(deleted.deleted);
 }
 
 #[tokio::test]

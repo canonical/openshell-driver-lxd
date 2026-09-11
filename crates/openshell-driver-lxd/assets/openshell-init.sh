@@ -28,6 +28,8 @@ elif command -v dhclient >/dev/null 2>&1; then
     fi
 elif command -v dhcpcd >/dev/null 2>&1; then
     dhcpcd -1 -t 30 eth0 || true
+elif [ -x /opt/openshell/net/udhcpc ]; then
+    /opt/openshell/net/udhcpc -i eth0 -f -q -n -t 10 -T 3 -s /opt/openshell/net/udhcpc.script || true
 else
     echo "openshell-init: no supported DHCP client found (udhcpc, dhclient, dhcpcd)" >&2
     exit 1
@@ -35,7 +37,7 @@ fi
 
 # Ensure IPv4 address is acquired (wait up to remaining time if needed)
 waited=0
-while ! has_ipv4 && [ "$waited" -lt 3 ]; do
+while ! has_ipv4 && [ "$waited" -lt 10 ]; do
     sleep 1
     waited=$((waited + 1))
 done

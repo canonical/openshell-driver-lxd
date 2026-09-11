@@ -106,16 +106,54 @@ impl LxdClient {
         name: &str,
         binary: &Path,
     ) -> Result<(), LxdError> {
+        let binary_bytes = tokio::fs::read(binary).await?;
+        self.ensure_single_file_volume(pool, name, &[("openshell-sandbox", &binary_bytes, 0o755)])
+            .await
+    }
+
+    /// Ensures a digest-keyed DHCP client storage volume exists on `pool`.
+    ///
+    /// Packages `binary_bytes` as `udhcpc` and `script_bytes` as `udhcpc.script`,
+    /// creates the volume with `content-type: filesystem` and `security.shifted: true`,
+    /// and treats an "already exists" conflict as success.
+    pub async fn ensure_dhcp_client_volume(
+        &self,
+        pool: &str,
+        name: &str,
+        binary_bytes: &[u8],
+        script_bytes: &[u8],
+    ) -> Result<(), LxdError> {
+        self.ensure_single_file_volume(
+            pool,
+            name,
+            &[
+                ("udhcpc", binary_bytes, 0o755),
+                ("udhcpc.script", script_bytes, 0o755),
+            ],
+        )
+        .await
+    }
+
+    /// Ensures a digest-keyed storage volume exists on `pool` containing the given file entries.
+    ///
+    /// Packages `entries` into a tarball, creates the volume with
+    /// `content-type: filesystem` and `security.shifted: true`, and treats an
+    /// "already exists" conflict as success.
+    pub async fn ensure_single_file_volume(
+        &self,
+        pool: &str,
+        name: &str,
+        entries: &[(&str, &[u8], u32)],
+    ) -> Result<(), LxdError> {
         if self
             .storage_pool_volume_exists(pool, "custom", name)
             .await?
         {
-            tracing::debug!(pool = %pool, name = %name, "supervisor volume already exists");
+            tracing::debug!(pool = %pool, name = %name, "storage volume already exists");
             return Ok(());
         }
 
-        let binary_bytes = tokio::fs::read(binary).await?;
-        let tarball_bytes = create_single_file_tarball("openshell-sandbox", &binary_bytes, 0o755)?;
+        let tarball_bytes = create_multi_file_tarball(entries)?;
 
         match self
             .create_storage_pool_volume_from_tarball(pool, name, &tarball_bytes)
@@ -159,19 +197,29 @@ impl LxdClient {
     }
 }
 
+/// Helper to create an in-memory tarball containing multiple files at root.
+pub(crate) fn create_multi_file_tarball(
+    entries: &[(&str, &[u8], u32)],
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut builder = tar::Builder::new(Vec::new());
+    for (filename, contents, mode) in entries {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(contents.len() as u64);
+        header.set_mode(*mode);
+        header.set_cksum();
+        builder.append_data(&mut header, *filename, *contents)?;
+    }
+    builder.into_inner()
+}
+
 /// Helper to create an in-memory tarball containing a single file at root.
+#[cfg(test)]
 pub(crate) fn create_single_file_tarball(
     filename: &str,
     contents: &[u8],
     mode: u32,
 ) -> Result<Vec<u8>, std::io::Error> {
-    let mut builder = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_size(contents.len() as u64);
-    header.set_mode(mode);
-    header.set_cksum();
-    builder.append_data(&mut header, filename, contents)?;
-    builder.into_inner()
+    create_multi_file_tarball(&[(filename, contents, mode)])
 }
 
 /// Checks whether an error from volume creation represents an already-exists conflict.
@@ -210,6 +258,36 @@ mod tests {
         let mut extracted = Vec::new();
         std::io::Read::read_to_end(&mut entry, &mut extracted).unwrap();
         assert_eq!(extracted, content);
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn test_create_multi_file_tarball() {
+        let bin_content = b"fake-binary";
+        let script_content = b"#!/bin/sh\necho test\n";
+        let tar_bytes = create_multi_file_tarball(&[
+            ("udhcpc", bin_content, 0o755),
+            ("udhcpc.script", script_content, 0o755),
+        ])
+        .unwrap();
+
+        let mut archive = tar::Archive::new(&tar_bytes[..]);
+        let mut entries = archive.entries().unwrap();
+
+        let mut entry1 = entries.next().unwrap().unwrap();
+        assert_eq!(entry1.path().unwrap().to_str().unwrap(), "udhcpc");
+        assert_eq!(entry1.header().mode().unwrap(), 0o755);
+        let mut extracted1 = Vec::new();
+        std::io::Read::read_to_end(&mut entry1, &mut extracted1).unwrap();
+        assert_eq!(extracted1, bin_content);
+
+        let mut entry2 = entries.next().unwrap().unwrap();
+        assert_eq!(entry2.path().unwrap().to_str().unwrap(), "udhcpc.script");
+        assert_eq!(entry2.header().mode().unwrap(), 0o755);
+        let mut extracted2 = Vec::new();
+        std::io::Read::read_to_end(&mut entry2, &mut extracted2).unwrap();
+        assert_eq!(extracted2, script_content);
+
         assert!(entries.next().is_none());
     }
 

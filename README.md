@@ -164,6 +164,15 @@ Upstream Docker and Podman drivers extract the supervisor binary (`/openshell-sa
 - **Clustered LXD safety:** Because the disk device refers to a named storage-pool volume rather than a local host path, LXD manages replication and cluster-wide attachment automatically.
 - **Idempotency & Race safety:** Volume creation is serialized in-process per digest and handles existing volume conflicts idempotently. Subsequent sandboxes reusing the same supervisor binary digest share the volume.
 
+### Bundled Fallback DHCP Client Delivery
+
+Guest networking on LXD containers relies on DHCP over `eth0`. Some base sandbox images (such as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`) do not bundle any DHCP client.
+
+To guarantee sandboxes obtain an IP lease regardless of what packages are installed in the guest image:
+- The driver vendors a static DHCP client (`udhcpc`) and an event script (`udhcpc.script`) embedded into the driver binary.
+- On sandbox creation, a digest-keyed custom storage volume (`openshell-dhcp-client-<digest>`) is provisioned on the storage pool and mounted read-only at `/opt/openshell/net`.
+- In `/openshell-init.sh`, the init script probes for existing image-provided DHCP clients (`udhcpc`, `dhclient`, `dhcpcd`). If none are present on `PATH`, it runs the bundled fallback client (`/opt/openshell/net/udhcpc`) with `/opt/openshell/net/udhcpc.script` in the background to acquire and apply the network lease.
+
 ## Known limitations
 
 - GPU requests attach every host GPU; an exact requested `count` isn't honored.

@@ -353,3 +353,98 @@ async fn ensure_supervisor_volume_lifecycle_and_idempotency() {
         let _ = client.wait_operation(&op.id).await;
     }
 }
+
+#[tokio::test]
+async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
+    let client = client();
+    let vol_name = format!("test-dhcp-vol-{}", unique_name());
+
+    let bin_bytes = b"dummy-udhcpc-binary";
+    let script_bytes = b"#!/bin/sh\necho test\n";
+
+    // 1. Initial creation
+    client
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .await
+        .expect("initial ensure_dhcp_client_volume should succeed");
+
+    // Check volume exists
+    let exists = client
+        .storage_pool_volume_exists("default", "custom", &vol_name)
+        .await
+        .expect("storage_pool_volume_exists should succeed");
+    assert!(exists);
+
+    // Verify files in the provisioned volume have executable permissions (0o755)
+    let inst_name = unique_name();
+    let mut devices = sandbox_devices();
+    let mut vol_device = HashMap::new();
+    vol_device.insert("type".to_string(), "disk".to_string());
+    vol_device.insert("pool".to_string(), "default".to_string());
+    vol_device.insert("source".to_string(), vol_name.clone());
+    vol_device.insert("path".to_string(), "/mnt/dhcp".to_string());
+    devices.insert("dhcp-vol".to_string(), vol_device);
+
+    let create_op = client
+        .create_instance(
+            &inst_name,
+            TEST_IMAGE_ALIAS,
+            HashMap::new(),
+            devices,
+            vec![],
+            true,
+        )
+        .await
+        .expect("create_instance with custom volume should succeed");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        client.wait_operation(&create_op.id),
+    )
+    .await
+    .expect("create should not time out")
+    .expect("create should succeed");
+
+    let (bin_fetched, bin_mode) = client
+        .get_file_from_instance(&inst_name, "/mnt/dhcp/udhcpc")
+        .await
+        .expect("fetching udhcpc from instance should succeed");
+    assert_eq!(&bin_fetched[..], bin_bytes);
+    assert_eq!(bin_mode & 0o777, 0o755, "udhcpc must have mode 0o755");
+
+    let (script_fetched, script_mode) = client
+        .get_file_from_instance(&inst_name, "/mnt/dhcp/udhcpc.script")
+        .await
+        .expect("fetching udhcpc.script from instance should succeed");
+    assert_eq!(&script_fetched[..], script_bytes);
+    assert_eq!(
+        script_mode & 0o777,
+        0o755,
+        "udhcpc.script must have mode 0o755"
+    );
+
+    let stop_op = client
+        .stop_instance(&inst_name, true)
+        .await
+        .expect("stop_instance should succeed");
+    let _ = client.wait_operation(&stop_op.id).await;
+
+    let delete_inst_op = client
+        .delete_instance(&inst_name)
+        .await
+        .expect("delete_instance should succeed");
+    let _ = client.wait_operation(&delete_inst_op.id).await;
+
+    // 2. Second call is an idempotent no-op (short circuits on exists check)
+    client
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .await
+        .expect("second ensure_dhcp_client_volume should succeed idempotently");
+
+    // Clean up volume
+    if let Ok(op) = client
+        .delete_storage_pool_volume("default", "custom", &vol_name)
+        .await
+    {
+        let _ = client.wait_operation(&op.id).await;
+    }
+}

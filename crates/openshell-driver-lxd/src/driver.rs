@@ -11,6 +11,7 @@ use lxd_client::{LxdClient, LxdError};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::dhcp_client;
 use crate::error::DriverError;
 use crate::image::{digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
@@ -48,6 +49,7 @@ pub struct LxdComputeDriver {
     lxd: LxdClient,
     image_cache: ImageCache,
     supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl LxdComputeDriver {
@@ -75,6 +77,7 @@ impl LxdComputeDriver {
             lxd,
             image_cache,
             supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -281,11 +284,41 @@ impl LxdComputeDriver {
                 })?;
         }
 
+        // Ensure digest-keyed custom storage volume exists for the bundled DHCP client
+        let dhcp_digest = dhcp_client::dhcp_client_digest();
+        let dhcp_volume_name = mapping::dhcp_client_volume_name(&dhcp_digest);
+        let dhcp_vol_lock = {
+            let mut locks = self.dhcp_client_volume_locks.lock().await;
+            locks
+                .entry(dhcp_digest.clone())
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = dhcp_vol_lock.lock().await;
+            self.lxd
+                .ensure_dhcp_client_volume(
+                    &self.config.supervisor_storage_pool,
+                    &dhcp_volume_name,
+                    dhcp_client::DHCP_CLIENT_BINARY,
+                    dhcp_client::DHCP_CLIENT_SCRIPT,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "DHCP client volume provisioning failed on pool {:?}: {e}",
+                        self.config.supervisor_storage_pool
+                    ))
+                })?;
+        }
+
         let devices = mapping::build_create_devices(
             template,
             gpu.is_some(),
             &self.config.supervisor_storage_pool,
             &volume_name,
+            &self.config.supervisor_storage_pool,
+            &dhcp_volume_name,
         );
         let profiles = mapping::build_profiles(template);
 

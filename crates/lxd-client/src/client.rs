@@ -510,6 +510,42 @@ impl LxdClient {
         }
         Ok(())
     }
+
+    /// GET raw bytes with response headers.
+    pub(crate) async fn get_raw_with_headers(
+        &self,
+        path: &str,
+    ) -> Result<(hyper::HeaderMap, Bytes), LxdError> {
+        let (mut sender, host) = self.connect().await?;
+
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(path)
+            .header("Host", host)
+            .body(Full::new(Bytes::new()))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        Ok((headers, body))
+    }
 }
 
 impl fmt::Debug for LxdClient {
