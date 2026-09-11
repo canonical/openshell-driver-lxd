@@ -55,3 +55,4 @@ strum = { version = "0.27", features = ["derive"] }
 
 # URI query encoding (lxd-client file push)
 urlencoding = "2.1"
+url = "2.5"

@@ -72,7 +72,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!(socket = %config.socket.display(), "Starting OpenShell LXD compute driver");
 
-    let lxd = LxdClient::new(endpoint)?;
+    let lxd = LxdClient::new(endpoint)?.with_project(config.project.clone());
+
+    // Fail fast with a clear diagnostic if the configured project does not
+    // exist. This gate must run before image_alias_exists because every
+    // subsequent request (including that one) is decorated with
+    // project=<config.project>; a missing project would otherwise make the
+    // image-alias check return a 404-driven Ok(false) and emit the wrong
+    // diagnostic. Only the check itself failing (e.g. LXD not reachable yet)
+    // is non-fatal here — that failure mode is already surfaced clearly
+    // wherever it's next hit.
+    match lxd.project_exists(&config.project).await {
+        Ok(false) => {
+            error!(
+                project = %config.project,
+                "configured LXD project does not exist; create it before starting the driver"
+            );
+            std::process::exit(1);
+        }
+        Ok(true) => {}
+        Err(e) => {
+            warn!(
+                project = %config.project,
+                %e,
+                "could not verify configured LXD project exists; continuing anyway"
+            );
+        }
+    }
 
     // Fail fast with a clear diagnostic rather than letting the first
     // create_sandbox call surface an opaque LXD 404. Only the check itself

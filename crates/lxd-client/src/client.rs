@@ -213,6 +213,9 @@ impl LxdHttpsConfig {
     }
 }
 
+/// Default LXD project. LXD always has a `default` project.
+pub const DEFAULT_PROJECT: &str = "default";
+
 /// Async client for the LXD REST API.
 ///
 /// Opens a fresh connection per request. Use [`LxdEndpoint::UnixSocket`] for a
@@ -224,6 +227,9 @@ pub struct LxdClient {
     /// Pre-built TLS connector, cached at construction to avoid re-reading cert
     /// files on every request.
     tls_connector: Option<tokio_rustls::TlsConnector>,
+    /// Target LXD project applied to every request as a `project` query
+    /// parameter. Defaults to `"default"`.
+    project: String,
 }
 
 impl LxdClient {
@@ -244,7 +250,31 @@ impl LxdClient {
         Ok(Self {
             endpoint,
             tls_connector,
+            project: DEFAULT_PROJECT.to_string(),
         })
+    }
+
+    /// Sets the target LXD project for every request.
+    ///
+    /// Consumes `self` and returns it, so existing call sites that use
+    /// `LxdClient::new(endpoint)?` unchanged keep the `"default"` project.
+    pub fn with_project(mut self, project: impl Into<String>) -> Self {
+        self.project = project.into();
+        self
+    }
+
+    /// Appends `project=<name>` to `path`, URL-encoding the project name.
+    ///
+    /// Uses `?` when the path has no query string and `&` when it already has
+    /// one. This is the single choke point for project scoping on the wire.
+    pub(crate) fn decorate_path(&self, path: &str) -> String {
+        let base = url::Url::parse("http://localhost").expect("valid base URL");
+        let mut url = base.join(path).expect("valid relative path");
+        url.query_pairs_mut().append_pair("project", &self.project);
+        match url.query() {
+            Some(query) => format!("{}?{query}", url.path()),
+            None => url.path().to_string(),
+        }
     }
 
     /// WebSocket scheme for the configured endpoint (`"ws"` or `"wss"`).
@@ -310,9 +340,10 @@ impl LxdClient {
             None => Vec::new(),
         };
 
+        let decorated_path = self.decorate_path(path);
         let mut builder = Request::builder()
             .method(method)
-            .uri(path)
+            .uri(&decorated_path)
             .header("Host", host);
         if body.is_some() {
             builder = builder.header("Content-Type", "application/json");
@@ -402,9 +433,10 @@ impl LxdClient {
     ) -> Result<(), LxdError> {
         let (mut sender, host) = self.connect().await?;
 
+        let decorated_path = self.decorate_path(path);
         let mut builder = Request::builder()
             .method(Method::POST)
-            .uri(path)
+            .uri(&decorated_path)
             .header("Host", host)
             .header("Content-Type", content_type);
         for (name, value) in extra_headers {
@@ -475,4 +507,70 @@ where
         }
     });
     Ok(sender)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_client() -> LxdClient {
+        LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from("/tmp/test.sock"))).unwrap()
+    }
+
+    #[test]
+    fn decorate_path_bare_path_uses_question_mark() {
+        let client = test_client().with_project("p");
+        assert_eq!(
+            client.decorate_path("/1.0/instances"),
+            "/1.0/instances?project=p"
+        );
+    }
+
+    #[test]
+    fn decorate_path_with_recursion_uses_ampersand() {
+        let client = test_client().with_project("p");
+        assert_eq!(
+            client.decorate_path("/1.0/instances?recursion=1"),
+            "/1.0/instances?recursion=1&project=p"
+        );
+    }
+
+    #[test]
+    fn decorate_path_with_file_push_path_uses_ampersand() {
+        let client = test_client().with_project("p");
+        assert_eq!(
+            client.decorate_path("/1.0/instances/foo/files?path=/etc/test"),
+            "/1.0/instances/foo/files?path=/etc/test&project=p"
+        );
+    }
+
+    #[test]
+    fn decorate_path_wait_timeout_uses_ampersand() {
+        let client = test_client().with_project("p");
+        assert_eq!(
+            client.decorate_path("/1.0/operations/uuid/wait?timeout=-1"),
+            "/1.0/operations/uuid/wait?timeout=-1&project=p"
+        );
+    }
+
+    #[test]
+    fn decorate_path_url_encodes_project_name() {
+        let client = test_client().with_project("my project");
+        assert_eq!(
+            client.decorate_path("/1.0/instances"),
+            "/1.0/instances?project=my+project"
+        );
+    }
+
+    #[test]
+    fn with_project_overrides_default() {
+        let client = test_client().with_project("custom");
+        assert_eq!(client.project, "custom");
+    }
+
+    #[test]
+    fn new_defaults_to_default_project() {
+        let client = test_client();
+        assert_eq!(client.project, DEFAULT_PROJECT);
+    }
 }

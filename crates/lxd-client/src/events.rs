@@ -29,9 +29,16 @@ impl LxdClient {
         let (raw, host) = self.connect_raw().await?;
         let scheme = self.ws_scheme();
         let type_param = types.join(",");
-        let url = format!("{scheme}://{host}/1.0/events?type={type_param}");
+        let path = self.decorate_path(&format!("/1.0/events?type={type_param}"));
+        let base =
+            url::Url::parse(&format!("{scheme}://{host}")).map_err(|e| LxdError::WebSocket {
+                reason: format!("invalid WebSocket URL base: {e}"),
+            })?;
+        let url = base.join(&path).map_err(|e| LxdError::WebSocket {
+            reason: format!("invalid WebSocket URL: {e}"),
+        })?;
 
-        let (ws, _) = tokio_tungstenite::client_async(url, raw)
+        let (ws, _) = tokio_tungstenite::client_async(url.as_str(), raw)
             .await
             .map_err(|e| match e {
                 tokio_tungstenite::tungstenite::Error::Io(io) => LxdError::Io(io),

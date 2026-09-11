@@ -11,11 +11,12 @@ mod images;
 mod instances;
 mod networks;
 mod operations;
+mod projects;
 pub mod resources;
 mod types;
 
 pub use acls::{AclAction, AclProtocol, AclState, LxdNetworkAclRule};
-pub use client::{LxdClient, LxdEndpoint, LxdHttpsConfig};
+pub use client::{LxdClient, LxdEndpoint, LxdHttpsConfig, DEFAULT_PROJECT};
 pub use error::LxdError;
 pub use types::{
     Instance, InstanceState, InstanceStateCpu, InstanceStateDisk, InstanceStateMemory,
