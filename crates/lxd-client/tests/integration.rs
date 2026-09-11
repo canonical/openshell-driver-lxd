@@ -448,3 +448,99 @@ async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
         let _ = client.wait_operation(&op.id).await;
     }
 }
+
+#[tokio::test]
+async fn create_image_from_split_streams_rootfs() {
+    let client = client();
+
+    // 1. Prepare minimal metadata.tar.xz
+    let temp_dir = tempfile::tempdir().unwrap();
+    let metadata_yaml = format!(
+        "architecture: \"x86_64\"\ncreation_date: {}\nproperties:\n  description: \"test split image\"\n",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let meta_file_path = temp_dir.path().join("metadata.yaml");
+    tokio::fs::write(&meta_file_path, metadata_yaml.as_bytes())
+        .await
+        .unwrap();
+
+    let meta_tar_path = temp_dir.path().join("metadata.tar");
+    {
+        let tar_file = std::fs::File::create(&meta_tar_path).unwrap();
+        let mut builder = tar::Builder::new(tar_file);
+        builder
+            .append_path_with_name(&meta_file_path, "metadata.yaml")
+            .unwrap();
+        builder.finish().unwrap();
+    }
+
+    let xz_cmd = tokio::process::Command::new("xz")
+        .args(["-z", "-k", meta_tar_path.to_str().unwrap()])
+        .output()
+        .await;
+
+    let metadata_bytes = match xz_cmd {
+        Ok(output) if output.status.success() => {
+            let xz_path = temp_dir.path().join("metadata.tar.xz");
+            tokio::fs::read(&xz_path).await.unwrap()
+        }
+        _ => {
+            eprintln!("xz not available; skipping create_image_from_split_streams_rootfs");
+            return;
+        }
+    };
+
+    // 2. Prepare a small rootfs.squashfs using mksquashfs
+    let rootfs_dir = temp_dir.path().join("rootfs");
+    tokio::fs::create_dir(&rootfs_dir).await.unwrap();
+    tokio::fs::write(rootfs_dir.join("test.txt"), b"hello-split-image")
+        .await
+        .unwrap();
+    let squashfs_path = temp_dir.path().join("rootfs.squashfs");
+
+    let mksquash_output = tokio::process::Command::new("mksquashfs")
+        .args([
+            rootfs_dir.to_str().unwrap(),
+            squashfs_path.to_str().unwrap(),
+            "-noappend",
+        ])
+        .output()
+        .await;
+
+    if mksquash_output.is_err() || !mksquash_output.unwrap().status.success() {
+        eprintln!("mksquashfs not available; skipping create_image_from_split_streams_rootfs");
+        return;
+    }
+
+    // 3. Call create_image_from_split with path
+    let op = client
+        .create_image_from_split(
+            "metadata.tar.xz",
+            &metadata_bytes,
+            "rootfs.squashfs",
+            &squashfs_path,
+        )
+        .await
+        .expect("create_image_from_split should succeed");
+
+    let finished_op = tokio::time::timeout(Duration::from_secs(60), client.wait_operation(&op.id))
+        .await
+        .expect("image upload operation should not time out")
+        .expect("image upload operation should complete successfully");
+
+    let fingerprint = finished_op
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("fingerprint"))
+        .and_then(|f| f.as_str())
+        .expect("operation response missing image fingerprint")
+        .to_string();
+
+    // Clean up the created image in LXD
+    if let Ok(del_op) = client.delete_image(&fingerprint).await {
+        let _ = client.wait_operation(&del_op.id).await;
+    }
+}

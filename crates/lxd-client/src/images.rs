@@ -2,12 +2,15 @@
 
 //! Image alias lookups, creation, and split image imports.
 
-use hyper::body::Bytes;
+use std::path::Path;
+
 use serde_json::json;
+use tokio::fs::File;
 use urlencoding::encode;
 
 use crate::client::LxdClient;
 use crate::error::LxdError;
+use crate::split_image_body::SplitImageBody;
 use crate::types::Operation;
 
 impl LxdClient {
@@ -43,51 +46,42 @@ impl LxdClient {
         Ok(())
     }
 
+    /// `DELETE /1.0/images/<fingerprint>`: deletes an image from LXD.
+    pub async fn delete_image(&self, fingerprint: &str) -> Result<Operation, LxdError> {
+        self.delete::<Operation>(&format!("/1.0/images/{}", encode(fingerprint)))
+            .await?
+            .into_metadata()
+    }
+
     /// `POST /1.0/images`: imports a split image (metadata + rootfs) via multipart/form-data.
     ///
-    /// Accepts raw bytes for `metadata` (e.g. `metadata.tar.xz`) and `rootfs`
-    /// (e.g. `rootfs.squashfs` or `rootfs.tar.xz`), sends them as a multipart form,
-    /// and returns an [`Operation`] tracking the import.
+    /// Accepts raw bytes for `metadata` (e.g. `metadata.tar.xz`) and a file path
+    /// for `rootfs` (e.g. `rootfs.squashfs` or `rootfs.tar.xz`). Streams the rootfs
+    /// directly from disk in bounded chunks to avoid loading multi-gigabyte rootfs
+    /// files into memory, and returns an [`Operation`] tracking the import.
     pub async fn create_image_from_split(
         &self,
         metadata_filename: &str,
         metadata_bytes: &[u8],
         rootfs_filename: &str,
-        rootfs_bytes: &[u8],
+        rootfs_path: &Path,
     ) -> Result<Operation, LxdError> {
+        let rootfs_meta = tokio::fs::metadata(rootfs_path).await?;
+        let rootfs_file = File::open(rootfs_path).await?;
         let boundary = "------------------------openshellsplitimageboundary";
-        let mut body = Vec::with_capacity(metadata_bytes.len() + rootfs_bytes.len() + 1024);
 
-        // metadata part
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"metadata\"; filename=\"{metadata_filename}\"\r\n"
-            )
-            .as_bytes(),
+        let body = SplitImageBody::new(
+            metadata_filename,
+            metadata_bytes,
+            rootfs_filename,
+            rootfs_file,
+            rootfs_meta.len(),
+            boundary,
         );
-        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-        body.extend_from_slice(metadata_bytes);
-        body.extend_from_slice(b"\r\n");
-
-        // rootfs part
-        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
-        body.extend_from_slice(
-            format!(
-                "Content-Disposition: form-data; name=\"rootfs\"; filename=\"{rootfs_filename}\"\r\n"
-            )
-            .as_bytes(),
-        );
-        body.extend_from_slice(b"Content-Type: application/octet-stream\r\n\r\n");
-        body.extend_from_slice(rootfs_bytes);
-        body.extend_from_slice(b"\r\n");
-
-        // closing boundary
-        body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
 
         let content_type = format!("multipart/form-data; boundary={boundary}");
         let response = self
-            .post_raw_response::<Operation>("/1.0/images", &content_type, &[], Bytes::from(body))
+            .post_streaming_response::<Operation>("/1.0/images", &content_type, body)
             .await?;
         response.into_metadata()
     }

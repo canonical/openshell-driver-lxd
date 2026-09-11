@@ -445,9 +445,6 @@ impl OciImporter for SkopeoImporter {
         );
 
         let metadata_tar_bytes = create_metadata_tar_xz(temp_path, &metadata_yaml).await?;
-        let squashfs_bytes = tokio::fs::read(&squashfs_path)
-            .await
-            .map_err(|e| DriverError::ImageImport(format!("failed to read squashfs file: {e}")))?;
 
         // 5. Upload via LxdClient::create_image_from_split + wait_operation
         let op = self
@@ -456,7 +453,7 @@ impl OciImporter for SkopeoImporter {
                 "metadata.tar.xz",
                 &metadata_tar_bytes,
                 "rootfs.squashfs",
-                &squashfs_bytes,
+                &squashfs_path,
             )
             .await
             .map_err(|e| DriverError::ImageImport(format!("LXD split image upload failed: {e}")))?;

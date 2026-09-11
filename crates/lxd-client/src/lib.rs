@@ -12,6 +12,7 @@ mod instances;
 mod networks;
 mod operations;
 pub mod resources;
+pub(crate) mod split_image_body;
 pub mod storage;
 mod types;
 

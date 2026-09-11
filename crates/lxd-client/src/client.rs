@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 
 use crate::error::LxdError;
+use crate::split_image_body::SplitImageBody;
 use crate::types::LxdResponse;
 
 /// A unified raw transport stream used for WebSocket connections.
@@ -284,9 +285,14 @@ impl LxdClient {
 
     /// Opens a fresh connection and returns an HTTP/1.1 sender plus the value
     /// to use for the `Host` header.
-    async fn connect(
+    async fn connect<B>(
         &self,
-    ) -> Result<(hyper::client::conn::http1::SendRequest<Full<Bytes>>, String), LxdError> {
+    ) -> Result<(hyper::client::conn::http1::SendRequest<B>, String), LxdError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let (raw, host) = self.connect_raw().await?;
         let sender = do_handshake(TokioIo::new(raw)).await?;
         Ok((sender, host))
@@ -447,6 +453,60 @@ impl LxdClient {
         Ok(parsed)
     }
 
+    /// POST a streaming body with arbitrary content-type and return the deserialized response.
+    ///
+    /// Used for split image imports where the request payload streams a multi-gigabyte rootfs
+    /// file in bounded chunks, while the response is LXD's standard JSON envelope.
+    pub(crate) async fn post_streaming_response<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: SplitImageBody,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        let (mut sender, host) = self.connect::<SplitImageBody>().await?;
+
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(path)
+            .header("Host", host)
+            .header("Content-Type", content_type)
+            .body(body)?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        let parsed: LxdResponse<T> = serde_json::from_slice(&resp_body)?;
+
+        if parsed.type_ == "error" {
+            let message = parsed
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
+            return Err(LxdError::Api {
+                status_code: parsed.error_code,
+                message,
+            });
+        }
+
+        Ok(parsed)
+    }
+
     /// POST raw bytes with arbitrary extra headers.
     ///
     /// Used for the file-push endpoint whose sync response has `metadata: null`
@@ -556,11 +616,12 @@ impl fmt::Debug for LxdClient {
     }
 }
 
-async fn do_handshake<IO>(
-    io: IO,
-) -> Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>, LxdError>
+async fn do_handshake<IO, B>(io: IO) -> Result<hyper::client::conn::http1::SendRequest<B>, LxdError>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::task::spawn(async move {
