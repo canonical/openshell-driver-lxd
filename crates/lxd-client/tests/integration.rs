@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lxd_client::{LxdClient, LxdEndpoint, LxdError, LxdNetworkAclRule};
+use lxd_client::{LxdClient, LxdEndpoint, LxdError, LxdNetworkAclRule, DEFAULT_PROJECT};
 
 const TEST_IMAGE_ALIAS: &str = "lxd-client-test";
 const LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
@@ -294,15 +294,77 @@ async fn project_exists_false_for_nonexistent_project() {
 
 #[tokio::test]
 async fn project_exists_with_non_default_project_client() {
-    let client = LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(LXD_SOCKET)))
-        .unwrap()
-        .with_project("default");
+    let default_client = client();
+    let project_name = unique_name();
+
+    default_client
+        .create_project(&project_name)
+        .await
+        .expect("create_project should succeed");
+
+    let project_client = client().with_project(&project_name);
+
+    // Verify project existence checks from the non-default project client.
     assert!(
-        client
-            .project_exists("default")
+        project_client
+            .project_exists(&project_name)
             .await
-            .expect("project_exists should succeed"),
-        "default project should exist when client targets default"
+            .expect("project_exists should succeed for dedicated project"),
+        "dedicated test project should exist"
+    );
+    assert!(
+        project_client
+            .project_exists(DEFAULT_PROJECT)
+            .await
+            .expect("project_exists should succeed for default project"),
+        "default project should exist"
+    );
+    assert!(
+        !project_client
+            .project_exists(&format!("{project_name}-missing"))
+            .await
+            .expect("project_exists should succeed for non-existent project"),
+        "non-existent project should not exist"
+    );
+
+    // Demonstrate resource isolation from default: the test image alias exists
+    // in the default project but is absent in the new project.
+    assert!(
+        default_client
+            .image_alias_exists(TEST_IMAGE_ALIAS)
+            .await
+            .expect("image_alias_exists should succeed in default project"),
+        "test image alias should exist in default project"
+    );
+    assert!(
+        !project_client
+            .image_alias_exists(TEST_IMAGE_ALIAS)
+            .await
+            .expect("image_alias_exists should succeed in custom project"),
+        "test image alias from default should not exist in isolated custom project"
+    );
+
+    // Instances are also isolated: the dedicated project has no instances.
+    let instances = project_client
+        .list_instances()
+        .await
+        .expect("list_instances should succeed in custom project");
+    assert!(
+        instances.is_empty(),
+        "custom project should have no instances"
+    );
+
+    default_client
+        .delete_project(&project_name)
+        .await
+        .expect("delete_project should succeed");
+
+    assert!(
+        !default_client
+            .project_exists(&project_name)
+            .await
+            .expect("project_exists should succeed after delete"),
+        "deleted project should not exist"
     );
 }
 
