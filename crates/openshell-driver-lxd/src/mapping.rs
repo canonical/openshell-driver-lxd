@@ -26,6 +26,10 @@ const DEFAULT_NETWORK: &str = "lxdbr0";
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
 pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.jwt";
 
+/// Identifies the guest-side Unix socket path where the supervisor binds its
+/// SSH relay listener. The supervisor reads it via `OPENSHELL_SSH_SOCKET_PATH`.
+pub(crate) const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
+
 /// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
 pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
 
@@ -116,6 +120,10 @@ fn ready_condition(lxd_status: &str) -> DriverCondition {
 
 /// Builds the LXD instance `config` map for `POST /1.0/instances`.
 ///
+/// Sets `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SANDBOX`, and
+/// `OPENSHELL_SSH_SOCKET_PATH` (pointing to [`GUEST_SSH_SOCKET_PATH`])
+/// unconditionally.
+///
 /// `gateway_endpoint` is the resolved `OPENSHELL_ENDPOINT` value
 /// (`http://<host-ip>:<gateway-grpc-port>`). When empty the env var is not
 /// set — the gateway is expected to supply it via `spec.environment` instead.
@@ -158,6 +166,10 @@ pub fn build_create_config(
     config.insert(
         format!("{ENV_PREFIX}OPENSHELL_SANDBOX"),
         sandbox.name.clone(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SSH_SOCKET_PATH"),
+        GUEST_SSH_SOCKET_PATH.to_string(),
     );
     if !gateway_endpoint.is_empty() {
         config.insert(
@@ -398,5 +410,24 @@ mod tests {
             format!("{GUEST_SUPERVISOR_BIN_DIR}/openshell-sandbox")
         );
         assert_eq!(GUEST_DHCP_CLIENT_DIR, "/opt/openshell/net");
+    }
+
+    #[test]
+    fn build_create_config_sets_ssh_socket_path() {
+        let sandbox = DriverSandbox {
+            id: "sb-123".to_string(),
+            name: "test-sandbox".to_string(),
+            ..Default::default()
+        };
+        let spec = DriverSandboxSpec::default();
+        let template = DriverSandboxTemplate::default();
+
+        let config = build_create_config(&sandbox, &spec, &template, "", false)
+            .expect("build_create_config should succeed");
+
+        assert_eq!(
+            config.get("environment.OPENSHELL_SSH_SOCKET_PATH"),
+            Some(&GUEST_SSH_SOCKET_PATH.to_string())
+        );
     }
 }
