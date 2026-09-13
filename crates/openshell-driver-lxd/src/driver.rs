@@ -227,8 +227,14 @@ impl LxdComputeDriver {
 
         let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(template).await?;
-        let config =
-            mapping::build_create_config(sandbox, spec, template, &gateway_endpoint, has_token)?;
+        let config = mapping::build_create_config(
+            sandbox,
+            spec,
+            template,
+            &gateway_endpoint,
+            has_token,
+            self.config.default_max_processes,
+        )?;
 
         // Auxiliary volumes live on the sandbox's own pool unless the
         // operator pinned them, so a request asking for a non-default

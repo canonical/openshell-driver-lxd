@@ -138,6 +138,7 @@ pub fn build_create_config(
     template: &DriverSandboxTemplate,
     gateway_endpoint: &str,
     has_token: bool,
+    default_max_processes: u32,
 ) -> Result<HashMap<String, String>, DriverError> {
     let mut config = HashMap::new();
 
@@ -216,7 +217,36 @@ pub fn build_create_config(
         }
     }
 
+    // Bound the sandbox's PID count. Sandboxes run untrusted agent workloads
+    // on a shared host, so an unlimited `pids.max` lets one sandbox fork-bomb
+    // its co-tenants; the supervisor warns about this on every boot when it
+    // finds the cgroup unlimited.
+    let max_processes = max_processes(template).unwrap_or(default_max_processes);
+    if max_processes > 0 {
+        config.insert("limits.processes".to_string(), max_processes.to_string());
+    }
+
     Ok(config)
+}
+
+/// Per-sandbox `limits.processes` override from `driver_config.max_processes`.
+fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
+    let value = template
+        .driver_config
+        .as_ref()?
+        .fields
+        .get("max_processes")?
+        .kind
+        .as_ref()?;
+    match value {
+        Kind::NumberValue(n)
+            if n.is_finite() && *n >= 0.0 && n.fract() == 0.0 && *n <= u32::MAX as f64 =>
+        {
+            Some(*n as u32)
+        }
+        Kind::StringValue(s) => s.parse::<u32>().ok(),
+        _ => None,
+    }
 }
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
@@ -428,12 +458,141 @@ mod tests {
         let spec = DriverSandboxSpec::default();
         let template = DriverSandboxTemplate::default();
 
-        let config = build_create_config(&sandbox, &spec, &template, "", false)
+        let config = build_create_config(&sandbox, &spec, &template, "", false, 0)
             .expect("build_create_config should succeed");
 
         assert_eq!(
             config.get("environment.OPENSHELL_SSH_SOCKET_PATH"),
             Some(&GUEST_SSH_SOCKET_PATH.to_string())
         );
+    }
+
+    #[test]
+    fn build_create_config_sets_default_pid_limit() {
+        let sandbox = DriverSandbox::default();
+        let spec = DriverSandboxSpec::default();
+        let template = DriverSandboxTemplate::default();
+
+        let config = build_create_config(&sandbox, &spec, &template, "", false, 4096)
+            .expect("build_create_config should succeed");
+        assert_eq!(config.get("limits.processes"), Some(&"4096".to_string()));
+
+        // 0 means "leave pids.max alone".
+        let unlimited = build_create_config(&sandbox, &spec, &template, "", false, 0)
+            .expect("build_create_config should succeed");
+        assert!(!unlimited.contains_key("limits.processes"));
+    }
+
+    #[test]
+    fn driver_config_overrides_pid_limit() {
+        let mut fields = std::collections::BTreeMap::new();
+        fields.insert(
+            "max_processes".to_string(),
+            prost_types::Value {
+                kind: Some(Kind::NumberValue(256.0)),
+            },
+        );
+        let template = DriverSandboxTemplate {
+            driver_config: Some(Struct { fields }),
+            ..Default::default()
+        };
+
+        let config = build_create_config(
+            &DriverSandbox::default(),
+            &DriverSandboxSpec::default(),
+            &template,
+            "",
+            false,
+            4096,
+        )
+        .expect("build_create_config should succeed");
+
+        assert_eq!(config.get("limits.processes"), Some(&"256".to_string()));
+    }
+
+    #[test]
+    fn max_processes_validation() {
+        use prost_types::Value;
+        use std::collections::BTreeMap;
+
+        let template_with_max_processes = |kind: Kind| DriverSandboxTemplate {
+            driver_config: Some(Struct {
+                fields: BTreeMap::from([("max_processes".to_string(), Value { kind: Some(kind) })]),
+            }),
+            ..Default::default()
+        };
+
+        // Whole, non-negative numbers and valid numeric strings are accepted
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(512.0))),
+            Some(512)
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(0.0))),
+            Some(0)
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::StringValue(
+                "256".to_string()
+            ))),
+            Some(256)
+        );
+
+        // Fractional numbers must not be cast to integers (e.g. 0.5 != 0)
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(0.5))),
+            None
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(1.5))),
+            None
+        );
+
+        // Negative numbers must not be accepted
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(-1.0))),
+            None
+        );
+
+        // Out of range or non-finite numbers must not be accepted
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(
+                u32::MAX as f64 + 1000.0
+            ))),
+            None
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(f64::NAN))),
+            None
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(
+                f64::INFINITY
+            ))),
+            None
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::NumberValue(
+                f64::NEG_INFINITY
+            ))),
+            None
+        );
+
+        // Invalid strings must not be treated as valid overrides
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::StringValue(
+                "abc".to_string()
+            ))),
+            None
+        );
+        assert_eq!(
+            max_processes(&template_with_max_processes(Kind::StringValue(
+                "-5".to_string()
+            ))),
+            None
+        );
+
+        // Empty template yields None
+        assert_eq!(max_processes(&DriverSandboxTemplate::default()), None);
     }
 }
