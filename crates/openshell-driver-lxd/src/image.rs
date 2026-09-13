@@ -103,6 +103,20 @@ pub fn repo_path(reference: &str) -> &str {
     }
 }
 
+/// The `docker://` target `skopeo inspect` resolves `reference` through.
+///
+/// skopeo rejects a reference carrying both a tag and a digest ("Docker
+/// references with both a tag and digest are currently not supported"), but
+/// such a reference is valid and the most readable way to pin an image. The
+/// digest identifies the image on its own, so the tag is dropped.
+pub fn inspect_target(reference: &str) -> String {
+    let bare = strip_docker_scheme(reference);
+    match bare.rfind("@sha256:") {
+        Some(idx) => format!("docker://{}{}", repo_path(bare), &bare[idx..]),
+        None => format!("docker://{bare}"),
+    }
+}
+
 /// Maps the current host architecture to the LXD architecture identifier
 /// (used in an image's `metadata.yaml`).
 pub fn host_lxd_arch() -> &'static str {
@@ -481,8 +495,7 @@ impl SkopeoImporter {
 impl OciImporter for SkopeoImporter {
     async fn resolve_digest(&self, reference: &str) -> Result<String, DriverError> {
         self.verify_lxd_architecture().await?;
-        let bare = strip_docker_scheme(reference);
-        let target = format!("docker://{bare}");
+        let target = inspect_target(reference);
 
         // `--raw` returns the top-level manifest document untouched. Two
         // reasons to prefer it over `inspect --format {{.Digest}}`:
@@ -1031,6 +1044,33 @@ mod tests {
                 ),
                 "{invalid:?}"
             );
+        }
+    }
+
+    #[test]
+    fn inspect_target_drops_the_tag_of_a_pinned_reference() {
+        let digest = format!("sha256:{}", "ab".repeat(32));
+        let cases = [
+            (
+                format!("ghcr.io/nvidia/openshell/supervisor:0.0.116@{digest}"),
+                format!("docker://ghcr.io/nvidia/openshell/supervisor@{digest}"),
+            ),
+            (
+                format!("docker://registry.example.com:5000/app:v1@{digest}"),
+                format!("docker://registry.example.com:5000/app@{digest}"),
+            ),
+            (
+                format!("registry.example.com/app@{digest}"),
+                format!("docker://registry.example.com/app@{digest}"),
+            ),
+            (
+                "registry.example.com:5000/app:v1".to_string(),
+                "docker://registry.example.com:5000/app:v1".to_string(),
+            ),
+            ("docker://ubuntu".to_string(), "docker://ubuntu".to_string()),
+        ];
+        for (reference, expected) in cases {
+            assert_eq!(inspect_target(&reference), expected, "{reference}");
         }
     }
 
