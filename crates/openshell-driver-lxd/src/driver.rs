@@ -111,6 +111,11 @@ impl LxdComputeDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.config.default_image.clone(),
+            // The gateway would stop sandboxes when it shuts down and restart
+            // them with StartSandbox when it comes back, which this driver
+            // does not implement. Sandboxes keep running across gateway
+            // restarts instead.
+            gateway_manages_lifecycle: false,
         }
     }
 
