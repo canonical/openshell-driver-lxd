@@ -964,6 +964,6 @@ mod tests {
             .resolve_alias(&template.image)
             .await
             .unwrap();
-        assert_eq!(resolved, format!("openshell-oci-{digest_hex}"));
+        assert_eq!(resolved, format!("openshell-oci-r2-{digest_hex}"));
     }
 }
