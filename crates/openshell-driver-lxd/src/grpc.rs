@@ -9,11 +9,13 @@ use computev1::pb::compute_driver_server::ComputeDriver;
 use computev1::pb::DriverSandbox;
 use computev1::pb::{
     watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
-    GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
-    StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
-    WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesRequest,
-    WatchSandboxesSandboxEvent,
+    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
+    GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
+    GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
+    StartSandboxRequest, StartSandboxResponse, StopSandboxRequest, StopSandboxResponse,
+    ValidateSandboxCreateRequest, ValidateSandboxCreateResponse, WatchSandboxesDeletedEvent,
+    WatchSandboxesEvent, WatchSandboxesRequest, WatchSandboxesSandboxEvent,
 };
 use futures::Stream;
 use tokio::sync::broadcast;
@@ -91,6 +93,47 @@ impl ComputeDriver for ComputeDriverService {
         _request: Request<GetCapabilitiesRequest>,
     ) -> Result<Response<GetCapabilitiesResponse>, Status> {
         Ok(Response::new(self.driver.capabilities()))
+    }
+
+    /// Sandboxes reach the gateway at the address the operator binds it to
+    /// (the LXD bridge), so no additional listener is needed.
+    ///
+    /// Answering rather than leaving the RPC unimplemented matters: the
+    /// gateway calls it at startup and aborts on any error other than
+    /// `Unimplemented`.
+    async fn get_gateway_listener_requirements(
+        &self,
+        _request: Request<GetGatewayListenerRequirementsRequest>,
+    ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
+        Ok(Response::new(
+            GetGatewayListenerRequirementsResponse::default(),
+        ))
+    }
+
+    /// Restarting a stopped sandbox is not supported yet, which is also why
+    /// the driver does not ask the gateway to manage sandbox lifecycle.
+    async fn start_sandbox(
+        &self,
+        _request: Request<StartSandboxRequest>,
+    ) -> Result<Response<StartSandboxResponse>, Status> {
+        Err(DriverError::Unimplemented("StartSandbox is not supported by the LXD driver").into())
+    }
+
+    /// Workspaces own no LXD resources of their own: every sandbox lives in
+    /// the driver's single project, so there is nothing to provision.
+    async fn ensure_workspace(
+        &self,
+        _request: Request<EnsureWorkspaceRequest>,
+    ) -> Result<Response<EnsureWorkspaceResponse>, Status> {
+        Ok(Response::new(EnsureWorkspaceResponse {}))
+    }
+
+    /// See [`Self::ensure_workspace`]: there is nothing to tear down.
+    async fn delete_workspace(
+        &self,
+        _request: Request<DeleteWorkspaceRequest>,
+    ) -> Result<Response<DeleteWorkspaceResponse>, Status> {
+        Ok(Response::new(DeleteWorkspaceResponse {}))
     }
 
     async fn validate_sandbox_create(
@@ -347,6 +390,49 @@ mod tests {
             .await
             .expect("watch stream should yield within 5s")
             .expect("watch stream should not end")
+    }
+
+    /// The gateway calls this at startup and aborts on any error but
+    /// `Unimplemented`; the driver needs no extra listeners.
+    #[tokio::test]
+    async fn gateway_listener_requirements_are_empty() {
+        let response = service()
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+            .expect("listener requirements should be answered")
+            .into_inner();
+        assert!(response.requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn start_sandbox_is_unimplemented() {
+        let status = service()
+            .start_sandbox(Request::new(StartSandboxRequest {
+                sandbox_id: "id".to_string(),
+                sandbox_name: "name".to_string(),
+            }))
+            .await
+            .expect_err("StartSandbox is not supported");
+        assert_eq!(status.code(), Code::Unimplemented);
+    }
+
+    #[tokio::test]
+    async fn workspaces_need_no_provisioning() {
+        let service = service();
+        service
+            .ensure_workspace(Request::new(EnsureWorkspaceRequest {
+                workspace: "ws".to_string(),
+            }))
+            .await
+            .expect("ensure_workspace succeeds");
+        service
+            .delete_workspace(Request::new(DeleteWorkspaceRequest {
+                workspace: "ws".to_string(),
+            }))
+            .await
+            .expect("delete_workspace succeeds");
     }
 
     #[tokio::test]

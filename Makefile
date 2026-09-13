@@ -62,14 +62,18 @@ proto:
 # be resolvable on protoc's include path for codegen to succeed.
 UPSTREAM_PROTOS := compute_driver.proto options.proto
 
-# Sync proto/ with upstream NVIDIA/OpenShell main.
+# OpenShell release the vendored protos are taken from. Keep it in step with
+# the OpenShell release the driver targets.
+OPENSHELL_REF ?= v0.0.116
+
+# Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:
 	@changed=""; \
 	for p in $(UPSTREAM_PROTOS); do \
-		gh api repos/NVIDIA/OpenShell/contents/proto/$$p --jq '.content' \
-			| base64 -d > /tmp/openshell_upstream_$$p; \
+		curl -fsSL "https://raw.githubusercontent.com/NVIDIA/OpenShell/$(OPENSHELL_REF)/proto/$$p" \
+			-o /tmp/openshell_upstream_$$p || rm -f /tmp/openshell_upstream_$$p; \
 		if [ ! -s /tmp/openshell_upstream_$$p ]; then \
-			echo "ERROR: failed to fetch proto/$$p from upstream" >&2; \
+			echo "ERROR: failed to fetch proto/$$p from upstream $(OPENSHELL_REF)" >&2; \
 			exit 1; \
 		fi; \
 		if ! diff -q /tmp/openshell_upstream_$$p proto/$$p > /dev/null 2>&1; then \
@@ -78,14 +82,14 @@ sync-proto:
 		fi; \
 	done; \
 	if [ -z "$$changed" ]; then \
-		echo "protos are already in sync with upstream main"; \
+		echo "protos are already in sync with upstream $(OPENSHELL_REF)"; \
 	else \
 		echo "==> updated:$$changed"; \
 		cargo build --workspace && \
 		if [ -t 0 ]; then \
 			read -r -p "Would you like to commit changes to$$changed (Y/n)? " answer; \
 			if [ "$${answer:-y}" = "y" ] || [ "$${answer:-y}" = "Y" ]; then \
-				git commit -S -s -m "chore(proto): sync protos with upstream main" --$$changed; \
+				git commit -S -s -m "chore(proto): sync protos with upstream $(OPENSHELL_REF)" --$$changed; \
 			fi; \
 		else \
 			echo "==>$$changed updated; please commit the change" >&2; \
