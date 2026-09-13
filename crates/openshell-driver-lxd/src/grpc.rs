@@ -28,9 +28,11 @@ use crate::watcher;
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
     driver: LxdComputeDriver,
-    /// Published on every successful DeleteSandbox so WatchSandboxes can emit
-    /// Deleted events and the gateway immediately removes the sandbox from its
-    /// store rather than waiting for the next reconcile cycle.
+    /// Published on every successful DeleteSandbox, and by the LXD lifecycle
+    /// watcher when a sandbox's instance is deleted any other way, so
+    /// WatchSandboxes can emit Deleted events and the gateway immediately
+    /// removes the sandbox from its store rather than waiting for the next
+    /// reconcile cycle.
     deletion_tx: broadcast::Sender<String>,
     /// Published by the LXD lifecycle watcher whenever a driver-managed
     /// instance changes state, so a sandbox whose supervisor exited is
@@ -43,7 +45,7 @@ impl ComputeDriverService {
     pub fn new(driver: LxdComputeDriver) -> Self {
         let (deletion_tx, _) = broadcast::channel(64);
         let (sandbox_tx, _) = broadcast::channel(64);
-        watcher::spawn(driver.lxd_client(), sandbox_tx.clone());
+        watcher::spawn(driver.lxd_client(), sandbox_tx.clone(), deletion_tx.clone());
         Self {
             driver,
             deletion_tx,

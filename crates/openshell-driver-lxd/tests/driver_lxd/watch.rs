@@ -161,11 +161,9 @@ async fn unmanaged_instances_are_not_pushed() {
         .await;
 }
 
-/// Removing a sandbox's instance behind the driver's back must reach the
-/// gateway as a deletion; today only DeleteSandbox publishes one, and the
-/// gateway keeps the sandbox until its orphan sweep.
+/// Removing a sandbox's instance behind the driver's back reaches the
+/// gateway as a deletion, instead of waiting for its orphan sweep.
 #[tokio::test]
-#[ignore = "known gap: an out-of-band instance delete publishes no Deleted event"]
 async fn out_of_band_delete_is_pushed_as_deleted() {
     let driver = Driver::start().await;
     let name = unique_name("woobdel");
@@ -177,6 +175,39 @@ async fn out_of_band_delete_is_pushed_as_deleted() {
     lxc(&["delete", "--force", &name]);
 
     watch.expect_deleted(&id).await;
+}
+
+/// A sandbox created after the watcher subscribed is known to it too.
+#[tokio::test]
+async fn out_of_band_delete_of_a_sandbox_created_after_subscribing_is_pushed() {
+    let driver = Driver::start().await;
+    let mut watch = driver.watch().await;
+    let name = unique_name("wlate");
+    let id = sandbox_id(&name);
+    let _cleanup = driver.cleanup(&[&name]);
+    driver.create_running(&name).await;
+    watch.expect_snapshot(&id, "True", "").await;
+
+    lxc(&["delete", "--force", &name]);
+
+    watch.expect_deleted(&id).await;
+}
+
+/// Deleting an unmanaged instance says nothing.
+#[tokio::test]
+async fn out_of_band_delete_of_an_unmanaged_instance_is_not_pushed() {
+    let driver = Driver::start().await;
+    let name = unique_name("wunmdel");
+    let _cleanup = driver.cleanup(&[&name]);
+    let alias = ensure_sandbox_image();
+    lxc(&["init", &alias, &name]);
+    let mut watch = driver.watch().await;
+
+    lxc(&["delete", "--force", &name]);
+
+    watch
+        .expect_silence_about(&name, "", Duration::from_secs(5))
+        .await;
 }
 
 /// A new watcher learns the current state of every sandbox, or anything that

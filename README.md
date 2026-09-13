@@ -211,7 +211,15 @@ To guarantee sandboxes obtain an IP lease regardless of what packages are instal
 The driver subscribes to LXD's lifecycle event stream and pushes an updated
 sandbox snapshot to the gateway as soon as an instance changes state, rather
 than leaving the gateway to notice on its next reconcile (up to a minute
-later). A sandbox whose supervisor dies is reported in well under a second.
+later). A sandbox whose supervisor dies is reported in well under a second,
+and a sandbox whose instance is deleted outside the driver (for example with
+`lxc delete`) is reported as deleted. A watch that (re)connects first
+receives the current state of every sandbox, so nothing that changed while
+the driver or gateway was restarting is missed.
+
+When a sandbox is not ready, the condition's `message` says why; for an
+exited supervisor it names the `lxc console <name> --show-log` command that
+shows the supervisor's output.
 
 The `Ready` condition's `reason` uses the cross-driver vocabulary upstream
 defines in `openshell-core::driver_utils`, because the gateway keys real

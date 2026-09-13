@@ -8,6 +8,7 @@
 //! stream and pushes an updated sandbox snapshot straight away, the same way
 //! the upstream Podman driver forwards runtime events.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use computev1::pb::DriverSandbox;
@@ -27,8 +28,11 @@ const RESUBSCRIBE_DELAY: Duration = Duration::from_secs(2);
 /// `instance-shutdown` is the interesting one: LXD emits it when the guest's
 /// init exits by itself, which for a sandbox means the supervisor is gone.
 /// `instance-stopped` is its counterpart for a stop issued through the API.
-/// The rest keep the pushed snapshot honest across a sandbox's life.
+/// The rest keep the pushed snapshot honest across a sandbox's life;
+/// `instance-created` also makes a new sandbox known, so its deletion can be
+/// reported (see [`DELETED_ACTION`]).
 const WATCHED_ACTIONS: &[&str] = &[
+    "instance-created",
     "instance-started",
     "instance-shutdown",
     "instance-stopped",
@@ -36,6 +40,11 @@ const WATCHED_ACTIONS: &[&str] = &[
     "instance-paused",
     "instance-resumed",
 ];
+
+/// Lifecycle action for a deleted instance. There is nothing left to re-read,
+/// so the watcher reports it as a deletion of the sandbox it last knew under
+/// that name.
+const DELETED_ACTION: &str = "instance-deleted";
 
 /// Extracts the instance name from a lifecycle event's metadata.
 ///
@@ -64,15 +73,20 @@ fn action(metadata: &serde_json::Value) -> Option<&str> {
     metadata.get("action").and_then(|v| v.as_str())
 }
 
-/// Spawns the lifecycle watcher, returning the receiver side for
-/// `WatchSandboxes` to fan out to the gateway.
+/// Spawns the lifecycle watcher, which publishes a snapshot on `tx` whenever
+/// a driver-managed instance changes state and a sandbox id on `deleted_tx`
+/// when one is deleted, for `WatchSandboxes` to fan out to the gateway.
 ///
 /// The task reconnects on its own and never terminates, so a subscription
 /// failure at start-up (LXD not up yet) is not fatal.
-pub(crate) fn spawn(lxd: LxdClient, tx: broadcast::Sender<DriverSandbox>) {
+pub(crate) fn spawn(
+    lxd: LxdClient,
+    tx: broadcast::Sender<DriverSandbox>,
+    deleted_tx: broadcast::Sender<String>,
+) {
     tokio::spawn(async move {
         loop {
-            match run_once(&lxd, &tx).await {
+            match run_once(&lxd, &tx, &deleted_tx).await {
                 Ok(()) => {
                     tracing::debug!("LXD event stream ended; re-subscribing");
                 }
@@ -85,33 +99,69 @@ pub(crate) fn spawn(lxd: LxdClient, tx: broadcast::Sender<DriverSandbox>) {
     });
 }
 
+/// Sandbox ids of the managed instances currently in the project, by name.
+async fn managed_sandbox_ids(
+    lxd: &LxdClient,
+) -> Result<HashMap<String, String>, lxd_client::LxdError> {
+    Ok(lxd
+        .list_instances()
+        .await?
+        .into_iter()
+        .filter_map(|instance| {
+            let id = instance.config.get(mapping::KEY_SANDBOX_ID)?.clone();
+            Some((instance.name, id))
+        })
+        .collect())
+}
+
 /// Subscribes once and forwards events until the stream ends.
 async fn run_once(
     lxd: &LxdClient,
     tx: &broadcast::Sender<DriverSandbox>,
+    deleted_tx: &broadcast::Sender<String>,
 ) -> Result<(), lxd_client::LxdError> {
     use futures::StreamExt;
 
     let mut stream = lxd.subscribe_events(&["lifecycle"]).await?;
     tracing::debug!("subscribed to LXD lifecycle events");
 
+    // Which sandbox each instance name belongs to, so a deletion — after which
+    // the instance can no longer be read — can still be reported by sandbox
+    // id. Seeded after subscribing, so nothing created in between is missed.
+    let mut sandbox_ids = managed_sandbox_ids(lxd).await?;
+
     while let Some(event) = stream.next().await {
         let event = event?;
         let Some(action) = action(&event.metadata) else {
             continue;
         };
-        if !WATCHED_ACTIONS.contains(&action) {
-            continue;
-        }
         let Some(name) = instance_name(&event.metadata) else {
             continue;
         };
 
+        if action == DELETED_ACTION {
+            // Only sandboxes are reported. A delete through DeleteSandbox has
+            // already published this; the gateway treats a repeat as a no-op.
+            if let Some(sandbox_id) = sandbox_ids.remove(&name) {
+                tracing::debug!(
+                    name = %name,
+                    sandbox_id = %sandbox_id,
+                    "pushing sandbox deletion from lifecycle event"
+                );
+                deleted_tx.send(sandbox_id).ok();
+            }
+            continue;
+        }
+
+        if !WATCHED_ACTIONS.contains(&action) {
+            continue;
+        }
+
         // Re-read the instance rather than trusting the event: the event says
         // what happened, the instance says what state it left behind, and the
         // snapshot the gateway wants is built from the latter. A sandbox that
-        // has since been deleted 404s here and is skipped — its removal
-        // travels as a Deleted event from delete_sandbox instead.
+        // has since been deleted 404s here and is skipped; its deletion event
+        // follows.
         let instance = match lxd.get_instance(&name).await {
             Ok(instance) => instance,
             Err(e) => {
@@ -121,10 +171,11 @@ async fn run_once(
         };
 
         // Only driver-managed instances are ours to report on; the event
-        // stream carries every instance on the host.
-        if !instance.config.contains_key(mapping::KEY_SANDBOX_ID) {
+        // stream carries every instance in the project.
+        let Some(sandbox_id) = instance.config.get(mapping::KEY_SANDBOX_ID) else {
             continue;
-        }
+        };
+        sandbox_ids.insert(name.clone(), sandbox_id.clone());
 
         let sandbox = mapping::instance_to_driver_sandbox(&instance);
         tracing::debug!(
@@ -200,5 +251,13 @@ mod tests {
         // Noise that should not trigger a re-read.
         assert!(!WATCHED_ACTIONS.contains(&"instance-log-retrieved"));
         assert!(!WATCHED_ACTIONS.contains(&"image-created"));
+    }
+
+    /// A deleted instance cannot be re-read; it is handled separately, by
+    /// the sandbox id learned when it was created or first seen.
+    #[test]
+    fn deletion_is_not_a_re_read_action_but_creation_is() {
+        assert!(!WATCHED_ACTIONS.contains(&DELETED_ACTION));
+        assert!(WATCHED_ACTIONS.contains(&"instance-created"));
     }
 }
