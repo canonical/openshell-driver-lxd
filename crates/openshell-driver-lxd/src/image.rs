@@ -46,6 +46,9 @@ pub fn strip_docker_scheme(reference: &str) -> &str {
 ///
 /// Disallows shell metacharacters, whitespace, control characters, or invalid formats.
 /// An optional leading `docker://` transport prefix is accepted.
+///
+/// A reference that fails this check can never be imported, so it is the
+/// caller's mistake: [`DriverError::InvalidArgument`], not an import failure.
 pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
     if reference.is_empty() {
         return Err(DriverError::InvalidArgument(
@@ -53,7 +56,7 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
         ));
     }
     if !OCI_REF_REGEX.is_match(reference) {
-        return Err(DriverError::ImageImport(format!(
+        return Err(DriverError::InvalidArgument(format!(
             "invalid OCI image reference: {reference:?}"
         )));
     }
@@ -1007,16 +1010,28 @@ mod tests {
         assert!(validate_reference("docker://ubuntu:22.04").is_ok());
         assert!(validate_reference("docker://registry.example.com/org/sandbox:latest").is_ok());
 
-        // Invalid references (shell injection / malformed)
-        assert!(validate_reference("").is_err());
-        assert!(validate_reference("ubuntu; rm -rf /").is_err());
-        assert!(validate_reference("ubuntu && touch /tmp/pwn").is_err());
-        assert!(validate_reference("ubuntu|cat").is_err());
-        assert!(validate_reference("ubuntu`id`").is_err());
-        assert!(validate_reference("ubuntu$(id)").is_err());
-        assert!(validate_reference("ubuntu\n").is_err());
-        assert!(validate_reference("ubuntu foo").is_err());
-        assert!(validate_reference("ubuntu:").is_err());
+        // Invalid references (shell injection / malformed) are the caller's
+        // mistake.
+        for invalid in [
+            "",
+            "ubuntu; rm -rf /",
+            "ubuntu && touch /tmp/pwn",
+            "ubuntu|cat",
+            "ubuntu`id`",
+            "ubuntu$(id)",
+            "ubuntu\n",
+            "ubuntu foo",
+            "ubuntu:",
+            "UPPER/Case::bad",
+        ] {
+            assert!(
+                matches!(
+                    validate_reference(invalid),
+                    Err(DriverError::InvalidArgument(_))
+                ),
+                "{invalid:?}"
+            );
+        }
     }
 
     #[test]

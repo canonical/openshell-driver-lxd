@@ -106,10 +106,9 @@ async fn unresolvable_images_fail_cleanly() {
     );
 }
 
-/// A reference that can never be valid is the caller's mistake and should be
-/// `InvalidArgument`; today it is reported as an internal import failure.
+/// A reference that can never be valid is the caller's mistake:
+/// `InvalidArgument`, and nothing is created.
 #[tokio::test]
-#[ignore = "known gap: a malformed image reference is Internal, not InvalidArgument"]
 async fn malformed_image_reference_is_invalid_argument() {
     let driver = Driver::start().await;
     let name = unique_name("malformed");
@@ -119,6 +118,7 @@ async fn malformed_image_reference_is_invalid_argument() {
         .await
         .expect_err("a malformed reference should fail the create");
     assert_eq!(status.code(), Code::InvalidArgument, "{status}");
+    assert!(lxd().get_instance(&name).await.is_err());
 }
 
 /// A cold import converts the image once, keyed by digest; later creates

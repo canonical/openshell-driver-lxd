@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use crate::config::Config;
 use crate::dhcp_client;
 use crate::error::DriverError;
-use crate::image::{digest_of_file, ImageCache, SkopeoImporter};
+use crate::image::{self, digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
@@ -135,6 +135,12 @@ impl LxdComputeDriver {
         let template = spec.template.as_ref().ok_or_else(|| {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
+
+        // An empty image means the default image, which is validated when it
+        // is resolved.
+        if !template.image.is_empty() {
+            image::validate_reference(&template.image)?;
+        }
 
         for key in template.labels.keys() {
             if !mapping::is_valid_label_key(key) {
@@ -751,12 +757,9 @@ mod tests {
         assert!(matches!(err, DriverError::InvalidArgument(_)));
     }
 
-    /// A malformed reference can never be imported, so it should be refused
-    /// as the caller's mistake before CreateSandbox runs. Today validation
-    /// does not look at the image, and CreateSandbox later reports the same
-    /// reference as an internal image-import failure.
+    /// A malformed reference can never be imported, so it is refused as the
+    /// caller's mistake before CreateSandbox runs.
     #[tokio::test]
-    #[ignore = "known gap: ValidateSandboxCreate does not validate template.image"]
     async fn validate_sandbox_create_rejects_malformed_image_reference() {
         let sandbox = sandbox_with_spec(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
@@ -771,6 +774,22 @@ mod tests {
             .await
             .expect_err("malformed image reference should be rejected");
         assert!(matches!(err, DriverError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_a_well_formed_image_reference() {
+        let sandbox = sandbox_with_spec(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("a well-formed reference should be accepted without contacting a registry");
     }
 
     #[test]
