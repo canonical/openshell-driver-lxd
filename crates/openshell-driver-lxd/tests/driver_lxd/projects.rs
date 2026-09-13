@@ -120,16 +120,9 @@ async fn driver_refuses_to_start_without_its_project() {
 }
 
 /// A driver confined to a project creates, reports and deletes its sandboxes
-/// there and nowhere else.
-///
-/// Today no sandbox can be created in a non-default project: the supervisor
-/// and DHCP-client volumes are uploaded without the project
-/// (`LxdClient::post_raw_response` does not add it), so LXD creates them in
-/// `default`. The driver then waits for that operation's events in its own
-/// project, never sees them, and the create hangs with no deadline; when the
-/// volume already exists in `default` it fails instead.
+/// there and nowhere else, including the supervisor and DHCP-client volumes
+/// it provisions.
 #[tokio::test]
-#[ignore = "known gap: volume uploads ignore --project, so creates in a non-default project hang or fail"]
 async fn sandboxes_stay_inside_the_driver_project() {
     let project = Project::create(false);
     let in_project = Driver::start_with(DriverOptions {
@@ -143,6 +136,30 @@ async fn sandboxes_stay_inside_the_driver_project() {
     let _cleanup = in_project.cleanup(&[&name]);
 
     in_project.create_running(&name).await;
+
+    // The volumes the sandbox mounts were provisioned in the project.
+    let volumes = lxc(&[
+        "storage",
+        "volume",
+        "list",
+        "default",
+        "--project",
+        &project.name,
+        "--format",
+        "csv",
+        "-c",
+        "tn",
+    ]);
+    for prefix in [
+        "custom,openshell-supervisor-",
+        "custom,openshell-dhcp-client-",
+    ] {
+        assert!(
+            volumes.lines().any(|line| line.starts_with(prefix)),
+            "no {prefix}* volume in {}: {volumes}",
+            project.name
+        );
+    }
 
     assert!(lxd_in(&project.name).get_instance(&name).await.is_ok());
     assert!(
@@ -163,17 +180,12 @@ async fn sandboxes_stay_inside_the_driver_project() {
     assert!(lxd_in(&project.name).get_instance(&name).await.is_err());
 }
 
-/// In a project with its own images, the converted image must be uploaded
-/// into that project. Today the upload goes to the default project without
-/// an alias, the driver waits for the operation in the wrong project until
-/// the import deadline, and every attempt leaves an orphaned image in
-/// `default`.
+/// In a project with its own images, the converted image is uploaded into
+/// that project and nothing leaks into `default`.
 ///
-/// The import is driven through the startup pre-warm: CreateSandbox
-/// provisions volumes before it imports, so there the volume gap above would
-/// hide this one.
+/// The import is driven through the startup pre-warm, which imports without
+/// provisioning volumes, so this checks the image upload on its own.
 #[tokio::test]
-#[ignore = "known gap: image upload ignores --project"]
 async fn cold_import_lands_in_a_project_with_its_own_images() {
     let project = Project::create(true);
     let prefix = format!("{}-", project.name);

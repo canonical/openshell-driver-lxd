@@ -482,9 +482,10 @@ impl LxdClient {
     ) -> Result<LxdResponse<T>, LxdError> {
         let (mut sender, host) = self.connect().await?;
 
+        let decorated_path = self.decorate_path(path);
         let mut builder = Request::builder()
             .method(Method::POST)
-            .uri(path)
+            .uri(&decorated_path)
             .header("Host", host)
             .header("Content-Type", content_type);
         for (name, value) in extra_headers {
@@ -539,9 +540,10 @@ impl LxdClient {
     ) -> Result<LxdResponse<T>, LxdError> {
         let (mut sender, host) = self.connect::<SplitImageBody>().await?;
 
+        let decorated_path = self.decorate_path(path);
         let request = Request::builder()
             .method(Method::POST)
-            .uri(path)
+            .uri(&decorated_path)
             .header("Host", host)
             .header("Content-Type", content_type)
             .body(body)?;
@@ -653,9 +655,10 @@ impl LxdClient {
     ) -> Result<(hyper::HeaderMap, Bytes), LxdError> {
         let (mut sender, host) = self.connect().await?;
 
+        let decorated_path = self.decorate_path(path);
         let request = Request::builder()
             .method(Method::GET)
-            .uri(path)
+            .uri(&decorated_path)
             .header("Host", host)
             .body(Full::new(Bytes::new()))?;
 
