@@ -403,6 +403,8 @@ fn struct_get_str_list(s: Option<&Struct>, key: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use lxd_client::LxdError;
+
     use super::*;
 
     #[test]
@@ -583,15 +585,643 @@ mod tests {
             ready_condition(&instance_with("Starting", &[])).reason,
             CONDITION_STARTING
         );
-        assert_eq!(
-            ready_condition(&instance_with("Frozen", &[])).reason,
-            CONDITION_PAUSED
-        );
         // An unrecognised status stays Unknown, which the gateway maps to
         // Provisioning rather than Error.
         assert_eq!(
             ready_condition(&instance_with("Weird", &[])).status,
             "Unknown"
+        );
+    }
+
+    /// `ContainerPaused` is what upstream's Docker driver reports for a
+    /// paused container (OpenShell v0.0.116
+    /// `crates/openshell-driver-docker/src/lib.rs:3515`). It is not in the
+    /// gateway's transient set, so a frozen sandbox surfaces as `Error`, the
+    /// same as on Docker.
+    #[test]
+    fn frozen_is_reported_as_paused() {
+        let cond = ready_condition(&instance_with("Frozen", &[]));
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, CONDITION_PAUSED);
+    }
+
+    #[test]
+    fn lxd_error_status_is_reported_as_error() {
+        let cond = ready_condition(&instance_with("Error", &[]));
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, "Error");
+    }
+
+    /// Phase the OpenShell v0.0.116 gateway derives from a `Ready` condition
+    /// (`crates/openshell-server/src/compute/mod.rs`, `derive_phase` and
+    /// `is_terminal_failure_reason`, lines 4033-4131). Mirrored here so every
+    /// reason the driver emits is checked against how the gateway reads it.
+    fn v0_0_116_gateway_phase(cond: &DriverCondition) -> &'static str {
+        const TRANSIENT_REASONS: &[&str] = &[
+            "reconcilererror",
+            "dependenciesnotready",
+            "supervisornotconnected",
+            "starting",
+            "containerstarting",
+            "containercreated",
+            "healthcheckstarting",
+            "inspectfailed",
+        ];
+        if cond.status.eq_ignore_ascii_case("true") {
+            "Ready"
+        } else if cond.status.eq_ignore_ascii_case("false") {
+            if TRANSIENT_REASONS.contains(&cond.reason.to_ascii_lowercase().as_str()) {
+                "Provisioning"
+            } else {
+                "Error"
+            }
+        } else {
+            "Provisioning"
+        }
+    }
+
+    /// The reason strings are consumed by the gateway, so pin the phase each
+    /// observable instance state lands in. A mid-create sandbox must never
+    /// read as `Error`; an exited or stopped one must not read as
+    /// `Provisioning` (the gateway separately confirms `Stopping → Stopped`
+    /// on `ContainerExited`/`ContainerStopped`, v0.0.116 `mod.rs:3877-3887`).
+    #[test]
+    fn every_reported_state_maps_to_the_intended_gateway_phase() {
+        let ran = ("volatile.last_state.power", "STOPPED");
+        let cases = [
+            (instance_with("Running", &[]), "Ready"),
+            (instance_with("Ready", &[]), "Ready"),
+            (instance_with("Stopped", &[]), "Provisioning"),
+            (instance_with("Starting", &[]), "Provisioning"),
+            (instance_with("Weird", &[]), "Provisioning"),
+            (instance_with("Stopped", &[ran]), "Error"),
+            (
+                instance_with("Stopped", &[ran, (KEY_STOP_INTENT, CONDITION_STOPPED)]),
+                "Error",
+            ),
+            (instance_with("Frozen", &[]), "Error"),
+            (instance_with("Error", &[]), "Error"),
+        ];
+
+        for (instance, expected) in cases {
+            let cond = ready_condition(&instance);
+            assert_eq!(cond.r#type, "Ready");
+            assert_eq!(
+                v0_0_116_gateway_phase(&cond),
+                expected,
+                "LXD status {:?} with config {:?} reported {cond:?}",
+                instance.status,
+                instance.config
+            );
+        }
+    }
+
+    #[test]
+    fn observed_sandbox_carries_identity_and_one_ready_condition() {
+        let instance = Instance {
+            name: "sb-name".to_string(),
+            ..instance_with(
+                "Running",
+                &[
+                    (KEY_SANDBOX_ID, "sb-id"),
+                    (KEY_NAMESPACE, "ns"),
+                    (KEY_WORKSPACE, "ws"),
+                ],
+            )
+        };
+
+        let sandbox = instance_to_driver_sandbox(&instance);
+
+        assert_eq!(sandbox.id, "sb-id");
+        assert_eq!(sandbox.name, "sb-name");
+        assert_eq!(sandbox.namespace, "ns");
+        assert_eq!(sandbox.workspace, "ws");
+        assert!(sandbox.spec.is_none(), "observed snapshots omit spec");
+
+        let status = sandbox.status.expect("status is always reported");
+        assert_eq!(status.sandbox_name, "sb-name");
+        assert_eq!(status.instance_id, "sb-name");
+        assert!(!status.deleting);
+        assert_eq!(status.conditions.len(), 1);
+        assert_eq!(status.conditions[0].r#type, "Ready");
+        assert_eq!(status.conditions[0].status, "True");
+    }
+
+    #[test]
+    fn observed_sandbox_without_markers_has_empty_identity() {
+        let sandbox = instance_to_driver_sandbox(&instance_with("Running", &[]));
+        assert_eq!(sandbox.id, "");
+        assert_eq!(sandbox.namespace, "");
+        assert_eq!(sandbox.workspace, "");
+    }
+
+    fn string_value(s: &str) -> prost_types::Value {
+        prost_types::Value {
+            kind: Some(Kind::StringValue(s.to_string())),
+        }
+    }
+
+    fn driver_config(fields: &[(&str, prost_types::Value)]) -> Option<Struct> {
+        Some(Struct {
+            fields: fields
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), v.clone()))
+                .collect(),
+        })
+    }
+
+    fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn identified_sandbox() -> DriverSandbox {
+        DriverSandbox {
+            id: "sb-123".to_string(),
+            name: "test-sandbox".to_string(),
+            namespace: "ns".to_string(),
+            workspace: "ws".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn build_create_config_records_identity_and_init() {
+        let config = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &DriverSandboxTemplate::default(),
+            "",
+            false,
+            0,
+        )
+        .expect("build_create_config should succeed");
+
+        assert_eq!(
+            config.get(KEY_SANDBOX_ID).map(String::as_str),
+            Some("sb-123")
+        );
+        assert_eq!(config.get(KEY_NAMESPACE).map(String::as_str), Some("ns"));
+        assert_eq!(config.get(KEY_WORKSPACE).map(String::as_str), Some("ws"));
+        assert_eq!(
+            config.get("raw.lxc").map(String::as_str),
+            Some(RAW_LXC_INIT_CMD)
+        );
+        assert_eq!(
+            config.get("security.nesting").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            config
+                .get("environment.OPENSHELL_SANDBOX_ID")
+                .map(String::as_str),
+            Some("sb-123")
+        );
+        assert_eq!(
+            config
+                .get("environment.OPENSHELL_SANDBOX")
+                .map(String::as_str),
+            Some("test-sandbox")
+        );
+    }
+
+    #[test]
+    fn template_environment_overrides_spec_environment() {
+        let spec = DriverSandboxSpec {
+            environment: env(&[("SHARED", "from-spec"), ("SPEC_ONLY", "spec")]),
+            ..Default::default()
+        };
+        let template = DriverSandboxTemplate {
+            environment: env(&[("SHARED", "from-template"), ("TEMPLATE_ONLY", "template")]),
+            ..Default::default()
+        };
+
+        let config = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
+            .expect("build_create_config should succeed");
+
+        assert_eq!(
+            config.get("environment.SHARED").map(String::as_str),
+            Some("from-template")
+        );
+        assert_eq!(
+            config.get("environment.SPEC_ONLY").map(String::as_str),
+            Some("spec")
+        );
+        assert_eq!(
+            config.get("environment.TEMPLATE_ONLY").map(String::as_str),
+            Some("template")
+        );
+    }
+
+    /// The supervisor trusts these variables to know which sandbox it is and
+    /// where to reach the gateway; request-supplied environment must not be
+    /// able to redirect it.
+    #[test]
+    fn driver_injected_environment_cannot_be_overridden_by_the_request() {
+        let hostile = env(&[
+            ("OPENSHELL_SANDBOX_ID", "someone-else"),
+            ("OPENSHELL_SANDBOX", "someone-else"),
+            ("OPENSHELL_SSH_SOCKET_PATH", "/tmp/evil.sock"),
+            ("OPENSHELL_ENDPOINT", "http://attacker:1"),
+            ("OPENSHELL_SANDBOX_TOKEN_FILE", "/tmp/evil.jwt"),
+        ]);
+        let spec = DriverSandboxSpec {
+            environment: hostile.clone(),
+            ..Default::default()
+        };
+        let template = DriverSandboxTemplate {
+            environment: hostile,
+            ..Default::default()
+        };
+
+        let config = build_create_config(
+            &identified_sandbox(),
+            &spec,
+            &template,
+            "http://10.0.0.1:17670",
+            true,
+            0,
+        )
+        .expect("build_create_config should succeed");
+
+        let expected = [
+            ("OPENSHELL_SANDBOX_ID", "sb-123"),
+            ("OPENSHELL_SANDBOX", "test-sandbox"),
+            ("OPENSHELL_SSH_SOCKET_PATH", GUEST_SSH_SOCKET_PATH),
+            ("OPENSHELL_ENDPOINT", "http://10.0.0.1:17670"),
+            ("OPENSHELL_SANDBOX_TOKEN_FILE", GUEST_SANDBOX_TOKEN_PATH),
+        ];
+        for (key, value) in expected {
+            assert_eq!(
+                config
+                    .get(&format!("environment.{key}"))
+                    .map(String::as_str),
+                Some(value),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_endpoint_is_only_injected_when_resolved() {
+        let spec = DriverSandboxSpec {
+            environment: env(&[("OPENSHELL_ENDPOINT", "http://from-gateway:17670")]),
+            ..Default::default()
+        };
+        let template = DriverSandboxTemplate::default();
+
+        let resolved = build_create_config(
+            &identified_sandbox(),
+            &spec,
+            &template,
+            "http://10.0.0.1:17670",
+            false,
+            0,
+        )
+        .expect("build_create_config should succeed");
+        assert_eq!(
+            resolved
+                .get("environment.OPENSHELL_ENDPOINT")
+                .map(String::as_str),
+            Some("http://10.0.0.1:17670")
+        );
+
+        // Empty means "not resolved": the gateway-supplied value is kept.
+        let unresolved = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
+            .expect("build_create_config should succeed");
+        assert_eq!(
+            unresolved
+                .get("environment.OPENSHELL_ENDPOINT")
+                .map(String::as_str),
+            Some("http://from-gateway:17670")
+        );
+    }
+
+    /// The token is delivered as a root-only file pushed before start. It
+    /// must never be written into instance config, which any LXD API client
+    /// with read access can see.
+    #[test]
+    fn sandbox_token_is_referenced_by_file_never_embedded() {
+        let spec = DriverSandboxSpec {
+            sandbox_token: "eyJhbGciOiJFZERTQSJ9.secret-token".to_string(),
+            ..Default::default()
+        };
+        let template = DriverSandboxTemplate::default();
+
+        let with_token = build_create_config(&identified_sandbox(), &spec, &template, "", true, 0)
+            .expect("build_create_config should succeed");
+        assert_eq!(
+            with_token
+                .get("environment.OPENSHELL_SANDBOX_TOKEN_FILE")
+                .map(String::as_str),
+            Some(GUEST_SANDBOX_TOKEN_PATH)
+        );
+        assert!(
+            with_token.values().all(|v| !v.contains("secret-token")),
+            "token leaked into instance config: {with_token:?}"
+        );
+        assert!(!with_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN"));
+
+        let without_token =
+            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
+                .expect("build_create_config should succeed");
+        assert!(!without_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"));
+    }
+
+    #[test]
+    fn labels_are_namespaced_and_validated() {
+        let template = DriverSandboxTemplate {
+            labels: env(&[("team", "infra"), ("app.kubernetes.io_name", "agent")]),
+            ..Default::default()
+        };
+        let config = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &template,
+            "",
+            false,
+            0,
+        )
+        .expect("build_create_config should succeed");
+        assert_eq!(
+            config.get("user.openshell.label.team").map(String::as_str),
+            Some("infra")
+        );
+        assert_eq!(
+            config
+                .get("user.openshell.label.app.kubernetes.io_name")
+                .map(String::as_str),
+            Some("agent")
+        );
+
+        let invalid = DriverSandboxTemplate {
+            labels: env(&[("has/slash", "x")]),
+            ..Default::default()
+        };
+        let err = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &invalid,
+            "",
+            false,
+            0,
+        )
+        .expect_err("invalid label key should be rejected");
+        assert!(matches!(err, DriverError::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn label_key_charset() {
+        for valid in ["a", "A-Z_0.9", "team.example-key_1"] {
+            assert!(is_valid_label_key(valid), "{valid:?}");
+        }
+        for invalid in ["", "with space", "slash/key", "colon:key", "ünïcode", "a=b"] {
+            assert!(!is_valid_label_key(invalid), "{invalid:?}");
+        }
+    }
+
+    fn resources(
+        cpu_request: &str,
+        cpu_limit: &str,
+        memory_request: &str,
+        memory_limit: &str,
+    ) -> DriverSandboxTemplate {
+        DriverSandboxTemplate {
+            resources: Some(computev1::pb::DriverResourceRequirements {
+                cpu_request: cpu_request.to_string(),
+                cpu_limit: cpu_limit.to_string(),
+                memory_request: memory_request.to_string(),
+                memory_limit: memory_limit.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn config_for(
+        template: &DriverSandboxTemplate,
+    ) -> Result<HashMap<String, String>, DriverError> {
+        build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            template,
+            "",
+            false,
+            0,
+        )
+    }
+
+    #[test]
+    fn resource_limits_prefer_limit_over_request() {
+        let config = config_for(&resources("1", "3", "256Mi", "1Gi")).unwrap();
+        assert_eq!(config.get("limits.cpu").map(String::as_str), Some("3"));
+        assert_eq!(
+            config.get("limits.memory").map(String::as_str),
+            Some("1GiB")
+        );
+    }
+
+    /// LXD has no soft request, so a request alone becomes the hard limit.
+    #[test]
+    fn resource_request_is_enforced_when_no_limit_is_given() {
+        let config = config_for(&resources("500m", "", "512Mi", "")).unwrap();
+        assert_eq!(config.get("limits.cpu").map(String::as_str), Some("1"));
+        assert_eq!(
+            config.get("limits.memory").map(String::as_str),
+            Some("512MiB")
+        );
+    }
+
+    #[test]
+    fn no_resources_means_no_cpu_or_memory_limits() {
+        let config = config_for(&DriverSandboxTemplate::default()).unwrap();
+        assert!(!config.contains_key("limits.cpu"));
+        assert!(!config.contains_key("limits.memory"));
+
+        let empty = config_for(&resources("", "", "", "")).unwrap();
+        assert!(!empty.contains_key("limits.cpu"));
+        assert!(!empty.contains_key("limits.memory"));
+    }
+
+    #[test]
+    fn invalid_resource_quantities_are_rejected() {
+        for template in [
+            resources("", "lots", "", ""),
+            resources("", "0", "", ""),
+            resources("", "", "", "12Qi"),
+        ] {
+            let err = config_for(&template).expect_err("invalid quantity should be rejected");
+            assert!(
+                matches!(err, DriverError::Lxd(LxdError::InvalidQuantity { .. })),
+                "{err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn max_processes_override_accepts_numbers_and_numeric_strings() {
+        let as_string = DriverSandboxTemplate {
+            driver_config: driver_config(&[("max_processes", string_value("128"))]),
+            ..Default::default()
+        };
+        assert_eq!(max_processes(&as_string), Some(128));
+
+        // 0 lifts the limit for this sandbox even when the driver has a default.
+        let zero = DriverSandboxTemplate {
+            driver_config: driver_config(&[(
+                "max_processes",
+                prost_types::Value {
+                    kind: Some(Kind::NumberValue(0.0)),
+                },
+            )]),
+            ..Default::default()
+        };
+        let config = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &zero,
+            "",
+            false,
+            4096,
+        )
+        .unwrap();
+        assert!(!config.contains_key("limits.processes"));
+    }
+
+    #[test]
+    fn unusable_max_processes_override_falls_back_to_default() {
+        for value in [
+            prost_types::Value {
+                kind: Some(Kind::NumberValue(-1.0)),
+            },
+            string_value("many"),
+            prost_types::Value {
+                kind: Some(Kind::BoolValue(true)),
+            },
+        ] {
+            let template = DriverSandboxTemplate {
+                driver_config: driver_config(&[("max_processes", value)]),
+                ..Default::default()
+            };
+            let config = build_create_config(
+                &identified_sandbox(),
+                &DriverSandboxSpec::default(),
+                &template,
+                "",
+                false,
+                4096,
+            )
+            .unwrap();
+            assert_eq!(
+                config.get("limits.processes").map(String::as_str),
+                Some("4096")
+            );
+        }
+    }
+
+    #[test]
+    fn network_and_storage_pool_default_and_override() {
+        let defaults = DriverSandboxTemplate::default();
+        assert_eq!(network(&defaults), "lxdbr0");
+        assert_eq!(storage_pool(&defaults), "default");
+
+        let custom = DriverSandboxTemplate {
+            driver_config: driver_config(&[
+                ("network", string_value("sandboxbr0")),
+                ("storage_pool", string_value("fast")),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(network(&custom), "sandboxbr0");
+        assert_eq!(storage_pool(&custom), "fast");
+
+        // Wrong types are ignored rather than half-applied.
+        let wrong_types = DriverSandboxTemplate {
+            driver_config: driver_config(&[
+                (
+                    "network",
+                    prost_types::Value {
+                        kind: Some(Kind::NumberValue(1.0)),
+                    },
+                ),
+                (
+                    "storage_pool",
+                    prost_types::Value {
+                        kind: Some(Kind::BoolValue(true)),
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        assert_eq!(network(&wrong_types), "lxdbr0");
+        assert_eq!(storage_pool(&wrong_types), "default");
+    }
+
+    #[test]
+    fn devices_follow_driver_config_network_and_pool() {
+        let template = DriverSandboxTemplate {
+            driver_config: driver_config(&[
+                ("network", string_value("sandboxbr0")),
+                ("storage_pool", string_value("fast")),
+            ]),
+            ..Default::default()
+        };
+
+        let devices = build_create_devices(&template, false, "fast", "sup", "fast", "dhcp");
+
+        let root = devices.get("root").expect("root device");
+        assert_eq!(root.get("pool").map(String::as_str), Some("fast"));
+        assert_eq!(root.get("path").map(String::as_str), Some("/"));
+        let eth0 = devices.get("eth0").expect("eth0 device");
+        assert_eq!(eth0.get("type").map(String::as_str), Some("nic"));
+        assert_eq!(eth0.get("network").map(String::as_str), Some("sandboxbr0"));
+    }
+
+    #[test]
+    fn profiles_always_start_with_default() {
+        assert_eq!(
+            build_profiles(&DriverSandboxTemplate::default()),
+            vec!["default".to_string()]
+        );
+
+        let template = DriverSandboxTemplate {
+            driver_config: driver_config(&[(
+                "profiles",
+                prost_types::Value {
+                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                        values: vec![
+                            string_value("gpu"),
+                            prost_types::Value {
+                                kind: Some(Kind::NumberValue(7.0)),
+                            },
+                            string_value("audit"),
+                        ],
+                    })),
+                },
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            build_profiles(&template),
+            vec![
+                "default".to_string(),
+                "gpu".to_string(),
+                "audit".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn volume_names_are_digest_keyed() {
+        let digest = "sha256:0123abcd";
+        assert_eq!(
+            supervisor_volume_name(digest),
+            "openshell-supervisor-0123abcd"
+        );
+        assert_eq!(
+            supervisor_volume_name("0123abcd"),
+            supervisor_volume_name(digest)
         );
     }
 

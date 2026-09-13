@@ -679,6 +679,169 @@ mod tests {
             .expect("omitted gpu.count should be accepted");
     }
 
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_explicit_gpu_count() {
+        let sandbox = sandbox_with_spec(spec_with_gpu_count(Some(1)));
+
+        driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("gpu.count >= 1 should be accepted");
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_requires_identity_spec_and_template() {
+        let complete = || sandbox_with_spec(spec_with_labels(HashMap::new()));
+        let cases = [
+            (
+                "sandbox.name",
+                DriverSandbox {
+                    name: String::new(),
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.id",
+                DriverSandbox {
+                    id: String::new(),
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.spec",
+                DriverSandbox {
+                    spec: None,
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.spec.template",
+                sandbox_with_spec(DriverSandboxSpec::default()),
+            ),
+        ];
+
+        for (field, sandbox) in cases {
+            let err = driver()
+                .validate_sandbox_create(&sandbox)
+                .await
+                .expect_err("incomplete sandbox should be rejected");
+            match err {
+                DriverError::InvalidArgument(msg) => {
+                    assert!(msg.contains(field), "expected {field} in {msg:?}");
+                }
+                other => panic!("expected InvalidArgument for missing {field}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_empty_label_key() {
+        let mut labels = HashMap::new();
+        labels.insert(String::new(), "value".to_string());
+        let sandbox = sandbox_with_spec(spec_with_labels(labels));
+
+        let err = driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("empty label key should be rejected");
+        assert!(matches!(err, DriverError::InvalidArgument(_)));
+    }
+
+    /// A malformed reference can never be imported, so it should be refused
+    /// as the caller's mistake before CreateSandbox runs. Today validation
+    /// does not look at the image, and CreateSandbox later reports the same
+    /// reference as an internal image-import failure.
+    #[tokio::test]
+    #[ignore = "known gap: ValidateSandboxCreate does not validate template.image"]
+    async fn validate_sandbox_create_rejects_malformed_image_reference() {
+        let sandbox = sandbox_with_spec(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "UPPER/Case::bad".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("malformed image reference should be rejected");
+        assert!(matches!(err, DriverError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[test]
+    fn capabilities_report_configured_default_image() {
+        let config = Config::parse_from([
+            "openshell-driver-lxd",
+            "--default-image",
+            "registry.example.com/sandboxes/custom:v2",
+        ]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+
+        let response = LxdComputeDriver::new(config, lxd).capabilities();
+
+        assert_eq!(
+            response.default_image,
+            "registry.example.com/sandboxes/custom:v2"
+        );
+    }
+
+    /// Messages as LXD 6.9 reports them: synchronously (400) when the
+    /// instance is already stopped at request time, or on the operation when
+    /// it stopped while the request was in flight.
+    #[test]
+    fn already_stopped_is_recognized_from_sync_and_async_errors() {
+        let sync_already_stopped = LxdError::Api {
+            status_code: 400,
+            message: "The instance is already stopped".to_string(),
+        };
+        assert!(is_already_stopped(&sync_already_stopped));
+
+        let async_already_stopped = LxdError::OperationFailed {
+            description: "Stopping instance".to_string(),
+            err: "The instance is already stopped".to_string(),
+        };
+        assert!(is_already_stopped(&async_already_stopped));
+
+        let async_not_running = LxdError::OperationFailed {
+            description: "Stopping instance".to_string(),
+            err: "Instance is not running".to_string(),
+        };
+        assert!(is_already_stopped(&async_not_running));
+    }
+
+    /// Anything else must propagate: swallowing it would report a stop that
+    /// did not happen.
+    #[test]
+    fn other_errors_are_not_mistaken_for_already_stopped() {
+        let cases = [
+            LxdError::Api {
+                status_code: 400,
+                message: "Invalid config".to_string(),
+            },
+            // Only a 400 carries the synchronous "already stopped" meaning.
+            LxdError::Api {
+                status_code: 500,
+                message: "The instance is already stopped".to_string(),
+            },
+            LxdError::Api {
+                status_code: 404,
+                message: "Instance not found".to_string(),
+            },
+            LxdError::OperationFailed {
+                description: "Stopping instance".to_string(),
+                err: "Failed shutting down instance, status is \"Running\": context deadline exceeded"
+                    .to_string(),
+            },
+            LxdError::Io(std::io::Error::other("already stopped")),
+        ];
+
+        for err in cases {
+            assert!(!is_already_stopped(&err), "{err:?}");
+        }
+    }
+
     struct MockAliasChecker {
         exists: bool,
     }

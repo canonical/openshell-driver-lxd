@@ -70,3 +70,92 @@ impl From<DriverError> for Status {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tonic::Code;
+
+    use super::*;
+
+    fn api(status_code: u16) -> DriverError {
+        DriverError::Lxd(LxdError::Api {
+            status_code,
+            message: format!("lxd said {status_code}"),
+        })
+    }
+
+    /// The gateway branches on these codes: `NotFound` means "absent" during
+    /// reconcile and delete recovery, `AlreadyExists`/`FailedPrecondition`
+    /// pass through to the user, and anything else becomes an internal error.
+    #[test]
+    fn status_code_follows_error_kind() {
+        let cases = [
+            (DriverError::Unimplemented("x"), Code::Unimplemented),
+            (
+                DriverError::InvalidArgument("x".into()),
+                Code::InvalidArgument,
+            ),
+            (DriverError::NotFound("x".into()), Code::NotFound),
+            (DriverError::Timeout, Code::DeadlineExceeded),
+            (DriverError::ImageImport("x".into()), Code::Internal),
+            (api(400), Code::InvalidArgument),
+            (api(401), Code::Unauthenticated),
+            (api(403), Code::PermissionDenied),
+            (api(404), Code::NotFound),
+            (api(409), Code::AlreadyExists),
+            (api(500), Code::Internal),
+            (api(503), Code::Internal),
+            (
+                DriverError::Lxd(LxdError::InvalidQuantity {
+                    quantity: "lots".into(),
+                    reason: "not a number".into(),
+                }),
+                Code::InvalidArgument,
+            ),
+            (
+                DriverError::Lxd(LxdError::OperationFailed {
+                    description: "Starting instance".into(),
+                    err: "boom".into(),
+                }),
+                Code::Internal,
+            ),
+            (
+                DriverError::Lxd(LxdError::Io(std::io::Error::other("socket gone"))),
+                Code::Internal,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            let rendered = err.to_string();
+            let status = Status::from(err);
+            assert_eq!(status.code(), expected, "for {rendered}");
+        }
+    }
+
+    #[test]
+    fn status_message_keeps_the_underlying_detail() {
+        let status = Status::from(api(409));
+        assert_eq!(status.message(), "lxd said 409");
+
+        let status = Status::from(api(500));
+        assert!(
+            status.message().contains("status code 500")
+                && status.message().contains("lxd said 500"),
+            "message was {:?}",
+            status.message()
+        );
+
+        let status = Status::from(DriverError::ImageImport("manifest unknown".into()));
+        assert_eq!(status.message(), "image import failed: manifest unknown");
+
+        let status = Status::from(DriverError::Lxd(LxdError::InvalidQuantity {
+            quantity: "lots".into(),
+            reason: "not a number".into(),
+        }));
+        assert!(
+            status.message().contains("\"lots\""),
+            "{:?}",
+            status.message()
+        );
+    }
+}
