@@ -4,14 +4,17 @@
 //! through the gRPC service, driven in-process (no socket needed, mirroring
 //! `tests/get_capabilities.rs`).
 //!
-//! Requires a running LXD with a `default` storage pool, an `lxdbr0`
-//! network, and a published `openshell-sandbox` image alias (locally: `make
-//! sandbox-image`; CI builds and imports the same image via the
-//! container-image job).
+//! Requires a running LXD with a `default` storage pool and an `lxdbr0`
+//! network. The sandbox image is the upstream OpenShell supervisor image,
+//! which the driver pulls and imports on demand via `skopeo`/`umoci`/
+//! `mksquashfs` — no image needs to be pre-built or pre-loaded. The test
+//! host must therefore have those tools installed and outbound access to
+//! `ghcr.io`.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use computev1::pb::compute_driver_server::ComputeDriver;
@@ -23,14 +26,52 @@ use lxd_client::{LxdClient, LxdEndpoint};
 use openshell_driver_lxd::config::{Config, DEFAULT_LXD_SOCKET};
 use openshell_driver_lxd::driver::LxdComputeDriver;
 use openshell_driver_lxd::grpc::ComputeDriverService;
+use openshell_driver_lxd::image::{ImageCache, SkopeoImporter};
 use tonic::{Code, Request};
+
+/// A small image used purely to exercise instance lifecycle plumbing through
+/// the raw client. This is the supervisor image, which is *not* a usable
+/// sandbox rootfs (see `config::DEFAULT_SANDBOX_IMAGE`) — these tests never
+/// boot the supervisor in it, they only create/start/stop the container, and
+/// its 16 MiB keeps the suite fast.
+const SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+
+/// Sandbox base image known to have NO built-in DHCP client (neither udhcpc,
+/// dhclient, nor dhcpcd), exercising the driver's bundled fallback DHCP client.
+const NO_DHCP_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 
 fn raw_lxd_client() -> LxdClient {
     LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap()
 }
 
-fn service() -> ComputeDriverService {
+/// Imports [`SANDBOX_IMAGE`] through the same code path the driver uses and
+/// returns the resulting local LXD image alias. Lets tests that create
+/// instances directly via the raw client (bypassing the driver) still boot
+/// from a real, present image without depending on any pre-built alias.
+async fn ensure_sandbox_image_alias() -> String {
     let config = Config::parse_from(["openshell-driver-lxd"]);
+    let importer = Arc::new(SkopeoImporter::new(
+        raw_lxd_client(),
+        None,
+        None,
+        None,
+        config.image_work_dir.clone(),
+        Duration::from_secs(config.operation_timeout_secs),
+    ));
+    let cache = ImageCache::new(raw_lxd_client(), importer, config.image_cache_alias_prefix);
+    cache
+        .resolve_alias(SANDBOX_IMAGE)
+        .await
+        .expect("importing the upstream sandbox image should succeed")
+}
+
+fn service() -> ComputeDriverService {
+    let cache_dir = std::env::temp_dir().join("openshell-test-supervisor-cache");
+    let config = Config::parse_from([
+        "openshell-driver-lxd",
+        "--supervisor-cache-dir",
+        cache_dir.to_str().unwrap(),
+    ]);
     ComputeDriverService::new(LxdComputeDriver::new(config, raw_lxd_client()))
 }
 
@@ -50,7 +91,7 @@ fn sandbox(name: &str) -> DriverSandbox {
         workspace: "test-workspace".to_string(),
         spec: Some(DriverSandboxSpec {
             template: Some(DriverSandboxTemplate {
-                image: "ignored-in-v1".to_string(),
+                image: String::new(),
                 ..Default::default()
             }),
             ..Default::default()
@@ -85,6 +126,33 @@ async fn create_get_list_stop_delete_lifecycle() {
     assert_eq!(got.namespace, "default");
     assert_eq!(got.workspace, "test-workspace");
     assert_eq!(got.id, name);
+
+    // Verify via raw LxdClient that the instance has the supervisor custom storage volume attached
+    let raw_instance = raw_lxd_client()
+        .get_instance(&name)
+        .await
+        .expect("get_instance via raw client should succeed");
+    let supervisor_dev = raw_instance
+        .devices
+        .get("supervisor")
+        .expect("supervisor disk device should be present on created sandbox");
+    assert_eq!(supervisor_dev.get("type"), Some(&"disk".to_string()));
+    assert_eq!(
+        supervisor_dev.get("path"),
+        Some(&"/opt/openshell/bin".to_string())
+    );
+    assert_eq!(supervisor_dev.get("readonly"), Some(&"true".to_string()));
+
+    let dhcp_dev = raw_instance
+        .devices
+        .get("dhcp-client")
+        .expect("dhcp-client disk device should be present on created sandbox");
+    assert_eq!(dhcp_dev.get("type"), Some(&"disk".to_string()));
+    assert_eq!(
+        dhcp_dev.get("path"),
+        Some(&"/opt/openshell/net".to_string())
+    );
+    assert_eq!(dhcp_dev.get("readonly"), Some(&"true".to_string()));
 
     let listed = service
         .list_sandboxes(Request::new(ListSandboxesRequest {}))
@@ -124,6 +192,87 @@ async fn create_get_list_stop_delete_lifecycle() {
         .expect("deleting an already-gone sandbox should succeed, not error")
         .into_inner();
     assert!(!deleted_again.deleted);
+}
+
+#[tokio::test]
+async fn create_sandbox_fallback_dhcp_without_builtin_client() {
+    let service = service();
+    let name = unique_name();
+
+    let mut sb = sandbox(&name);
+    if let Some(spec) = sb.spec.as_mut() {
+        if let Some(template) = spec.template.as_mut() {
+            template.image = NO_DHCP_SANDBOX_IMAGE.to_string();
+        }
+    }
+
+    service
+        .create_sandbox(Request::new(CreateSandboxRequest { sandbox: Some(sb) }))
+        .await
+        .expect("create_sandbox with no-DHCP base image should succeed");
+
+    let got = service
+        .get_sandbox(Request::new(GetSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("get_sandbox should succeed")
+        .into_inner()
+        .sandbox
+        .expect("response should carry a sandbox");
+    assert_eq!(got.name, name);
+
+    let status = got.status.expect("sandbox should have status");
+    let ready_cond = status
+        .conditions
+        .iter()
+        .find(|c| c.r#type == "Ready")
+        .expect("sandbox should have Ready condition");
+    assert_eq!(
+        ready_cond.status, "True",
+        "sandbox with no built-in DHCP client should reach Ready via fallback DHCP client"
+    );
+
+    // Verify via raw LxdClient that eth0 acquired an IPv4 lease
+    let mut has_ipv4 = false;
+    for _ in 0..20 {
+        if let Ok(raw_state) = raw_lxd_client().get_instance_state(&name).await {
+            if let Some(eth0_net) = raw_state.network.get("eth0") {
+                if eth0_net
+                    .addresses
+                    .iter()
+                    .any(|a| a.family == "inet" && a.scope == "global" && !a.address.is_empty())
+                {
+                    has_ipv4 = true;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert!(
+        has_ipv4,
+        "eth0 must have acquired an IPv4 address via the bundled fallback DHCP client"
+    );
+
+    service
+        .stop_sandbox(Request::new(StopSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("stop_sandbox should succeed");
+
+    let deleted = service
+        .delete_sandbox(Request::new(DeleteSandboxRequest {
+            sandbox_id: String::new(),
+            sandbox_name: name.clone(),
+        }))
+        .await
+        .expect("delete_sandbox should succeed")
+        .into_inner();
+    assert!(deleted.deleted);
 }
 
 #[tokio::test]
@@ -213,6 +362,7 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     let service = service();
     let raw_lxd = raw_lxd_client();
     let name = unique_name();
+    let image_alias = ensure_sandbox_image_alias().await;
 
     // Created directly via lxd-client, bypassing create_sandbox, so it never
     // gets the user.openshell.sandbox_id marker. Still needs the "default"
@@ -222,7 +372,7 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     let create_op = raw_lxd
         .create_instance(
             &name,
-            "openshell-sandbox",
+            &image_alias,
             HashMap::new(),
             HashMap::new(),
             vec!["default".to_string()],

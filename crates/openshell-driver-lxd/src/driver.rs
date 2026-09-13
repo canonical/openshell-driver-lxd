@@ -2,13 +2,18 @@
 
 //! Core LXD compute driver logic, independent of the gRPC transport.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
 use lxd_client::{LxdClient, LxdError};
+use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::dhcp_client;
 use crate::error::DriverError;
+use crate::image::{digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
@@ -42,12 +47,51 @@ fn is_already_stopped(err: &LxdError) -> bool {
 pub struct LxdComputeDriver {
     config: Config,
     lxd: LxdClient,
+    image_cache: ImageCache,
+    supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl LxdComputeDriver {
     #[must_use]
     pub fn new(config: Config, lxd: LxdClient) -> Self {
-        Self { config, lxd }
+        let importer = Arc::new(SkopeoImporter::new(
+            lxd.clone(),
+            config.skopeo_path.clone(),
+            config.umoci_path.clone(),
+            config.mksquashfs_path.clone(),
+            config.image_work_dir.clone(),
+            Duration::from_secs(config.image_pull_timeout_secs),
+        ));
+        let image_cache = ImageCache::new(
+            lxd.clone(),
+            importer,
+            config.image_cache_alias_prefix.clone(),
+        );
+        Self::with_image_cache(config, lxd, image_cache)
+    }
+
+    #[must_use]
+    pub fn with_image_cache(config: Config, lxd: LxdClient, image_cache: ImageCache) -> Self {
+        Self {
+            config,
+            lxd,
+            image_cache,
+            supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Best-effort pre-warm of the default sandbox image so the first
+    /// `create_sandbox` need not block on a registry pull, and so a bad
+    /// default reference or an unreachable registry surfaces at startup
+    /// rather than on the first request. Importing requires the external
+    /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
+    /// otherwise ignored — the same import is retried on first use.
+    pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
+        self.image_cache
+            .resolve_alias(&self.config.default_image)
+            .await
     }
 
     /// Report driver capabilities and defaults.
@@ -186,6 +230,16 @@ impl LxdComputeDriver {
         let config =
             mapping::build_create_config(sandbox, spec, template, &gateway_endpoint, has_token)?;
 
+        // Auxiliary volumes live on the sandbox's own pool unless the
+        // operator pinned them, so a request asking for a non-default
+        // `storage_pool` does not end up with its rootfs on one pool and its
+        // supervisor volume on another.
+        let aux_pool = self
+            .config
+            .supervisor_storage_pool
+            .as_deref()
+            .unwrap_or_else(|| mapping::storage_pool(template));
+
         let gpu = spec
             .resource_requirements
             .as_ref()
@@ -200,26 +254,102 @@ impl LxdComputeDriver {
                 "GpuResourceRequirements.count is ignored in v1; attaching all host GPUs"
             );
         }
-        let devices = mapping::build_create_devices(template, gpu.is_some());
+        // Resolve supervisor binary and digest
+        let (binary_path, digest) = match &self.config.supervisor_bin {
+            Some(path) => (path.clone(), digest_of_file(path)?),
+            None => self
+                .image_cache
+                .extract_supervisor_binary(
+                    &self.config.supervisor_image,
+                    &self.config.supervisor_cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+                })?,
+        };
+
+        // Ensure digest-keyed custom storage volume exists on the aux pool.
+        // Locks are keyed by pool *and* digest: the same binary on two pools
+        // is two distinct volumes.
+        let volume_name = mapping::supervisor_volume_name(&digest);
+        let vol_lock = {
+            let mut locks = self.supervisor_volume_locks.lock().await;
+            locks
+                .entry(format!("{aux_pool}/{digest}"))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = vol_lock.lock().await;
+            self.lxd
+                .ensure_supervisor_volume(aux_pool, &volume_name, &binary_path)
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "supervisor binary volume provisioning failed on pool {aux_pool:?}: {e}"
+                    ))
+                })?;
+        }
+
+        // Ensure digest-keyed custom storage volume exists for the bundled DHCP client
+        let dhcp_digest = dhcp_client::dhcp_client_digest();
+        let dhcp_volume_name = mapping::dhcp_client_volume_name(&dhcp_digest);
+        let dhcp_vol_lock = {
+            let mut locks = self.dhcp_client_volume_locks.lock().await;
+            locks
+                .entry(format!("{aux_pool}/{dhcp_digest}"))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = dhcp_vol_lock.lock().await;
+            self.lxd
+                .ensure_dhcp_client_volume(
+                    aux_pool,
+                    &dhcp_volume_name,
+                    dhcp_client::DHCP_CLIENT_BINARY,
+                    dhcp_client::DHCP_CLIENT_SCRIPT,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "DHCP client volume provisioning failed on pool {aux_pool:?}: {e}"
+                    ))
+                })?;
+        }
+
+        let devices = mapping::build_create_devices(
+            template,
+            gpu.is_some(),
+            aux_pool,
+            &volume_name,
+            aux_pool,
+            &dhcp_volume_name,
+        );
         let profiles = mapping::build_profiles(template);
 
-        // v1: always use the configured default image; template.image is
-        // accepted by ValidateSandboxCreate but not yet consulted.
-        if !template.image.is_empty() {
-            tracing::debug!(
-                image = %template.image,
-                default = %self.config.default_image,
-                "template.image is ignored in v1; using default image"
-            );
-        }
-        let image = &self.config.default_image;
+        let image_alias = if template.image.is_empty() {
+            self.image_cache
+                .resolve_alias(&self.config.default_image)
+                .await?
+        } else {
+            self.image_cache.resolve_alias(&template.image).await?
+        };
 
         // Create the instance stopped so we can push the token file before the
         // supervisor starts — avoids a race where the supervisor reads
         // OPENSHELL_SANDBOX_TOKEN_FILE before it has been written.
         let op = self
             .lxd
-            .create_instance(&sandbox.name, image, config, devices, profiles, false)
+            .create_instance(
+                &sandbox.name,
+                &image_alias,
+                config,
+                devices,
+                profiles,
+                false,
+            )
             .await?;
         self.wait_operation(&op.id).await?;
 
@@ -394,7 +524,10 @@ mod tests {
 
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.default_image, "openshell-sandbox");
+        assert_eq!(
+            response.default_image,
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+        );
     }
 
     #[tokio::test]
@@ -443,5 +576,102 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .await
             .expect("omitted gpu.count should be accepted");
+    }
+
+    struct MockAliasChecker {
+        exists: bool,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::ImageAliasChecker for MockAliasChecker {
+        async fn image_alias_exists(&self, _alias: &str) -> Result<bool, DriverError> {
+            Ok(self.exists)
+        }
+    }
+
+    struct MockImporter {
+        digest: String,
+        imported_alias: std::sync::Mutex<Option<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::OciImporter for MockImporter {
+        async fn resolve_digest(&self, _reference: &str) -> Result<String, DriverError> {
+            Ok(self.digest.clone())
+        }
+
+        async fn import(
+            &self,
+            _reference: &str,
+            _digest: &str,
+            alias: &str,
+        ) -> Result<(), DriverError> {
+            *self.imported_alias.lock().unwrap() = Some(alias.to_string());
+            Ok(())
+        }
+
+        async fn extract_supervisor_binary(
+            &self,
+            _reference: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<(std::path::PathBuf, String), DriverError> {
+            let target_dir = cache_dir.join("test-digest");
+            let binary_path = target_dir.join("openshell-sandbox");
+            if !binary_path.exists() {
+                std::fs::create_dir_all(&target_dir).unwrap();
+                std::fs::write(&binary_path, b"mock-supervisor").unwrap();
+            }
+            Ok((binary_path, self.digest.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_resolves_image_or_defaults() {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+
+        let digest_hex = "ee".repeat(32);
+        let importer = Arc::new(MockImporter {
+            digest: format!("sha256:{digest_hex}"),
+            imported_alias: std::sync::Mutex::new(None),
+        });
+        let checker = Arc::new(MockAliasChecker { exists: true });
+        let cache =
+            ImageCache::with_checker(checker, importer, config.image_cache_alias_prefix.clone());
+
+        let driver = LxdComputeDriver::with_image_cache(config, lxd, cache);
+
+        // 1. Empty template.image falls back to default_image, which is now
+        //    itself an OCI reference resolved through the same import path.
+        let empty_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _sb_empty = sandbox_with_spec(empty_spec);
+        assert_eq!(
+            driver.config.default_image,
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+        );
+
+        // 2. Non-empty template.image resolves to the digest-derived alias
+        let custom_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "registry.example.com/custom:v1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sb_custom = sandbox_with_spec(custom_spec);
+        let template = sb_custom.spec.unwrap().template.unwrap();
+        let resolved = driver
+            .image_cache
+            .resolve_alias(&template.image)
+            .await
+            .unwrap();
+        assert_eq!(resolved, format!("openshell-oci-{digest_hex}"));
     }
 }
