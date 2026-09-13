@@ -227,6 +227,51 @@ async fn created_instance_carries_the_request() {
     );
 }
 
+/// The command a sandbox is created with reaches the supervisor intact,
+/// arguments with spaces, quotes and non-ASCII included, through LXD's
+/// environment config and the init script.
+#[tokio::test]
+async fn requested_command_reaches_the_supervisor() {
+    let driver = Driver::start().await;
+    let name = unique_name("cmd");
+    let _cleanup = driver.cleanup(&[&name]);
+    let command = vec![
+        "sh".to_string(),
+        "-lc".to_string(),
+        "printf '%s\\n' \"quoted $HOME\" > /sandbox/out; echo ünïcode".to_string(),
+    ];
+
+    let mut request = sandbox(&name);
+    {
+        let spec = request.spec.as_mut().unwrap();
+        spec.command = command.clone();
+        spec.tty = false;
+    }
+    driver
+        .create(request)
+        .await
+        .expect("create_sandbox should succeed");
+
+    let prefix = "odl-standin: env OPENSHELL_MAIN_PROCESS_SPEC=";
+    let line = eventually(
+        Duration::from_secs(15),
+        "the stand-in to report",
+        || async {
+            driver
+                .console_log(&name)
+                .lines()
+                .find_map(|line| line.trim_end().strip_prefix(prefix).map(str::to_string))
+        },
+    )
+    .await;
+    let decoded: serde_json::Value =
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e}: {line}"));
+    assert_eq!(
+        decoded,
+        serde_json::json!({"version": 1, "command": command, "tty": false})
+    );
+}
+
 /// The supervisor ignores LXD's graceful shutdown, so a stop is only ever as
 /// long as the graceful deadline plus the forced stop.
 #[tokio::test]
