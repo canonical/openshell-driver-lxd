@@ -212,3 +212,162 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(Box::pin(deleted.merge(updated))))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+    use std::time::Duration;
+
+    use clap::Parser;
+    use lxd_client::{LxdClient, LxdEndpoint};
+    use tonic::Code;
+
+    use super::*;
+    use crate::config::{Config, DEFAULT_LXD_SOCKET};
+
+    /// None of these tests reach LXD: the client only connects when a
+    /// request is sent, and every path exercised here returns before that.
+    fn service() -> ComputeDriverService {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+        ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd))
+    }
+
+    async fn next_event(
+        stream: &mut <ComputeDriverService as ComputeDriver>::WatchSandboxesStream,
+    ) -> Result<WatchSandboxesEvent, Status> {
+        tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("watch stream should yield within 5s")
+            .expect("watch stream should not end")
+    }
+
+    #[tokio::test]
+    async fn resolve_name_prefers_name_without_looking_up_id() {
+        let service = service();
+        let name = resolve_name(&service.driver, "by-name", "some-id")
+            .await
+            .expect("a name needs no lookup");
+        assert_eq!(name, "by-name");
+    }
+
+    #[tokio::test]
+    async fn resolve_name_requires_name_or_id() {
+        let service = service();
+        let status = resolve_name(&service.driver, "", "")
+            .await
+            .expect_err("neither name nor id should be rejected");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn requests_without_a_sandbox_are_invalid() {
+        let service = service();
+
+        let status = service
+            .validate_sandbox_create(Request::new(ValidateSandboxCreateRequest { sandbox: None }))
+            .await
+            .expect_err("validate without sandbox should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+
+        let status = service
+            .create_sandbox(Request::new(CreateSandboxRequest { sandbox: None }))
+            .await
+            .expect_err("create without sandbox should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn stop_and_delete_require_name_or_id() {
+        let service = service();
+
+        let status = service
+            .stop_sandbox(Request::new(StopSandboxRequest::default()))
+            .await
+            .expect_err("stop without identity should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+
+        let status = service
+            .delete_sandbox(Request::new(DeleteSandboxRequest::default()))
+            .await
+            .expect_err("delete without identity should fail");
+        assert_eq!(status.code(), Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn watch_forwards_deletions_and_snapshots() {
+        let service = service();
+        let mut stream = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .expect("watch should open")
+            .into_inner();
+
+        service.deletion_tx.send("sb-gone".to_string()).unwrap();
+        match next_event(&mut stream).await.unwrap().payload {
+            Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                assert_eq!(deleted.sandbox_id, "sb-gone");
+            }
+            other => panic!("expected a Deleted event, got {other:?}"),
+        }
+
+        let snapshot = DriverSandbox {
+            id: "sb-live".to_string(),
+            name: "sb-live".to_string(),
+            ..Default::default()
+        };
+        service.sandbox_tx.send(snapshot.clone()).unwrap();
+        match next_event(&mut stream).await.unwrap().payload {
+            Some(watch_sandboxes_event::Payload::Sandbox(event)) => {
+                assert_eq!(event.sandbox, Some(snapshot));
+            }
+            other => panic!("expected a Sandbox event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_watcher_receives_every_event() {
+        let service = service();
+        let mut first = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        let mut second = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        service.deletion_tx.send("sb-1".to_string()).unwrap();
+
+        for stream in [&mut first, &mut second] {
+            assert!(matches!(
+                next_event(stream).await.unwrap().payload,
+                Some(watch_sandboxes_event::Payload::Deleted(_))
+            ));
+        }
+    }
+
+    /// A watcher that falls behind must be told it missed events (so the
+    /// gateway reconnects and re-lists) rather than silently skipping them.
+    #[tokio::test]
+    async fn lagging_watcher_gets_data_loss() {
+        let service = service();
+        let mut stream = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+
+        for i in 0..100 {
+            service.deletion_tx.send(format!("sb-{i}")).unwrap();
+        }
+
+        let status = next_event(&mut stream)
+            .await
+            .expect_err("an overflowed receiver should report the gap");
+        assert_eq!(status.code(), Code::DataLoss);
+    }
+}

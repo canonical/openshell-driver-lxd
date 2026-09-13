@@ -197,3 +197,87 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub operation_timeout_secs: u64,
 }
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn cli_definition_is_consistent() {
+        Config::command().debug_assert();
+    }
+
+    #[test]
+    fn defaults_parse_without_arguments() {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+
+        assert_eq!(config.socket, PathBuf::from(DEFAULT_SOCKET));
+        assert_eq!(config.project, DEFAULT_PROJECT);
+        assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
+        assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
+        assert!(config.supervisor_bin.is_none());
+        assert!(config.lxd_url.is_none());
+        assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
+    }
+
+    /// A graceful stop always runs to its deadline (the supervisor ignores
+    /// LXD's shutdown signal), and each stop step is itself bounded by the
+    /// operation timeout, so the graceful deadline must fit inside it or the
+    /// forced stop never gets a chance to run.
+    #[test]
+    fn graceful_stop_deadline_fits_inside_operation_timeout() {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+        let stop_timeout = u64::try_from(config.stop_timeout_secs).expect("positive default");
+
+        assert!(stop_timeout > 0);
+        assert!(
+            stop_timeout < config.operation_timeout_secs,
+            "stop timeout {stop_timeout}s must be shorter than the operation timeout {}s",
+            config.operation_timeout_secs
+        );
+    }
+
+    /// Image conversion materializes several GiB; the default must not sit on
+    /// the memory-backed temp directory.
+    #[test]
+    fn default_image_work_dir_is_not_the_temp_dir() {
+        let work_dir = PathBuf::from(DEFAULT_IMAGE_WORK_DIR);
+
+        assert!(work_dir.is_absolute());
+        assert!(!work_dir.starts_with("/tmp"));
+        assert!(!work_dir.starts_with(std::env::temp_dir()));
+    }
+
+    #[test]
+    fn remote_lxd_requires_client_certificate_and_key() {
+        let missing_key = Config::try_parse_from([
+            "openshell-driver-lxd",
+            "--lxd-url",
+            "https://10.0.0.1:8443",
+            "--lxd-client-cert",
+            "/etc/cert.pem",
+        ]);
+        assert!(missing_key.is_err());
+
+        let complete = Config::try_parse_from([
+            "openshell-driver-lxd",
+            "--lxd-url",
+            "https://10.0.0.1:8443",
+            "--lxd-client-cert",
+            "/etc/cert.pem",
+            "--lxd-client-key",
+            "/etc/key.pem",
+        ])
+        .expect("url with cert and key should parse");
+        assert_eq!(complete.lxd_url.as_deref(), Some("https://10.0.0.1:8443"));
+    }
+
+    #[test]
+    fn server_ca_is_only_meaningful_with_a_remote_url() {
+        let result =
+            Config::try_parse_from(["openshell-driver-lxd", "--lxd-server-ca", "/etc/ca.pem"]);
+        assert!(result.is_err());
+    }
+}

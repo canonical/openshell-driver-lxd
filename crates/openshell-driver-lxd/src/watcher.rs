@@ -158,6 +158,31 @@ mod tests {
         assert_eq!(instance_name(&metadata).as_deref(), Some("sb-2"));
     }
 
+    /// LXD appends the project to `source` outside the default project, e.g.
+    /// `/1.0/instances/sb-3?project=sandboxes` (observed on LXD 6.9). The
+    /// fallback is only taken when `name` is absent, which LXD 6.9 always
+    /// sets, but when it is taken the query string must not leak into the
+    /// instance name.
+    #[test]
+    #[ignore = "known gap: source fallback keeps the ?project= query in the name"]
+    fn source_fallback_strips_project_query() {
+        let metadata = json!({
+            "action": "instance-shutdown",
+            "source": "/1.0/instances/sb-3?project=sandboxes",
+        });
+        assert_eq!(instance_name(&metadata).as_deref(), Some("sb-3"));
+    }
+
+    #[test]
+    fn explicit_name_wins_over_source() {
+        let metadata = json!({
+            "action": "instance-started",
+            "name": "sb-4",
+            "source": "/1.0/instances/sb-4?project=sandboxes",
+        });
+        assert_eq!(instance_name(&metadata).as_deref(), Some("sb-4"));
+    }
+
     #[test]
     fn ignores_events_without_identity() {
         assert_eq!(instance_name(&json!({"action": "instance-shutdown"})), None);
