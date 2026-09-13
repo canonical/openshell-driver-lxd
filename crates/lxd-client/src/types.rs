@@ -263,6 +263,43 @@ pub struct LxdEvent {
     pub metadata: serde_json::Value,
 }
 
+/// Type of managed LXD network, as reported by `GET /1.0/networks/<name>`
+/// in the `type` field.
+#[derive(Clone, Debug, Eq, PartialEq, strum::Display, strum::EnumString)]
+#[strum(serialize_all = "lowercase")]
+pub enum NetworkType {
+    Bridge,
+    Ovn,
+    Physical,
+    Macvlan,
+    Sriov,
+    Ipvlan,
+    #[strum(default)]
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for NetworkType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::from_str(&raw).map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for NetworkType {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Other(raw) => serializer.serialize_str(raw),
+            known => serializer.serialize_str(&known.to_string()),
+        }
+    }
+}
+
 /// A managed network, as returned by `GET /1.0/networks/<name>`.
 ///
 /// `config` keys of interest: `ipv4.address` / `ipv6.address` hold the
@@ -273,8 +310,31 @@ pub struct Network {
     pub name: String,
     /// Network type (e.g. `"bridge"`, `"physical"`).
     #[serde(rename = "type")]
-    pub type_: String,
+    pub type_: NetworkType,
     /// Network configuration key/value pairs.
     #[serde(default)]
     pub config: HashMap<String, String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn network_type_serde() {
+        for (raw, expected) in [
+            (r#""bridge""#, NetworkType::Bridge),
+            (r#""ovn""#, NetworkType::Ovn),
+            (r#""physical""#, NetworkType::Physical),
+            (r#""macvlan""#, NetworkType::Macvlan),
+            (r#""sriov""#, NetworkType::Sriov),
+            (r#""ipvlan""#, NetworkType::Ipvlan),
+            (r#""custom""#, NetworkType::Other("custom".to_string())),
+        ] {
+            let parsed: NetworkType = serde_json::from_str(raw).unwrap();
+            assert_eq!(parsed, expected);
+            let serialized = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(serialized, raw);
+        }
+    }
 }
