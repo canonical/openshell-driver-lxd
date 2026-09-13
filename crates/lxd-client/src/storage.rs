@@ -99,7 +99,7 @@ impl LxdClient {
     ///
     /// Packages `binary` into a single-entry tarball containing `openshell-sandbox`,
     /// creates the volume with `content-type: filesystem` and `security.shifted: true`,
-    /// and treats an "already exists" conflict as success.
+    /// and treats losing a creation race as success.
     pub async fn ensure_supervisor_volume(
         &self,
         pool: &str,
@@ -115,7 +115,7 @@ impl LxdClient {
     ///
     /// Packages `binary_bytes` as `udhcpc` and `script_bytes` as `udhcpc.script`,
     /// creates the volume with `content-type: filesystem` and `security.shifted: true`,
-    /// and treats an "already exists" conflict as success.
+    /// and treats losing a creation race as success.
     pub async fn ensure_dhcp_client_volume(
         &self,
         pool: &str,
@@ -136,9 +136,12 @@ impl LxdClient {
 
     /// Ensures a digest-keyed storage volume exists on `pool` containing the given file entries.
     ///
-    /// Packages `entries` into a tarball, creates the volume with
-    /// `content-type: filesystem` and `security.shifted: true`, and treats an
-    /// "already exists" conflict as success.
+    /// Packages `entries` into a tarball and creates the volume with
+    /// `content-type: filesystem` and `security.shifted: true`.
+    ///
+    /// Concurrent creators are expected: if creation fails, the volume is
+    /// re-probed and a volume that now exists counts as success, so the
+    /// outcome does not depend on the wording of LXD's error.
     pub async fn ensure_single_file_volume(
         &self,
         pool: &str,
@@ -155,31 +158,31 @@ impl LxdClient {
 
         let tarball_bytes = create_multi_file_tarball(entries)?;
 
-        match self
+        let created = match self
             .create_storage_pool_volume_from_tarball(pool, name, &tarball_bytes)
             .await
         {
-            Ok(op) => match self.wait_operation(&op.id).await {
-                Ok(_) => {}
-                Err(e) if is_volume_already_exists_error(&e) => {
-                    tracing::debug!(
-                        pool = %pool,
-                        name = %name,
-                        "volume creation raced; volume already exists"
-                    );
-                    return Ok(());
-                }
-                Err(e) => return Err(e),
-            },
-            Err(e) if is_volume_already_exists_error(&e) => {
+            Ok(op) => self.wait_operation(&op.id).await.map(|_| ()),
+            Err(e) => Err(e),
+        };
+
+        if let Err(e) = created {
+            // Another creator winning the race is success, not failure. Ask
+            // the API whether the volume is there now instead of matching on
+            // the error's wording, which differs between a synchronous 409, an
+            // async operation failure, and LXD versions.
+            if self
+                .storage_pool_volume_exists(pool, "custom", name)
+                .await?
+            {
                 tracing::debug!(
                     pool = %pool,
                     name = %name,
-                    "volume creation raced (synchronous conflict); volume already exists"
+                    "volume creation raced; volume already exists"
                 );
                 return Ok(());
             }
-            Err(e) => return Err(e),
+            return Err(e);
         }
 
         // Configure security.shifted: true so unprivileged containers can access the files
@@ -220,24 +223,6 @@ pub(crate) fn create_single_file_tarball(
     mode: u32,
 ) -> Result<Vec<u8>, std::io::Error> {
     create_multi_file_tarball(&[(filename, contents, mode)])
-}
-
-/// Checks whether an error from volume creation represents an already-exists conflict.
-pub(crate) fn is_volume_already_exists_error(err: &LxdError) -> bool {
-    match err {
-        LxdError::Api {
-            status_code: 409, ..
-        } => true,
-        LxdError::Api { message, .. } => {
-            let lower = message.to_lowercase();
-            lower.contains("already exists") || lower.contains("unique")
-        }
-        LxdError::OperationFailed { err, .. } => {
-            let lower = err.to_lowercase();
-            lower.contains("already exists") || lower.contains("unique")
-        }
-        _ => false,
-    }
 }
 
 #[cfg(test)]
@@ -289,25 +274,5 @@ mod tests {
         assert_eq!(extracted2, script_content);
 
         assert!(entries.next().is_none());
-    }
-
-    #[test]
-    fn test_is_volume_already_exists_error() {
-        assert!(is_volume_already_exists_error(&LxdError::Api {
-            status_code: 409,
-            message: "Conflict".into(),
-        }));
-        assert!(is_volume_already_exists_error(&LxdError::Api {
-            status_code: 400,
-            message: "volume already exists on storage pool".into(),
-        }));
-        assert!(is_volume_already_exists_error(&LxdError::OperationFailed {
-            description: "Creating storage volume".into(),
-            err: "UNIQUE constraint failed: storage_volumes...".into(),
-        }));
-        assert!(!is_volume_already_exists_error(&LxdError::Api {
-            status_code: 404,
-            message: "not found".into(),
-        }));
     }
 }

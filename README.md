@@ -195,7 +195,7 @@ Upstream Docker and Podman drivers extract the supervisor binary (`/openshell-sa
 `openshell-driver-lxd` instead packages the supervisor binary into a digest-keyed LXD custom storage volume (`openshell-supervisor-<digest>`) on the sandbox's own storage pool (or `--supervisor-storage-pool` when pinned), following the pattern established in `canonical/workshop` (`lxd_backend_sdk.go`):
 - **Volume layout & Mount distinction:** A `content-type: filesystem` storage volume is a filesystem tree. The volume contains `openshell-sandbox` at its root and is attached to each sandbox container as a read-only `disk` device mounted at directory `/opt/openshell/bin`. The injected guest init script (`/openshell-init.sh`) execs the binary at `/opt/openshell/bin/openshell-sandbox`.
 - **Clustered LXD safety:** Because the disk device refers to a named storage-pool volume rather than a local host path, LXD manages replication and cluster-wide attachment automatically.
-- **Idempotency & Race safety:** Volume creation is serialized in-process per pool and digest, and handles existing volume conflicts idempotently. Subsequent sandboxes reusing the same supervisor binary digest share the volume.
+- **Idempotency & Race safety:** Volume creation is serialized in-process per pool and digest, and a creation that loses a race is reconciled by re-checking whether the volume now exists rather than by matching LXD's error wording. Subsequent sandboxes reusing the same supervisor binary digest share the volume.
 
 ### Bundled Fallback DHCP Client Delivery
 
