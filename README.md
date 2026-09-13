@@ -236,6 +236,10 @@ driver records `user.openshell.stop_intent` on the instance when it is asked
 to stop one. Without it a user-requested stop is indistinguishable from a
 crash and surfaces as `Error` instead of `Stopped`.
 
+Note that the supervisor does not act on LXD's shutdown signal, so a graceful
+stop never completes on its own. `stop_sandbox` bounds the graceful attempt
+with `--stop-timeout-secs` (default 10s) and then stops the instance forcibly.
+
 ## Known limitations
 
 - GPU requests attach every host GPU; an exact requested `count` isn't honored.
