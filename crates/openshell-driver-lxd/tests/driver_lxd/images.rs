@@ -13,6 +13,10 @@ use crate::harness::*;
 /// a sandbox from it does not stay up; these tests only care about the image.
 const SMALL_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:0.0.116";
 
+/// Index digest of [`SMALL_IMAGE`].
+const SMALL_IMAGE_INDEX_DIGEST: &str =
+    "c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42";
+
 /// An alias prefix no other test or run uses, so the import is always cold.
 fn fresh_alias_prefix() -> String {
     let nanos = SystemTime::now()
@@ -157,6 +161,29 @@ async fn imports_are_cached_by_digest() {
         "second create should hit the cache"
     );
     assert_eq!(driver.log().matches("image cache miss").count(), 1);
+}
+
+/// A reference pinned by both tag and digest imports: skopeo rejects that
+/// form, so the driver must resolve it by digest alone.
+#[tokio::test]
+async fn tag_and_digest_pinned_reference_imports() {
+    let options = cold_import_options();
+    let prefix = options.image_cache_alias_prefix.clone();
+    let _images = ImageCleanup(prefix.clone());
+    let driver = Driver::start_with(options).await;
+    let name = unique_name("pinned");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let pinned = format!("{SMALL_IMAGE}@sha256:{SMALL_IMAGE_INDEX_DIGEST}");
+    if let Err(status) = create_from(&driver, &name, &pinned).await {
+        assert_ne!(status.code(), Code::Internal, "{status}");
+    }
+
+    assert!(
+        lxd().get_instance(&name).await.is_ok(),
+        "{name} should exist"
+    );
+    assert_eq!(aliases_with_prefix(&prefix).len(), 1);
 }
 
 /// Two creates of the same uncached image at once share one import.
