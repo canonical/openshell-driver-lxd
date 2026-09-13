@@ -54,6 +54,7 @@ pub struct LxdComputeDriver {
     image_cache: ImageCache,
     supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    lifecycle_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl LxdComputeDriver {
@@ -83,6 +84,7 @@ impl LxdComputeDriver {
             image_cache,
             supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -394,21 +396,28 @@ impl LxdComputeDriver {
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
-            self.settle_after_start(&sandbox.name).await?;
+            self.settle_after_start(&sandbox.name, &sandbox.id).await?;
 
             Ok::<(), DriverError>(())
         };
 
         if let Err(post_err) = post_create.await {
+            tracing::warn!(
+                name = %sandbox.name,
+                %post_err,
+                "post-create step failed; cleaning up instance"
+            );
             let cleanup = async {
-                let _ = self.lxd.stop_instance(&sandbox.name, true).await;
+                if let Ok(op) = self.lxd.stop_instance(&sandbox.name, true).await {
+                    let _ = self.wait_operation(&op.id).await;
+                }
                 let op = self.lxd.delete_instance(&sandbox.name).await?;
                 self.wait_operation(&op.id).await
             };
-            if let Err(e) = cleanup.await {
+            if let Err(cleanup_err) = cleanup.await {
                 tracing::warn!(
                     name = %sandbox.name,
-                    %e,
+                    %cleanup_err,
                     "failed to clean up instance after post-create failure"
                 );
             }
@@ -416,6 +425,14 @@ impl LxdComputeDriver {
         }
 
         Ok(())
+    }
+
+    async fn instance_lifecycle_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.lifecycle_locks.lock().await;
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
     }
 
     /// Records that the driver stopped this sandbox deliberately (see
@@ -437,6 +454,14 @@ impl LxdComputeDriver {
         }
     }
 
+    async fn clear_stop_intent(&self, name: &str) {
+        let mut config = HashMap::new();
+        config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
+        if let Err(e) = self.lxd.patch_instance_config(name, config).await {
+            tracing::debug!(name = %name, %e, "could not clear stop intent");
+        }
+    }
+
     /// Restarts a sandbox whose init exited immediately after the first start.
     ///
     /// The container's init is the supervisor, so if it gives up during
@@ -446,14 +471,40 @@ impl LxdComputeDriver {
     /// `boot.autorestart` is VM-only, and `boot.autostart` only covers daemon
     /// restarts. A bounded retry turns that transient into a working sandbox
     /// instead of one wedged in `Error`.
-    async fn settle_after_start(&self, name: &str) -> Result<(), DriverError> {
+    async fn settle_after_start(
+        &self,
+        name: &str,
+        expected_sandbox_id: &str,
+    ) -> Result<(), DriverError> {
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
         for attempt in 0..self.config.start_retries {
             // Give init long enough to fail; a supervisor that is going to
             // exit on a start-up race does so within a few seconds.
             tokio::time::sleep(SETTLE_DELAY).await;
 
-            let instance = self.lxd.get_instance(name).await?;
+            let _guard = lifecycle_lock.lock().await;
+
+            let instance = match self.lxd.get_instance(name).await {
+                Ok(i) => i,
+                Err(LxdError::Api {
+                    status_code: 404, ..
+                }) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if instance
+                .config
+                .get(mapping::KEY_SANDBOX_ID)
+                .map(String::as_str)
+                != Some(expected_sandbox_id)
+            {
+                return Ok(());
+            }
             if !instance.status.eq_ignore_ascii_case("Stopped") {
+                return Ok(());
+            }
+            // Stopped because it was asked to be, while this start settled:
+            // restarting it would undo that stop.
+            if instance.config.contains_key(mapping::KEY_STOP_INTENT) {
                 return Ok(());
             }
 
@@ -487,7 +538,13 @@ impl LxdComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
-        self.get_managed_instance(name).await?;
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let _guard = lifecycle_lock.lock().await;
+
+        let instance = self.get_managed_instance(name).await?;
+        if instance.status.eq_ignore_ascii_case("Stopped") {
+            return Ok(());
+        }
 
         // Record that this stop was asked for, before issuing it. LXD reports
         // the same `Stopped` status however an instance went down, so without
@@ -524,11 +581,16 @@ impl LxdComputeDriver {
         }
 
         let op = match self.lxd.stop_instance(name, true).await {
+            Ok(op) => op,
             Err(e) if is_already_stopped(&e) => return Ok(()),
-            other => other?,
+            Err(e) => {
+                self.clear_stop_intent(name).await;
+                return Err(e.into());
+            }
         };
         if let Err(e) = self.wait_operation(&op.id).await {
             if !matches!(&e, DriverError::Lxd(lxd_err) if is_already_stopped(lxd_err)) {
+                self.clear_stop_intent(name).await;
                 return Err(e);
             }
         }
@@ -542,6 +604,9 @@ impl LxdComputeDriver {
     /// Deleted event) if the sandbox was deleted, or `None` if it was not
     /// found — the caller may retry safely.
     pub async fn delete_sandbox(&self, name: &str) -> Result<Option<String>, DriverError> {
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let _guard = lifecycle_lock.lock().await;
+
         let instance = match self.lxd.get_instance(name).await {
             Ok(i) => i,
             Err(LxdError::Api {
@@ -578,6 +643,12 @@ impl LxdComputeDriver {
             other => other?,
         };
         self.wait_operation(&op.id).await?;
+        {
+            let mut locks = self.lifecycle_locks.lock().await;
+            if Arc::strong_count(&lifecycle_lock) <= 2 {
+                locks.remove(name);
+            }
+        }
         Ok(Some(sandbox_id))
     }
 }
