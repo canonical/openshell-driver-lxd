@@ -32,3 +32,7 @@ tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 regex = "1"
 tempfile = "3"
+
+[dev-dependencies]
+hyper-util = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

@@ -959,6 +959,7 @@ dependencies = [
  "clap",
  "computev1",
  "futures",
+ "hyper-util",
  "lxd-client",
  "prost-types",
  "regex",
@@ -969,6 +970,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
