@@ -15,7 +15,9 @@ use tonic::Request;
 async fn get_capabilities_returns_driver_info() {
     let config = Config::parse_from(["openshell-driver-lxd"]);
     let lxd = LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
-    let service = ComputeDriverService::new(LxdComputeDriver::new(config, lxd));
+    // No watcher: this test only reads static capabilities and must not
+    // depend on a reachable LXD event stream.
+    let service = ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd));
 
     let response = service
         .get_capabilities(Request::new(GetCapabilitiesRequest {}))

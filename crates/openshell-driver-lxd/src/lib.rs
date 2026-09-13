@@ -7,3 +7,4 @@ pub mod error;
 pub mod grpc;
 pub mod image;
 pub(crate) mod mapping;
+pub(crate) mod watcher;

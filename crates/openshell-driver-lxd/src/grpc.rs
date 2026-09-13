@@ -6,12 +6,14 @@
 use std::pin::Pin;
 
 use computev1::pb::compute_driver_server::ComputeDriver;
+use computev1::pb::DriverSandbox;
 use computev1::pb::{
     watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
     DeleteSandboxResponse, GetCapabilitiesRequest, GetCapabilitiesResponse, GetSandboxRequest,
     GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse, StopSandboxRequest,
     StopSandboxResponse, ValidateSandboxCreateRequest, ValidateSandboxCreateResponse,
     WatchSandboxesDeletedEvent, WatchSandboxesEvent, WatchSandboxesRequest,
+    WatchSandboxesSandboxEvent,
 };
 use futures::Stream;
 use tokio::sync::broadcast;
@@ -21,6 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::driver::LxdComputeDriver;
 use crate::error::DriverError;
+use crate::watcher;
 
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
@@ -29,15 +32,35 @@ pub struct ComputeDriverService {
     /// Deleted events and the gateway immediately removes the sandbox from its
     /// store rather than waiting for the next reconcile cycle.
     deletion_tx: broadcast::Sender<String>,
+    /// Published by the LXD lifecycle watcher whenever a driver-managed
+    /// instance changes state, so a sandbox whose supervisor exited is
+    /// reported at once instead of on the gateway's next reconcile.
+    sandbox_tx: broadcast::Sender<DriverSandbox>,
 }
 
 impl ComputeDriverService {
     #[must_use]
     pub fn new(driver: LxdComputeDriver) -> Self {
         let (deletion_tx, _) = broadcast::channel(64);
+        let (sandbox_tx, _) = broadcast::channel(64);
+        watcher::spawn(driver.lxd_client(), sandbox_tx.clone());
         Self {
             driver,
             deletion_tx,
+            sandbox_tx,
+        }
+    }
+
+    /// Builds the service without the LXD lifecycle watcher, for tests that
+    /// have no LXD to subscribe to.
+    #[must_use]
+    pub fn without_watcher(driver: LxdComputeDriver) -> Self {
+        let (deletion_tx, _) = broadcast::channel(64);
+        let (sandbox_tx, _) = broadcast::channel(64);
+        Self {
+            driver,
+            deletion_tx,
+            sandbox_tx,
         }
     }
 }
@@ -158,17 +181,34 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<WatchSandboxesRequest>,
     ) -> Result<Response<Self::WatchSandboxesStream>, Status> {
-        let rx = self.deletion_tx.subscribe();
-        let stream = BroadcastStream::new(rx).map(|result| match result {
-            Ok(sandbox_id) => Ok(WatchSandboxesEvent {
-                payload: Some(watch_sandboxes_event::Payload::Deleted(
-                    WatchSandboxesDeletedEvent { sandbox_id },
-                )),
-            }),
-            Err(BroadcastStreamRecvError::Lagged(n)) => Err(Status::data_loss(format!(
+        let lagged = |n| {
+            Status::data_loss(format!(
                 "WatchSandboxes receiver lagged and missed {n} event(s); reconnect and re-list to resync"
-            ))),
-        });
-        Ok(Response::new(Box::pin(stream)))
+            ))
+        };
+
+        let deleted =
+            BroadcastStream::new(self.deletion_tx.subscribe()).map(move |result| match result {
+                Ok(sandbox_id) => Ok(WatchSandboxesEvent {
+                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                        WatchSandboxesDeletedEvent { sandbox_id },
+                    )),
+                }),
+                Err(BroadcastStreamRecvError::Lagged(n)) => Err(lagged(n)),
+            });
+
+        let updated =
+            BroadcastStream::new(self.sandbox_tx.subscribe()).map(move |result| match result {
+                Ok(sandbox) => Ok(WatchSandboxesEvent {
+                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                        WatchSandboxesSandboxEvent {
+                            sandbox: Some(sandbox),
+                        },
+                    )),
+                }),
+                Err(BroadcastStreamRecvError::Lagged(n)) => Err(lagged(n)),
+            });
+
+        Ok(Response::new(Box::pin(deleted.merge(updated))))
     }
 }

@@ -211,6 +211,11 @@ To guarantee sandboxes obtain an IP lease regardless of what packages are instal
 
 ## Sandbox State Reporting
 
+The driver subscribes to LXD's lifecycle event stream and pushes an updated
+sandbox snapshot to the gateway as soon as an instance changes state, rather
+than leaving the gateway to notice on its next reconcile (up to a minute
+later). A sandbox whose supervisor dies is reported in well under a second.
+
 The `Ready` condition's `reason` uses the cross-driver vocabulary upstream
 defines in `openshell-core::driver_utils`, because the gateway keys real
 behaviour off these exact strings — which reasons are transient (mapping to
