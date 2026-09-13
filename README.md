@@ -129,6 +129,11 @@ gateway so you can create a sandbox end-to-end.
   the `userns` capability, relaxes `/proc/sys` and cgroup mount restrictions,
   and allows AppArmor-stacking access — independent of
   `security.privileged`, which is not set.
+- **PID limits are enforced, other cgroup limits are not.** Every sandbox
+  gets `limits.processes` (`--default-max-processes`, default 4096) so one
+  sandbox cannot fork-bomb its co-tenants, but there is no I/O or PID-cgroup
+  budgeting beyond that, and CPU/memory are only set when the request asks
+  for them.
 - **No seccomp/AppArmor allowlist audit yet.** Sandboxes rely on LXD's
   default seccomp deny list (`kexec_load`, `open_by_handle_at`,
   `init_module`, `delete_module`), not a syscall allowlist scoped to what the
@@ -169,6 +174,7 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   - `--supervisor-cache-dir`: host directory for caching extracted supervisor binaries by content digest (default: `/var/cache/openshell/lxd-supervisor`).
   - `--supervisor-storage-pool`: LXD storage pool for the supervisor and DHCP-client volumes. When unset, each sandbox's own pool (`driver_config.storage_pool`, itself defaulting to `default`) is used, so the auxiliary volumes always land beside the rootfs they attach to. Set it to pin every auxiliary volume to one pool.
   - `--image-work-dir`: host scratch directory for image conversion (default: `/var/cache/openshell/lxd-image-work`). Must not be a small tmpfs such as `/tmp`.
+  - `--default-max-processes`: `limits.processes` applied to every sandbox, bounding its PID count (default: 4096; `0` leaves it unlimited). Overridable per sandbox via `driver_config.max_processes`.
   - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.

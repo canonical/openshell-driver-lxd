@@ -46,6 +46,13 @@ pub const DEFAULT_IMAGE_WORK_DIR: &str = "/var/cache/openshell/lxd-image-work";
 /// Default deadline, in seconds, for pulling and importing OCI images.
 pub const DEFAULT_IMAGE_PULL_TIMEOUT_SECS: u64 = 300;
 
+/// Default `limits.processes` (PID limit) applied to every sandbox container.
+///
+/// Sandboxes run untrusted agent workloads on a shared host, so an unbounded
+/// PID count is a fork-bomb denial of service against co-tenant sandboxes.
+/// Set to `0` to leave `pids.max` unlimited.
+pub const DEFAULT_MAX_PROCESSES: u32 = 4096;
+
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
@@ -110,6 +117,12 @@ pub struct Config {
     /// image), so it must not be a small tmpfs such as `/tmp`.
     #[arg(long, default_value = DEFAULT_IMAGE_WORK_DIR)]
     pub image_work_dir: PathBuf,
+
+    /// `limits.processes` applied to every sandbox container, bounding the
+    /// PID count a sandbox can consume. `0` leaves it unlimited.
+    /// Overridable per sandbox via `driver_config.max_processes`.
+    #[arg(long, default_value_t = DEFAULT_MAX_PROCESSES)]
+    pub default_max_processes: u32,
 
     /// Deadline, in seconds, for pulling and importing OCI images before failing.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
