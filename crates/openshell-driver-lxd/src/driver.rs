@@ -397,6 +397,25 @@ impl LxdComputeDriver {
         Ok(())
     }
 
+    /// Records that the driver stopped this sandbox deliberately (see
+    /// [`mapping::KEY_STOP_INTENT`]).
+    ///
+    /// Best-effort: the marker only refines the reason reported for a stopped
+    /// sandbox, so failing to write it must not fail the stop itself. Nothing
+    /// clears it because this driver exposes no start RPC — a stopped sandbox
+    /// is only ever deleted. A future `StartSandbox` would need to clear it so
+    /// a later crash is not reported as a deliberate stop.
+    async fn set_stop_intent(&self, name: &str) {
+        let mut config = HashMap::new();
+        config.insert(
+            mapping::KEY_STOP_INTENT.to_string(),
+            Some(mapping::CONDITION_STOPPED.to_string()),
+        );
+        if let Err(e) = self.lxd.patch_instance_config(name, config).await {
+            tracing::debug!(name = %name, %e, "could not record stop intent");
+        }
+    }
+
     /// Restarts a sandbox whose init exited immediately after the first start.
     ///
     /// The container's init is the supervisor, so if it gives up during
@@ -448,6 +467,13 @@ impl LxdComputeDriver {
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
         self.get_managed_instance(name).await?;
+
+        // Record that this stop was asked for, before issuing it. LXD reports
+        // the same `Stopped` status however an instance went down, so without
+        // this marker a requested stop is indistinguishable from the init
+        // dying and would be reported as `ContainerExited` — surfacing to the
+        // user as `Error` instead of `Stopped`.
+        self.set_stop_intent(name).await;
 
         let op = match self.lxd.stop_instance(name, false).await {
             Err(e) if is_already_stopped(&e) => return Ok(()),

@@ -419,6 +419,14 @@ impl LxdClient {
         self.request(Method::PUT, path, Some(body)).await
     }
 
+    pub(crate) async fn patch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Value,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        self.request(Method::PATCH, path, Some(body)).await
+    }
+
     pub(crate) async fn delete<T: DeserializeOwned>(
         &self,
         path: &str,
