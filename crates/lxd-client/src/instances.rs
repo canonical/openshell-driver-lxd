@@ -81,6 +81,33 @@ impl LxdClient {
             .into_metadata()
     }
 
+    /// `PATCH /1.0/instances/<name>`: merges `config` into the instance's
+    /// configuration, leaving keys that aren't mentioned untouched.
+    ///
+    /// A `null` value removes the key, which is how a caller clears a marker
+    /// it previously set.
+    pub async fn patch_instance_config(
+        &self,
+        name: &str,
+        config: HashMap<String, Option<String>>,
+    ) -> Result<(), LxdError> {
+        let config: serde_json::Map<String, serde_json::Value> = config
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    v.map_or(serde_json::Value::Null, serde_json::Value::String),
+                )
+            })
+            .collect();
+        self.patch::<serde_json::Value>(
+            &format!("/1.0/instances/{}", encode(name)),
+            json!({ "config": config }),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// `DELETE /1.0/instances/<name>`.
     pub async fn delete_instance(&self, name: &str) -> Result<Operation, LxdError> {
         self.delete::<Operation>(&format!("/1.0/instances/{name}"))

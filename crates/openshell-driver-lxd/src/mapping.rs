@@ -90,21 +90,72 @@ pub fn instance_to_driver_sandbox(instance: &Instance) -> DriverSandbox {
             instance_id: instance.name.clone(),
             agent_fd: String::new(),
             sandbox_fd: String::new(),
-            conditions: vec![ready_condition(&instance.status)],
+            conditions: vec![ready_condition(instance)],
             deleting: false,
         }),
     }
 }
 
-/// `Ready` is currently keyed only on LXD's own instance status, not on
-/// supervisor-connected-to-gateway acknowledgment -- that signal doesn't
-/// exist yet.
-fn ready_condition(lxd_status: &str) -> DriverCondition {
-    let (status, reason) = match lxd_status {
-        "Running" => ("True", ""),
-        "Stopped" => ("False", "Stopped"),
-        // "Starting" is in the gateway's transient-reason set → Provisioning phase.
-        "Starting" => ("False", "Starting"),
+/// Ready-condition reason when a sandbox's init exited on its own — an
+/// ordinary application exit or a crash.
+///
+/// Terminal: the gateway deliberately does not relaunch these at startup, so a
+/// genuine failure keeps its error signal.
+pub(crate) const CONDITION_EXITED: &str = "ContainerExited";
+
+/// Ready-condition reason when a sandbox was stopped through the API, i.e. the
+/// driver was asked to stop it. The gateway treats this as recoverable.
+pub(crate) const CONDITION_STOPPED: &str = "ContainerStopped";
+
+/// Ready-condition reason while a sandbox exists but has not been started yet.
+/// In the gateway's transient set, so it maps to `Provisioning`, not `Error`.
+pub(crate) const CONDITION_CREATED: &str = "ContainerCreated";
+
+/// Ready-condition reason while a sandbox is starting. Also transient.
+pub(crate) const CONDITION_STARTING: &str = "ContainerStarting";
+
+/// Ready-condition reason when a sandbox is frozen/paused.
+pub(crate) const CONDITION_PAUSED: &str = "ContainerPaused";
+
+/// Instance config key recording that the *driver* stopped this sandbox.
+///
+/// LXD reports a plain `Stopped` status whichever way an instance went down —
+/// `volatile.last_state.power` is `STOPPED` both when the init exited by itself
+/// and when the API stopped it — so intent has to be recorded when the stop is
+/// issued. Without it a user-requested stop would be reported as
+/// [`CONDITION_EXITED`] and surface as `Error` instead of `Stopped`.
+pub(crate) const KEY_STOP_INTENT: &str = "user.openshell.stop_intent";
+
+/// LXD sets this volatile key the first time an instance starts, so its absence
+/// distinguishes "created, never started" from "ran and is now down".
+const KEY_LAST_POWER: &str = "volatile.last_state.power";
+
+/// Maps an instance's observed state to the `Ready` condition.
+///
+/// The reason strings mirror the cross-driver vocabulary in upstream's
+/// `openshell-core::driver_utils` (`ContainerExited`, `ContainerStopped`,
+/// `ContainerStarting`, `ContainerCreated`, `ContainerPaused`). This driver is
+/// out-of-tree and cannot import that crate, but the gateway keys real
+/// behaviour off these exact strings — which of them are transient (→
+/// `Provisioning` rather than `Error`) and which are eligible for recovery at
+/// gateway startup — so they must match upstream verbatim.
+fn ready_condition(instance: &Instance) -> DriverCondition {
+    let (status, reason) = match instance.status.as_str() {
+        // A guest that signalled readiness over devlxd reports `Ready`; treat
+        // it as running rather than falling through to `Unknown`.
+        "Running" | "Ready" => ("True", ""),
+        "Stopped" => {
+            if !instance.config.contains_key(KEY_LAST_POWER) {
+                // Created but never started: still provisioning, not a failure.
+                ("False", CONDITION_CREATED)
+            } else if instance.config.contains_key(KEY_STOP_INTENT) {
+                ("False", CONDITION_STOPPED)
+            } else {
+                ("False", CONDITION_EXITED)
+            }
+        }
+        "Starting" => ("False", CONDITION_STARTING),
+        "Frozen" => ("False", CONDITION_PAUSED),
         "Error" => ("False", "Error"),
         // "Unknown" status (not "False") → gateway maps to Provisioning, not Error.
         _ => ("Unknown", "Unknown"),
@@ -464,6 +515,87 @@ mod tests {
         assert_eq!(
             config.get("environment.OPENSHELL_SSH_SOCKET_PATH"),
             Some(&GUEST_SSH_SOCKET_PATH.to_string())
+        );
+    }
+
+    fn instance_with(status: &str, config: &[(&str, &str)]) -> Instance {
+        Instance {
+            name: "sb".to_string(),
+            description: String::new(),
+            status: status.to_string(),
+            status_code: 0,
+            architecture: String::new(),
+            ephemeral: false,
+            profiles: Vec::new(),
+            config: config
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            devices: HashMap::new(),
+            type_: "container".to_string(),
+            project: "default".to_string(),
+        }
+    }
+
+    /// The reason strings are a contract with the gateway, not cosmetic: it
+    /// keys "is this transient?" and "may this be recovered at startup?" off
+    /// these exact values.
+    #[test]
+    fn stopped_reason_distinguishes_death_from_requested_stop() {
+        // Ran, then its init exited on its own → terminal ContainerExited.
+        let died = instance_with("Stopped", &[("volatile.last_state.power", "STOPPED")]);
+        let cond = ready_condition(&died);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, CONDITION_EXITED);
+
+        // The driver was asked to stop it → recoverable ContainerStopped.
+        let stopped = instance_with(
+            "Stopped",
+            &[
+                ("volatile.last_state.power", "STOPPED"),
+                (KEY_STOP_INTENT, CONDITION_STOPPED),
+            ],
+        );
+        assert_eq!(ready_condition(&stopped).reason, CONDITION_STOPPED);
+    }
+
+    /// A created-but-never-started instance is also `Stopped` in LXD. Reporting
+    /// it as `ContainerExited` would put a sandbox that is merely mid-create
+    /// into a terminal, sticky `Error` at the gateway.
+    #[test]
+    fn never_started_instance_is_transient_not_terminal() {
+        let fresh = instance_with("Stopped", &[]);
+        let cond = ready_condition(&fresh);
+        assert_eq!(cond.status, "False");
+        assert_eq!(cond.reason, CONDITION_CREATED);
+    }
+
+    #[test]
+    fn running_and_guest_signalled_ready_are_both_ready() {
+        assert_eq!(
+            ready_condition(&instance_with("Running", &[])).status,
+            "True"
+        );
+        // LXD reports `Ready` once a guest signals over devlxd; without this
+        // arm it fell through to `Unknown`.
+        assert_eq!(ready_condition(&instance_with("Ready", &[])).status, "True");
+    }
+
+    #[test]
+    fn transient_states_are_reported_with_transient_reasons() {
+        assert_eq!(
+            ready_condition(&instance_with("Starting", &[])).reason,
+            CONDITION_STARTING
+        );
+        assert_eq!(
+            ready_condition(&instance_with("Frozen", &[])).reason,
+            CONDITION_PAUSED
+        );
+        // An unrecognised status stays Unknown, which the gateway maps to
+        // Provisioning rather than Error.
+        assert_eq!(
+            ready_condition(&instance_with("Weird", &[])).status,
+            "Unknown"
         );
     }
 
