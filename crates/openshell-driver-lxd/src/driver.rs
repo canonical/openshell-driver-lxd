@@ -481,7 +481,34 @@ impl LxdComputeDriver {
         // user as `Error` instead of `Stopped`.
         self.set_stop_intent(name).await;
 
-        let op = match self.lxd.stop_instance(name, false).await {
+        // Ask politely first, but with a deadline. The sandbox's init is the
+        // supervisor, which does not act on LXD's shutdown signal, so an
+        // unbounded graceful stop never completes: the LXD operation stays
+        // RUNNING, the instance stays up, and StopSandbox only fails once the
+        // driver's own operation timeout fires. Bounding it here means the
+        // graceful attempt fails fast and the forced stop below is what
+        // actually stops the sandbox.
+        let graceful = async {
+            let op = self
+                .lxd
+                .stop_instance_timeout(name, false, self.config.stop_timeout_secs)
+                .await?;
+            self.wait_operation(&op.id).await
+        };
+
+        match graceful.await {
+            Ok(()) => return Ok(()),
+            Err(DriverError::Lxd(ref e)) if is_already_stopped(e) => return Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    name = %name,
+                    %e,
+                    "graceful stop did not complete; forcing"
+                );
+            }
+        }
+
+        let op = match self.lxd.stop_instance(name, true).await {
             Err(e) if is_already_stopped(&e) => return Ok(()),
             other => other?,
         };

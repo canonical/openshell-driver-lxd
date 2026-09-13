@@ -74,8 +74,27 @@ impl LxdClient {
     }
 
     /// `PUT /1.0/instances/<name>/state` with `{action: "stop", force}`.
+    ///
+    /// Equivalent to [`LxdClient::stop_instance_timeout`] with no deadline: a
+    /// graceful stop (`force == false`) then waits indefinitely for the
+    /// instance's init to exit.
     pub async fn stop_instance(&self, name: &str, force: bool) -> Result<Operation, LxdError> {
-        let body = json!({"action": "stop", "force": force});
+        self.stop_instance_timeout(name, force, 0).await
+    }
+
+    /// `PUT /1.0/instances/<name>/state` with `{action: "stop", force, timeout}`.
+    ///
+    /// `timeout_secs` bounds how long LXD waits for a graceful stop before the
+    /// operation fails; `0` means wait forever. Worth setting for any init that
+    /// might not act on LXD's shutdown signal, since the operation otherwise
+    /// never completes and the instance stays up.
+    pub async fn stop_instance_timeout(
+        &self,
+        name: &str,
+        force: bool,
+        timeout_secs: i64,
+    ) -> Result<Operation, LxdError> {
+        let body = json!({"action": "stop", "force": force, "timeout": timeout_secs});
         self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
             .await?
             .into_metadata()

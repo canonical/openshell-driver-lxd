@@ -57,6 +57,9 @@ pub const DEFAULT_MAX_PROCESSES: u32 = 4096;
 /// after the first start.
 pub const DEFAULT_START_RETRIES: u32 = 1;
 
+/// Default deadline, in seconds, for a graceful sandbox stop before forcing it.
+pub const DEFAULT_STOP_TIMEOUT_SECS: i64 = 10;
+
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
@@ -133,6 +136,13 @@ pub struct Config {
     /// with the gateway). `0` disables the retry.
     #[arg(long, default_value_t = DEFAULT_START_RETRIES)]
     pub start_retries: u32,
+
+    /// Deadline, in seconds, to wait for a sandbox to shut down gracefully
+    /// before stopping it forcibly. The supervisor does not act on LXD's
+    /// shutdown signal today, so this is how long each stop waits before the
+    /// forced stop that actually ends it.
+    #[arg(long, default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
+    pub stop_timeout_secs: i64,
 
     /// Deadline, in seconds, for pulling and importing OCI images before failing.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
