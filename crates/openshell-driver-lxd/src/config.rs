@@ -53,6 +53,10 @@ pub const DEFAULT_IMAGE_PULL_TIMEOUT_SECS: u64 = 300;
 /// Set to `0` to leave `pids.max` unlimited.
 pub const DEFAULT_MAX_PROCESSES: u32 = 4096;
 
+/// Default number of times to restart a sandbox whose init exits immediately
+/// after the first start.
+pub const DEFAULT_START_RETRIES: u32 = 1;
+
 /// Default gRPC port the gateway listens on.
 pub const DEFAULT_GATEWAY_GRPC_PORT: u16 = 17670;
 
@@ -128,6 +132,12 @@ pub struct Config {
     /// Overridable per sandbox via `driver_config.max_processes`.
     #[arg(long, default_value_t = DEFAULT_MAX_PROCESSES)]
     pub default_max_processes: u32,
+
+    /// Number of times to restart a sandbox whose init exits immediately
+    /// after the first start (e.g. a supervisor that lost a start-up race
+    /// with the gateway). `0` disables the retry.
+    #[arg(long, default_value_t = DEFAULT_START_RETRIES)]
+    pub start_retries: u32,
 
     /// Deadline, in seconds, for pulling and importing OCI images before failing.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]

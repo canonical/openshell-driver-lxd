@@ -146,6 +146,14 @@ gateway so you can create a sandbox end-to-end.
   needs a guest-to-driver signal that containers don't provide; the fix lands
   with a planned microVM + `lxd-agent`-over-vsock transition, not before.
 
+  As a partial mitigation, `create_sandbox` checks the instance again a few
+  seconds after start and restarts it up to `--start-retries` times (default
+  1) if its init has already exited. The container's init *is* the
+  supervisor, so a supervisor that gives up during start-up — losing a race
+  with the gateway finishing the sandbox record, say — otherwise leaves the
+  instance `Stopped` with nothing to bring it back: LXD's `boot.autorestart`
+  is VM-only and `boot.autostart` only covers daemon restarts.
+
 ## Images and Caching
 
 The driver supports per-sandbox OCI images specified via `template.image` in the
@@ -178,6 +186,7 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   - `--dhcp-client-bin`: optional path to a DHCP client binary on the host (defaults to searching PATH and standard locations for `udhcpc` or `busybox`).
   - `--image-work-dir`: host scratch directory for image conversion (default: `/var/cache/openshell/lxd-image-work`). Must not be a small tmpfs such as `/tmp`.
   - `--default-max-processes`: `limits.processes` applied to every sandbox, bounding its PID count (default: 4096; `0` leaves it unlimited). Overridable per sandbox via `driver_config.max_processes`.
+  - `--start-retries`: how many times to restart a sandbox whose init exits immediately after the first start (default: 1; `0` disables).
   - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.

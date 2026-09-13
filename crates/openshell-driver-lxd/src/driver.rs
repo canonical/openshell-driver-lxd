@@ -18,6 +18,10 @@ use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
 
+/// How long to let a freshly started sandbox settle before checking that its
+/// init is still up. See [`LxdComputeDriver::settle_after_start`].
+const SETTLE_DELAY: Duration = Duration::from_secs(3);
+
 /// Returns true if `err` indicates the instance was already stopped.
 ///
 /// Covers both cases: LXD rejects the stop request synchronously with a
@@ -373,6 +377,7 @@ impl LxdComputeDriver {
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
+            self.settle_after_start(&sandbox.name).await?;
 
             Ok::<(), DriverError>(())
         };
@@ -393,6 +398,37 @@ impl LxdComputeDriver {
             return Err(post_err);
         }
 
+        Ok(())
+    }
+
+    /// Restarts a sandbox whose init exited immediately after the first start.
+    ///
+    /// The container's init is the supervisor, so if it gives up during
+    /// start-up — for example because its first policy sync lost a race with
+    /// the gateway finishing the sandbox record — PID 1 exits, LXD reports
+    /// the instance `Stopped`, and nothing brings it back: LXD's
+    /// `boot.autorestart` is VM-only, and `boot.autostart` only covers daemon
+    /// restarts. A bounded retry turns that transient into a working sandbox
+    /// instead of one wedged in `Error`.
+    async fn settle_after_start(&self, name: &str) -> Result<(), DriverError> {
+        for attempt in 0..self.config.start_retries {
+            // Give init long enough to fail; a supervisor that is going to
+            // exit on a start-up race does so within a few seconds.
+            tokio::time::sleep(SETTLE_DELAY).await;
+
+            let instance = self.lxd.get_instance(name).await?;
+            if !instance.status.eq_ignore_ascii_case("Stopped") {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                name = %name,
+                attempt = attempt + 1,
+                "sandbox init exited immediately after start; restarting"
+            );
+            let op = self.lxd.start_instance(name).await?;
+            self.wait_operation(&op.id).await?;
+        }
         Ok(())
     }
 
