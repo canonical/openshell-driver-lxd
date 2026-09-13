@@ -179,10 +179,9 @@ async fn out_of_band_delete_is_pushed_as_deleted() {
     watch.expect_deleted(&id).await;
 }
 
-/// A new watcher must learn the current state of every sandbox, or anything
-/// that changed while it was disconnected waits for the next reconcile.
+/// A new watcher learns the current state of every sandbox, or anything that
+/// changed while it was disconnected would wait for the next reconcile.
 #[tokio::test]
-#[ignore = "known gap: WatchSandboxes sends no snapshot of existing sandboxes on subscribe"]
 async fn new_watcher_receives_current_state() {
     let driver = Driver::start().await;
     let name = unique_name("wsnap");
@@ -195,12 +194,10 @@ async fn new_watcher_receives_current_state() {
     watch.expect_snapshot(&id, "True", "").await;
 }
 
-/// The symptom of the gap above as the gateway meets it: the driver restarts
-/// (upgrade, crash), a sandbox dies meanwhile, and nothing is pushed when the
-/// gateway reconnects. Measured end to end, the gateway then took 54s to
-/// notice.
+/// The same, as the gateway meets it: the driver restarts (upgrade, crash),
+/// a sandbox dies meanwhile, and the reconnecting gateway is told at once.
+/// Before the subscribe snapshot, it took the gateway 54s to notice.
 #[tokio::test]
-#[ignore = "known gap: changes made while the driver was down are not pushed after it restarts"]
 async fn restarted_driver_reports_changes_made_while_down() {
     let driver = Driver::start().await;
     let name = unique_name("wdown");

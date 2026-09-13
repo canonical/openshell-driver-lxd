@@ -186,6 +186,12 @@ impl ComputeDriver for ComputeDriverService {
     type WatchSandboxesStream =
         Pin<Box<dyn Stream<Item = Result<WatchSandboxesEvent, Status>> + Send>>;
 
+    /// Streams the current state of every sandbox, then every change.
+    ///
+    /// The snapshot of existing sandboxes matters whenever a watcher
+    /// (re)connects: without it, anything that changed while it was not
+    /// connected — a driver restart, a gateway reconnect — would only be
+    /// noticed on the gateway's next reconcile.
     async fn watch_sandboxes(
         &self,
         _request: Request<WatchSandboxesRequest>,
@@ -218,28 +224,133 @@ impl ComputeDriver for ComputeDriverService {
                 Err(BroadcastStreamRecvError::Lagged(n)) => Err(lagged(n)),
             });
 
-        Ok(Response::new(Box::pin(deleted.merge(updated))))
+        // Subscribed above, before listing: a change that lands while the
+        // list is being read is still delivered, after the snapshot. Every
+        // LXD state change publishes its own event, so the last snapshot a
+        // watcher receives for a sandbox is always its latest state.
+        let current = self
+            .driver
+            .list_sandboxes()
+            .await?
+            .into_iter()
+            .map(|sandbox| {
+                Ok(WatchSandboxesEvent {
+                    payload: Some(watch_sandboxes_event::Payload::Sandbox(
+                        WatchSandboxesSandboxEvent {
+                            sandbox: Some(sandbox),
+                        },
+                    )),
+                })
+            });
+
+        Ok(Response::new(Box::pin(
+            tokio_stream::iter(current).chain(deleted.merge(updated)),
+        )))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
     use std::time::Duration;
 
     use clap::Parser;
-    use lxd_client::{LxdClient, LxdEndpoint};
+    use lxd_client::{Instance, LxdClient, LxdEndpoint};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
 
     use super::*;
-    use crate::config::{Config, DEFAULT_LXD_SOCKET};
+    use crate::config::Config;
+    use crate::mapping;
 
-    /// None of these tests reach LXD: the client only connects when a
-    /// request is sent, and every path exercised here returns before that.
-    fn service() -> ComputeDriverService {
+    /// A service whose LXD client points at `lxd_socket`.
+    fn service_on(lxd_socket: &Path) -> ComputeDriverService {
         let config = Config::parse_from(["openshell-driver-lxd"]);
-        let lxd =
-            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+        let lxd = LxdClient::new(LxdEndpoint::UnixSocket(lxd_socket.to_path_buf())).unwrap();
         ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd))
+    }
+
+    /// A service for paths that never reach LXD: the client only connects
+    /// when a request is sent, and its socket does not exist.
+    fn service() -> ComputeDriverService {
+        service_on(Path::new("/nonexistent/lxd.socket"))
+    }
+
+    /// Stands in for LXD on a Unix socket, answering every request with
+    /// `instances` as the response metadata — enough for ListSandboxes.
+    fn fake_lxd(instances: Vec<Instance>) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("lxd.socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let body = serde_json::json!({
+            "type": "sync",
+            "status": "Success",
+            "status_code": 200,
+            "error_code": 0,
+            "error": "",
+            "metadata": instances,
+        })
+        .to_string();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    // Requests here carry no body: read up to the blank line.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match conn.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = conn.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (dir, socket)
+    }
+
+    fn instance(name: &str, status: &str, config: &[(&str, &str)]) -> Instance {
+        Instance {
+            name: name.to_string(),
+            description: String::new(),
+            status: status.to_string(),
+            status_code: 0,
+            architecture: "x86_64".to_string(),
+            ephemeral: false,
+            profiles: vec!["default".to_string()],
+            config: config
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            devices: HashMap::new(),
+            type_: "container".to_string(),
+            project: "default".to_string(),
+        }
+    }
+
+    /// A watch on a service backed by a fake LXD with no instances, so the
+    /// stream starts with nothing but live events.
+    async fn empty_watch() -> (
+        ComputeDriverService,
+        <ComputeDriverService as ComputeDriver>::WatchSandboxesStream,
+        tempfile::TempDir,
+    ) {
+        let (dir, socket) = fake_lxd(Vec::new());
+        let service = service_on(&socket);
+        let stream = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .expect("watch should open")
+            .into_inner();
+        (service, stream, dir)
     }
 
     async fn next_event(
@@ -305,12 +416,7 @@ mod tests {
 
     #[tokio::test]
     async fn watch_forwards_deletions_and_snapshots() {
-        let service = service();
-        let mut stream = service
-            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
-            .await
-            .expect("watch should open")
-            .into_inner();
+        let (service, mut stream, _lxd) = empty_watch().await;
 
         service.deletion_tx.send("sb-gone".to_string()).unwrap();
         match next_event(&mut stream).await.unwrap().payload {
@@ -336,12 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_watcher_receives_every_event() {
-        let service = service();
-        let mut first = service
-            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
+        let (service, mut first, _lxd) = empty_watch().await;
         let mut second = service
             .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
             .await
@@ -362,12 +463,7 @@ mod tests {
     /// gateway reconnects and re-lists) rather than silently skipping them.
     #[tokio::test]
     async fn lagging_watcher_gets_data_loss() {
-        let service = service();
-        let mut stream = service
-            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
-            .await
-            .unwrap()
-            .into_inner();
+        let (service, mut stream, _lxd) = empty_watch().await;
 
         for i in 0..100 {
             service.deletion_tx.send(format!("sb-{i}")).unwrap();
@@ -377,5 +473,74 @@ mod tests {
             .await
             .expect_err("an overflowed receiver should report the gap");
         assert_eq!(status.code(), Code::DataLoss);
+    }
+
+    /// A new watcher first receives the current state of every managed
+    /// sandbox, then live events.
+    #[tokio::test]
+    async fn watch_starts_with_a_snapshot_of_every_managed_sandbox() {
+        let (_lxd, socket) = fake_lxd(vec![
+            instance(
+                "sb-running",
+                "Running",
+                &[(mapping::KEY_SANDBOX_ID, "id-running")],
+            ),
+            instance(
+                "sb-exited",
+                "Stopped",
+                &[
+                    (mapping::KEY_SANDBOX_ID, "id-exited"),
+                    ("volatile.last_state.power", "STOPPED"),
+                ],
+            ),
+            instance("not-a-sandbox", "Running", &[]),
+        ]);
+        let service = service_on(&socket);
+        let mut stream = service
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+            .expect("watch should open")
+            .into_inner();
+
+        let mut snapshots = HashMap::new();
+        for _ in 0..2 {
+            match next_event(&mut stream).await.unwrap().payload {
+                Some(watch_sandboxes_event::Payload::Sandbox(event)) => {
+                    let sandbox = event.sandbox.unwrap();
+                    let reason = sandbox.status.unwrap().conditions[0].reason.clone();
+                    snapshots.insert(sandbox.id, reason);
+                }
+                other => panic!("expected a snapshot, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            snapshots,
+            HashMap::from([
+                ("id-running".to_string(), String::new()),
+                ("id-exited".to_string(), "ContainerExited".to_string()),
+            ])
+        );
+
+        // Then live events, and nothing about the unmanaged instance.
+        service.deletion_tx.send("id-exited".to_string()).unwrap();
+        assert!(matches!(
+            next_event(&mut stream).await.unwrap().payload,
+            Some(watch_sandboxes_event::Payload::Deleted(_))
+        ));
+    }
+
+    /// If the current state cannot be read the watch fails, so the gateway
+    /// reconnects and gets the snapshot, rather than silently starting from
+    /// nothing.
+    #[tokio::test]
+    async fn watch_fails_when_current_state_cannot_be_listed() {
+        let status = match service()
+            .watch_sandboxes(Request::new(WatchSandboxesRequest {}))
+            .await
+        {
+            Ok(_) => panic!("watch should fail without LXD"),
+            Err(status) => status,
+        };
+        assert_eq!(status.code(), Code::Internal, "{status}");
     }
 }
