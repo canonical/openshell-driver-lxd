@@ -19,7 +19,7 @@ use futures::Stream;
 use tokio::sync::broadcast;
 use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
 use tokio_stream::StreamExt;
-use tonic::{Request, Response, Status};
+use tonic::{Code, Request, Response, Status};
 
 use crate::driver::LxdComputeDriver;
 use crate::error::DriverError;
@@ -162,7 +162,16 @@ impl ComputeDriver for ComputeDriverService {
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
         let req = request.into_inner();
-        let name = resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await?;
+        let name = match resolve_name(&self.driver, &req.sandbox_name, &req.sandbox_id).await {
+            Ok(name) => name,
+            // No instance carries this id, so there is nothing to delete —
+            // the same answer an unknown name gets. Delete must be idempotent
+            // however the caller addresses the sandbox.
+            Err(status) if status.code() == Code::NotFound => {
+                return Ok(Response::new(DeleteSandboxResponse { deleted: false }));
+            }
+            Err(status) => return Err(status),
+        };
         match self.driver.delete_sandbox(&name).await? {
             Some(sandbox_id) => {
                 if !sandbox_id.is_empty() {
@@ -220,7 +229,6 @@ mod tests {
 
     use clap::Parser;
     use lxd_client::{LxdClient, LxdEndpoint};
-    use tonic::Code;
 
     use super::*;
     use crate::config::{Config, DEFAULT_LXD_SOCKET};

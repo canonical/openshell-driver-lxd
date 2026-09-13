@@ -320,11 +320,9 @@ async fn unknown_sandboxes_are_not_found() {
     assert!(!deleted);
 }
 
-/// Delete must be idempotent however the caller identifies the sandbox.
-/// By name an unknown sandbox is `deleted: false`; by id alone it is
-/// currently `NotFound`.
+/// Delete is idempotent however the caller identifies the sandbox: an
+/// unknown id is `deleted: false`, like an unknown name.
 #[tokio::test]
-#[ignore = "known gap: DeleteSandbox by unknown id returns NotFound instead of deleted: false"]
 async fn deleting_an_unknown_id_is_idempotent() {
     let driver = Driver::start().await;
     let missing = unique_name("missing");
