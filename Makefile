@@ -14,10 +14,14 @@ test: test-lxd-client test-driver
 test-lxd-client: setup-lxd-test-env
 	cargo test -p lxd-client
 
-# Runs the driver integration tests. These boot real sandboxes on a live LXD
-# and need `skopeo`, `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus
-# outbound access to ghcr.io: the driver pulls and imports the upstream
-# OpenShell supervisor image on demand — no image is pre-built or pre-loaded.
+# Runs the driver's unit and integration tests. The integration tests
+# (crates/openshell-driver-lxd/tests/driver_lxd) start the driver binary and
+# boot real sandboxes on a live LXD, so they need the `lxc` CLI, `skopeo`,
+# `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus outbound access to
+# ghcr.io: the sandbox image is imported on first use. Sandboxes run a
+# stand-in supervisor built from examples/, not the real one, which needs a
+# gateway. `cargo test -p openshell-driver-lxd -- --ignored` runs the tests
+# for known gaps.
 test-driver:
 	cargo test -p openshell-driver-lxd
 
