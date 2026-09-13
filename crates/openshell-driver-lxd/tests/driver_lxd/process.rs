@@ -77,11 +77,10 @@ async fn sandboxes_survive_a_driver_restart() {
     watch.expect_snapshot(&id, "False", "ContainerExited").await;
 }
 
-/// Pre-warming the default image must not delay serving: the socket accepts
-/// connections as soon as it is bound, so a gateway that connects during a
-/// slow pre-warm waits without any error until the import finishes.
+/// Pre-warming the default image does not delay serving: the socket accepts
+/// connections as soon as it is bound, so a gateway that connected during a
+/// slow pre-warm would otherwise wait without any error until it finished.
 #[tokio::test]
-#[ignore = "known gap: the driver pre-warms its default image before serving"]
 async fn serves_while_the_default_image_prewarms() {
     // A registry that accepts connections and never answers.
     let registry = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -99,11 +98,42 @@ async fn serves_while_the_default_image_prewarms() {
     });
     let started = Instant::now();
     driver.wait_ready(Duration::from_secs(60)).await;
-    hold.abort();
-
+    let elapsed = started.elapsed();
+    assert!(elapsed < Duration::from_secs(5), "serving took {elapsed:?}");
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "serving took {:?}",
-        started.elapsed()
+        !driver.log().contains("pre-warm"),
+        "the pre-warm should still be in progress while serving"
     );
+
+    // The pre-warm still runs, and reports its failure once the registry
+    // goes away.
+    hold.abort();
+    eventually(
+        Duration::from_secs(60),
+        "the pre-warm to give up",
+        || async {
+            driver
+                .log()
+                .contains("could not pre-warm default sandbox image")
+                .then_some(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn default_image_is_prewarmed_in_the_background() {
+    let driver = Driver::start().await;
+
+    eventually(
+        Duration::from_secs(60),
+        "the pre-warm to finish",
+        || async {
+            driver
+                .log()
+                .contains("default sandbox image ready")
+                .then_some(())
+        },
+    )
+    .await;
 }

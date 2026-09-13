@@ -189,7 +189,6 @@ async fn sandboxes_stay_inside_the_driver_project() {
 async fn cold_import_lands_in_a_project_with_its_own_images() {
     let project = Project::create(true);
     let prefix = format!("{}-", project.name);
-    // Serves once the pre-warm import has finished or hit its deadline.
     let driver = Driver::start_with(DriverOptions {
         project: project.name.clone(),
         default_image: "ghcr.io/nvidia/openshell/supervisor:0.0.116".to_string(),
@@ -197,6 +196,18 @@ async fn cold_import_lands_in_a_project_with_its_own_images() {
         extra_args: vec!["--image-pull-timeout-secs".into(), "30".into()],
         ..Default::default()
     })
+    .await;
+
+    // The pre-warm runs in the background; wait for its outcome.
+    eventually(
+        Duration::from_secs(120),
+        "the pre-warm to finish",
+        || async {
+            let log = driver.log();
+            (log.contains("default sandbox image ready") || log.contains("could not pre-warm"))
+                .then_some(())
+        },
+    )
     .await;
 
     // Remove any image leaked into the default project before asserting. The

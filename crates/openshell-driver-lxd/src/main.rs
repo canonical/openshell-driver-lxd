@@ -105,21 +105,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Best-effort pre-warm of the default sandbox image. The driver pulls the
     // image from the registry on demand, so a missing local image is not an
-    // error; pre-warming here just makes the first create fast and surfaces an
+    // error; pre-warming just makes the first create fast and surfaces an
     // invalid reference or an unreachable registry early. Any failure is
     // logged and otherwise ignored — the import is retried on first use.
-    match driver.ensure_default_image().await {
-        Ok(alias) => {
-            info!(image = %default_image, %alias, "default sandbox image ready");
+    //
+    // It runs in the background: a cold import takes minutes, and the socket
+    // already accepts connections, so blocking here would leave a connecting
+    // gateway waiting with no error until it finished. A create that arrives
+    // meanwhile waits on the same import rather than starting a second one.
+    let prewarm = driver.clone();
+    tokio::spawn(async move {
+        match prewarm.ensure_default_image().await {
+            Ok(alias) => {
+                info!(image = %default_image, %alias, "default sandbox image ready");
+            }
+            Err(e) => {
+                warn!(
+                    image = %default_image,
+                    %e,
+                    "could not pre-warm default sandbox image; it will be imported on first use"
+                );
+            }
         }
-        Err(e) => {
-            warn!(
-                image = %default_image,
-                %e,
-                "could not pre-warm default sandbox image; it will be imported on first use"
-            );
-        }
-    }
+    });
 
     let service = ComputeDriverService::new(driver);
 
