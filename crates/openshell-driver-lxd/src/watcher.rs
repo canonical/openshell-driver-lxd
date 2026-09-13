@@ -41,7 +41,9 @@ const WATCHED_ACTIONS: &[&str] = &[
 ///
 /// Prefers the explicit `name` field and falls back to the last segment of
 /// `source` (e.g. `/1.0/instances/my-sandbox`), which older LXD releases set
-/// without a `name`.
+/// without a `name`. Outside the default project `source` carries the
+/// project as a query (`/1.0/instances/my-sandbox?project=sandboxes`), which
+/// is not part of the name.
 fn instance_name(metadata: &serde_json::Value) -> Option<String> {
     if let Some(name) = metadata.get("name").and_then(|v| v.as_str()) {
         if !name.is_empty() {
@@ -51,7 +53,8 @@ fn instance_name(metadata: &serde_json::Value) -> Option<String> {
     metadata
         .get("source")
         .and_then(|v| v.as_str())
-        .and_then(|source| source.rsplit('/').next())
+        .and_then(|source| source.split('?').next())
+        .and_then(|path| path.rsplit('/').next())
         .filter(|name| !name.is_empty())
         .map(str::to_string)
 }
@@ -161,10 +164,8 @@ mod tests {
     /// LXD appends the project to `source` outside the default project, e.g.
     /// `/1.0/instances/sb-3?project=sandboxes` (observed on LXD 6.9). The
     /// fallback is only taken when `name` is absent, which LXD 6.9 always
-    /// sets, but when it is taken the query string must not leak into the
-    /// instance name.
+    /// sets.
     #[test]
-    #[ignore = "known gap: source fallback keeps the ?project= query in the name"]
     fn source_fallback_strips_project_query() {
         let metadata = json!({
             "action": "instance-shutdown",
