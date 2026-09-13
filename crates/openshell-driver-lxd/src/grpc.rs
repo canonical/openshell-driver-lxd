@@ -25,43 +25,35 @@ use crate::driver::LxdComputeDriver;
 use crate::error::DriverError;
 use crate::watcher;
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum WatchEvent {
+    Sandbox(Box<DriverSandbox>),
+    Deleted(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct ComputeDriverService {
     driver: LxdComputeDriver,
-    /// Published on every successful DeleteSandbox so WatchSandboxes can emit
-    /// Deleted events and the gateway immediately removes the sandbox from its
-    /// store rather than waiting for the next reconcile cycle.
-    deletion_tx: broadcast::Sender<String>,
-    /// Published by the LXD lifecycle watcher whenever a driver-managed
-    /// instance changes state, so a sandbox whose supervisor exited is
-    /// reported at once instead of on the gateway's next reconcile.
-    sandbox_tx: broadcast::Sender<DriverSandbox>,
+    /// Ordered event stream published on state changes and deletions, so
+    /// WatchSandboxes preserves the relative order of lifecycle events
+    /// (e.g. an exit snapshot is never delivered after a deletion).
+    pub(crate) event_tx: broadcast::Sender<WatchEvent>,
 }
 
 impl ComputeDriverService {
     #[must_use]
     pub fn new(driver: LxdComputeDriver) -> Self {
-        let (deletion_tx, _) = broadcast::channel(64);
-        let (sandbox_tx, _) = broadcast::channel(64);
-        watcher::spawn(driver.lxd_client(), sandbox_tx.clone());
-        Self {
-            driver,
-            deletion_tx,
-            sandbox_tx,
-        }
+        let (event_tx, _) = broadcast::channel(64);
+        watcher::spawn(driver.lxd_client(), event_tx.clone());
+        Self { driver, event_tx }
     }
 
     /// Builds the service without the LXD lifecycle watcher, for tests that
     /// have no LXD to subscribe to.
     #[must_use]
     pub fn without_watcher(driver: LxdComputeDriver) -> Self {
-        let (deletion_tx, _) = broadcast::channel(64);
-        let (sandbox_tx, _) = broadcast::channel(64);
-        Self {
-            driver,
-            deletion_tx,
-            sandbox_tx,
-        }
+        let (event_tx, _) = broadcast::channel(64);
+        Self { driver, event_tx }
     }
 }
 
@@ -175,7 +167,7 @@ impl ComputeDriver for ComputeDriverService {
         match self.driver.delete_sandbox(&name).await? {
             Some(sandbox_id) => {
                 if !sandbox_id.is_empty() {
-                    self.deletion_tx.send(sandbox_id).ok();
+                    self.event_tx.send(WatchEvent::Deleted(sandbox_id)).ok();
                 }
                 Ok(Response::new(DeleteSandboxResponse { deleted: true }))
             }
@@ -202,23 +194,18 @@ impl ComputeDriver for ComputeDriverService {
             ))
         };
 
-        let deleted =
-            BroadcastStream::new(self.deletion_tx.subscribe()).map(move |result| match result {
-                Ok(sandbox_id) => Ok(WatchSandboxesEvent {
-                    payload: Some(watch_sandboxes_event::Payload::Deleted(
-                        WatchSandboxesDeletedEvent { sandbox_id },
-                    )),
-                }),
-                Err(BroadcastStreamRecvError::Lagged(n)) => Err(lagged(n)),
-            });
-
-        let updated =
-            BroadcastStream::new(self.sandbox_tx.subscribe()).map(move |result| match result {
-                Ok(sandbox) => Ok(WatchSandboxesEvent {
+        let live_events =
+            BroadcastStream::new(self.event_tx.subscribe()).map(move |result| match result {
+                Ok(WatchEvent::Sandbox(sandbox)) => Ok(WatchSandboxesEvent {
                     payload: Some(watch_sandboxes_event::Payload::Sandbox(
                         WatchSandboxesSandboxEvent {
-                            sandbox: Some(sandbox),
+                            sandbox: Some(*sandbox),
                         },
+                    )),
+                }),
+                Ok(WatchEvent::Deleted(sandbox_id)) => Ok(WatchSandboxesEvent {
+                    payload: Some(watch_sandboxes_event::Payload::Deleted(
+                        WatchSandboxesDeletedEvent { sandbox_id },
                     )),
                 }),
                 Err(BroadcastStreamRecvError::Lagged(n)) => Err(lagged(n)),
@@ -244,7 +231,7 @@ impl ComputeDriver for ComputeDriverService {
             });
 
         Ok(Response::new(Box::pin(
-            tokio_stream::iter(current).chain(deleted.merge(updated)),
+            tokio_stream::iter(current).chain(live_events),
         )))
     }
 }
@@ -418,7 +405,10 @@ mod tests {
     async fn watch_forwards_deletions_and_snapshots() {
         let (service, mut stream, _lxd) = empty_watch().await;
 
-        service.deletion_tx.send("sb-gone".to_string()).unwrap();
+        service
+            .event_tx
+            .send(WatchEvent::Deleted("sb-gone".to_string()))
+            .unwrap();
         match next_event(&mut stream).await.unwrap().payload {
             Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
                 assert_eq!(deleted.sandbox_id, "sb-gone");
@@ -431,12 +421,47 @@ mod tests {
             name: "sb-live".to_string(),
             ..Default::default()
         };
-        service.sandbox_tx.send(snapshot.clone()).unwrap();
+        service
+            .event_tx
+            .send(WatchEvent::Sandbox(Box::new(snapshot.clone())))
+            .unwrap();
         match next_event(&mut stream).await.unwrap().payload {
             Some(watch_sandboxes_event::Payload::Sandbox(event)) => {
                 assert_eq!(event.sandbox, Some(snapshot));
             }
             other => panic!("expected a Sandbox event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn watch_preserves_event_order_across_types() {
+        let (service, mut stream, _lxd) = empty_watch().await;
+
+        let snapshot = DriverSandbox {
+            id: "sb-live".to_string(),
+            name: "sb-live".to_string(),
+            ..Default::default()
+        };
+        service
+            .event_tx
+            .send(WatchEvent::Sandbox(Box::new(snapshot.clone())))
+            .unwrap();
+        service
+            .event_tx
+            .send(WatchEvent::Deleted("sb-live".to_string()))
+            .unwrap();
+
+        match next_event(&mut stream).await.unwrap().payload {
+            Some(watch_sandboxes_event::Payload::Sandbox(event)) => {
+                assert_eq!(event.sandbox, Some(snapshot));
+            }
+            other => panic!("expected a Sandbox event, got {other:?}"),
+        }
+        match next_event(&mut stream).await.unwrap().payload {
+            Some(watch_sandboxes_event::Payload::Deleted(deleted)) => {
+                assert_eq!(deleted.sandbox_id, "sb-live");
+            }
+            other => panic!("expected a Deleted event, got {other:?}"),
         }
     }
 
@@ -449,7 +474,10 @@ mod tests {
             .unwrap()
             .into_inner();
 
-        service.deletion_tx.send("sb-1".to_string()).unwrap();
+        service
+            .event_tx
+            .send(WatchEvent::Deleted("sb-1".to_string()))
+            .unwrap();
 
         for stream in [&mut first, &mut second] {
             assert!(matches!(
@@ -466,7 +494,10 @@ mod tests {
         let (service, mut stream, _lxd) = empty_watch().await;
 
         for i in 0..100 {
-            service.deletion_tx.send(format!("sb-{i}")).unwrap();
+            service
+                .event_tx
+                .send(WatchEvent::Deleted(format!("sb-{i}")))
+                .unwrap();
         }
 
         let status = next_event(&mut stream)
@@ -522,7 +553,10 @@ mod tests {
         );
 
         // Then live events, and nothing about the unmanaged instance.
-        service.deletion_tx.send("id-exited".to_string()).unwrap();
+        service
+            .event_tx
+            .send(WatchEvent::Deleted("id-exited".to_string()))
+            .unwrap();
         assert!(matches!(
             next_event(&mut stream).await.unwrap().payload,
             Some(watch_sandboxes_event::Payload::Deleted(_))
