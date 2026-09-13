@@ -108,14 +108,12 @@ gateway so you can create a sandbox end-to-end.
 4. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. The gateway must be able to mint sandbox tokens
    (`gateway_jwt`), or every supervisor exits with "no sandbox token source
-   available". This is for OpenShell v0.0.116 (config schema `version = 1`
-   and `--drivers`; later gateways use `version = 2` and
-   `--compute-driver`):
+   available". This is for OpenShell v0.1.0-pre.3:
 
    ```sh
    cat > /tmp/openshell-gateway.toml <<EOF
    [openshell]
-   version = 1
+   version = 2
 
    [openshell.gateway.gateway_jwt]
    signing_key_path = "$PKI/jwt/signing.pem"
@@ -130,7 +128,7 @@ gateway so you can create a sandbox end-to-end.
        --enable-mtls-auth true \
        --bind-address "$BRIDGE_IP" \
        --port 17670 \
-       --drivers lxd \
+       --compute-driver lxd \
        --compute-driver-socket /tmp/openshell-driver.sock \
        --db-url "sqlite:/tmp/openshell-gateway.db?mode=rwc" \
        --config /tmp/openshell-gateway.toml
@@ -406,7 +404,7 @@ materials before the instance starts.
 while it was running, on its own or the host's shutdown, and did not start it
 again. Its reason, `ContainerRuntimeRestart`, is what upstream's Docker and
 Podman drivers give such containers. The gateway still shows it as `Error`:
-from v0.1.0-pre.1 it restarts sandboxes with that reason at startup, but only
+from v0.1.0-pre.3 it restarts sandboxes with that reason at startup, but only
 for drivers that report `gateway_manages_lifecycle`, and this driver does not.
 
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
@@ -420,17 +418,18 @@ with `--stop-timeout-secs` (default 10s) and then stops the instance forcibly.
 local LXD, the way upstream validates its in-tree drivers:
 
 - `smoke`: create a sandbox, see it `Ready`, list it, exec in it, delete it.
-- `sandbox-continuity`: a running sandbox keeps its workload and a stopped
-  one stays stopped across a gateway restart and a driver restart.
 
 Both this and `make test-upstream-e2e` below run in the environment
-`scripts/openshell-env.sh` provides. It pins the OpenShell side to one
-release — gateway, CLI and supervisor image from v0.0.116, verified by
-checksum and digest — because mixing components from different releases
-fails in ways that are not the driver's, and runs everything in a throwaway
-LXD project (`openshell-test`) that shares the default project's image cache.
-The conformance runner is built from the newest upstream revision the pinned
-CLI can drive.
+`scripts/openshell-env.sh` provides. It pins the OpenShell side to
+v0.1.0-pre.3 — the release whose driver contract the vendored proto
+follows — because mixing components from different releases fails in
+ways that are not the driver's, and runs everything in a throwaway LXD
+project (`openshell-test`) that shares the default project's image cache.
+The supervisor is pinned by digest; the release publishes no prebuilt
+binaries, so the gateway, CLI and Python SDK are built from the tagged
+source (this takes several minutes and a few GiB of scratch on a cold cache,
+and the gateway requires `libz3-dev`). The conformance runner is built from
+the pinned OpenShell source revision.
 
 On failure, the driver and gateway logs and LXD's lifecycle events are left
 in `target/openshell-test/artifacts`, with each suite's reports in a
@@ -443,8 +442,8 @@ network policy, SSRF protections, credential handling, live policy updates,
 Landlock filesystem rules and `inference.local` routing. The supervisor
 enforces all of this, but only as far as the container lets it, and a sandbox
 that silently enforces nothing still passes smoke. The tests come from the
-v0.0.116 source tree (the Rust tests of `e2e/rust` and the Python tests of
-`e2e/python`, run through the release's Python SDK); upstream tests specific
+v0.1.0-pre.3 source tree (the Rust tests of `e2e/rust` and the Python tests of
+`e2e/python`, run through the built Python SDK); upstream tests specific
 to the Docker or Podman drivers are left out. It additionally needs rootless
 podman (with `uidmap` and `passt`) for a test fixture server, and
 `python3` 3.11 or newer. Logs and a JUnit report land in

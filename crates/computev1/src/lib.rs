@@ -9,9 +9,20 @@
 
 #![allow(clippy::all, clippy::pedantic, clippy::nursery, clippy::restriction)]
 
-pub mod pb {
-    tonic::include_proto!("openshell.compute.v1");
+pub mod openshell {
+    pub mod compute {
+        pub mod v1 {
+            tonic::include_proto!("openshell.compute.v1");
+        }
+    }
+    pub mod sandbox {
+        pub mod v1 {
+            tonic::include_proto!("openshell.sandbox.v1");
+        }
+    }
 }
 
+pub use openshell::compute::v1 as pb;
+pub use openshell::sandbox::v1 as sandbox;
 pub use pb::compute_driver_client;
 pub use pb::compute_driver_server;

@@ -32,21 +32,17 @@ set -euo pipefail
 
 # --- Pins --------------------------------------------------------------------
 
-# Bump the release here and in `OPENSHELL_REF` in the Makefile together, so
-# the vendored proto matches the gateway the suites run against.
-OPENSHELL_VERSION="0.0.116"
+# Bump the release here; Makefile derives OPENSHELL_REF from OPENSHELL_SOURCE_REV
+# so the vendored proto matches the gateway the suites run against.
+OPENSHELL_VERSION="0.1.0-pre.3"
 OPENSHELL_REPO="https://github.com/NVIDIA/OpenShell"
-OPENSHELL_RELEASE_URL="${OPENSHELL_REPO}/releases/download/v${OPENSHELL_VERSION}"
 # The commit the release tag points to, for suites that need the source.
 # shellcheck disable=SC2034  # used by the suites that source this file
-OPENSHELL_SOURCE_REV="d1155aa70042d3e2ee49dbfa15346b108b7c1d92"
-GATEWAY_SHA256_X86_64="59c6da724eae7a00c28826f9191efbdf4fbaa5c768afdc8dea6a80a949ebcc89"
-GATEWAY_SHA256_AARCH64="292c379193a339220234ffea585350901468bb8f4076e2076bc074e8ed18974b"
-CLI_SHA256_X86_64="4fb4476d80a1875a0b83547ec3aba999cf0a2e2d75f95f2f709b622e2103520e"
-CLI_SHA256_AARCH64="7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb3f43"
+OPENSHELL_SOURCE_REV="7e7a8d5610f336f5f7f9f60da0951adbf295475d"
 
 # The supervisor released with the gateway, pinned by index digest.
-SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@sha256:c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42"
+SUPERVISOR_DIGEST="sha256:ba4ef0c9d7c244f85e5d8ef1741d25b53a0575dff5395d7c51b3392875920363"
+SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@${SUPERVISOR_DIGEST}"
 
 # --- Layout ------------------------------------------------------------------
 
@@ -93,36 +89,43 @@ require_tools() {
 
 # --- Binaries ----------------------------------------------------------------
 
-fetch_release_asset() {
-    local name=$1 sha256=$2
-    local archive="${OPENSHELL_DIR}/${name}"
-    if [ ! -f "$archive" ]; then
-        log "downloading ${name}"
-        curl -fsSL --retry 3 -o "${archive}.partial" "${OPENSHELL_RELEASE_URL}/${name}"
-        mv "${archive}.partial" "$archive"
-    fi
-    echo "${sha256}  ${archive}" | sha256sum --check --quiet \
-        || die "checksum mismatch for ${name}; delete ${archive} to download it again"
-    case "$name" in
-        *.tar.gz) tar -xzf "$archive" -C "$OPENSHELL_DIR" ;;
-    esac
+# The OpenShell source at OPENSHELL_SOURCE_REV, shared with the suites that
+# build from it.
+fetch_openshell_source() {
+    local dir="${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
+    [ -f "${dir}/Cargo.toml" ] && return
+    log "fetching OpenShell source at v${OPENSHELL_VERSION} (${OPENSHELL_SOURCE_REV})"
+    rm -rf "$dir"
+    mkdir -p "$dir"
+    git -C "$dir" init --quiet
+    git -C "$dir" fetch --quiet --depth 1 "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
+    git -C "$dir" checkout --quiet FETCH_HEAD
+    rm -rf "${dir}/.git"
 }
 
+# Builds the gateway and CLI from source. Only the two binaries are kept;
+# the build tree runs to several GiB. The gateway links the system Z3 library
+# (libz3-dev on Debian/Ubuntu).
 fetch_openshell() {
+    [ -x "$GATEWAY_BIN" ] && [ -x "$CLI_BIN" ] && return
+    ldconfig -p 2>/dev/null | grep -q 'libz3\.so ' \
+        || die "building OpenShell ${OPENSHELL_VERSION} needs the Z3 development library (apt install libz3-dev)"
+    fetch_openshell_source
+    local target="${CACHE_DIR}/openshell-build-target"
+    log "building OpenShell ${OPENSHELL_VERSION} gateway and CLI from source (several minutes on a cold cache)"
+    (
+        cd "${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
+        # Upstream pins its own toolchain; build with ours, so a
+        # rustup-managed cargo does not download a second toolchain.
+        RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" CARGO_TARGET_DIR="$target" \
+            cargo build --quiet --release --locked \
+            -p openshell-gateway --bin openshell-gateway \
+            -p openshell-cli --bin openshell </dev/null
+    )
     mkdir -p "$OPENSHELL_DIR"
-    case "$(uname -m)" in
-        x86_64)
-            fetch_release_asset "openshell-gateway-x86_64-unknown-linux-gnu.tar.gz" "$GATEWAY_SHA256_X86_64"
-            fetch_release_asset "openshell-x86_64-unknown-linux-musl.tar.gz" "$CLI_SHA256_X86_64"
-            ;;
-        aarch64)
-            fetch_release_asset "openshell-gateway-aarch64-unknown-linux-gnu.tar.gz" "$GATEWAY_SHA256_AARCH64"
-            fetch_release_asset "openshell-aarch64-unknown-linux-musl.tar.gz" "$CLI_SHA256_AARCH64"
-            ;;
-        *)
-            die "unsupported architecture $(uname -m)"
-            ;;
-    esac
+    install -m 0755 "${target}/release/openshell-gateway" "$GATEWAY_BIN"
+    install -m 0755 "${target}/release/openshell" "$CLI_BIN"
+    rm -rf "$target"
 }
 
 build_driver() {
@@ -170,11 +173,9 @@ write_gateway_config() {
     echo "openshell-test" >"${keys}/kid"
     chmod 600 "${keys}/signing.pem"
 
-    # Schema version 1 is what v0.0.116 accepts. Without gateway_jwt the
-    # gateway mints no sandbox token and the supervisor cannot connect.
     cat >"${WORK_DIR}/gateway.toml" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -239,7 +240,7 @@ start_gateway() {
         --bind-address "$ip" \
         --port "$GATEWAY_PORT" \
         --health-port "$HEALTH_PORT" \
-        --drivers lxd \
+        --compute-driver lxd \
         --compute-driver-socket "$DRIVER_SOCKET" \
         --db-url "sqlite:${WORK_DIR}/gateway.db?mode=rwc" \
         --log-level info \

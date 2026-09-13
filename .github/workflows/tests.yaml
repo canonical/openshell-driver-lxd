@@ -64,7 +64,7 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --component rustfmt,clippy
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev libz3-dev
       - name: Install image import tools
         run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools
       - name: Run conformance suite

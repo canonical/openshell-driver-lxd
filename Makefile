@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto proto-sync sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -84,12 +84,15 @@ proto:
 # Proto files vendored from upstream NVIDIA/OpenShell. compute_driver.proto is
 # the driver contract itself; options.proto defines the custom field and method
 # options it imports (e.g. the `secret` field option on sandbox_token) and must
-# be resolvable on protoc's include path for codegen to succeed.
-UPSTREAM_PROTOS := compute_driver.proto options.proto
+# be resolvable on protoc's include path for codegen to succeed. sandbox.proto
+# defines the sandbox policy schema imported by compute_driver.proto.
+UPSTREAM_PROTOS := compute_driver.proto options.proto sandbox.proto
 
-# OpenShell release the vendored protos are taken from: the newest release the
-# driver targets.
-OPENSHELL_REF ?= v0.1.0-pre.1
+# OpenShell release the vendored protos are taken from: derived from
+# scripts/openshell-env.sh so the protos and test environment stay in sync.
+OPENSHELL_REF ?= $(shell sed -n 's/^OPENSHELL_SOURCE_REV="\(.*\)"/\1/p' scripts/openshell-env.sh)
+
+proto-sync: sync-proto
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:

@@ -41,11 +41,10 @@ const MAIN_PROCESS_SPEC_VERSION: u32 = 1;
 ///
 /// An empty command means the supervisor's default interactive shell — the
 /// same fallback upstream applies — because the supervisor rejects a spec
-/// whose command is empty. `await_main_process_attachment` (OpenShell
-/// v0.1.0-pre.1) tells the supervisor that the creating client will attach to
-/// the command, and is only passed with a requested command, as upstream's
-/// `MainProcessConfig::from_driver_spec` does; the v0.0.116 supervisor ignores
-/// the field.
+/// whose command is empty. `await_main_process_attachment` tells the
+/// supervisor that the creating client will attach to the command, and is
+/// only passed with a requested command, as upstream's
+/// `MainProcessConfig::from_driver_spec` does.
 pub fn main_process_spec(spec: &DriverSandboxSpec) -> String {
     let (command, tty, await_attachment) = if spec.command.is_empty() {
         (vec!["/bin/bash".to_string(), "-l".to_string()], true, false)
@@ -183,6 +182,8 @@ fn to_driver_sandbox(instance: &Instance, stop_seen: StopSeen) -> DriverSandbox 
             sandbox_fd: String::new(),
             conditions: vec![ready_condition(instance, stop_seen)],
             deleting: false,
+            resolved_identity: None,
+            fence_evidence: None,
         }),
     }
 }
@@ -196,10 +197,9 @@ pub(crate) const CONDITION_EXITED: &str = "ContainerExited";
 
 /// Ready-condition reason when the runtime stopped a sandbox that was running
 /// — LXD shutting down with the daemon or the host — rather than its init
-/// exiting. The gateway treats it as terminal like [`CONDITION_EXITED`]. From
-/// OpenShell v0.1.0-pre.1 it restarts sandboxes with this reason at startup,
-/// but only for drivers that report `gateway_manages_lifecycle`, which this
-/// driver does not.
+/// exiting. The gateway treats it as terminal like [`CONDITION_EXITED`]. It
+/// restarts sandboxes with this reason at startup, but only for drivers that
+/// report `gateway_manages_lifecycle`, which this driver does not.
 pub(crate) const CONDITION_RUNTIME_RESTART: &str = "ContainerRuntimeRestart";
 
 /// Ready-condition reason when a sandbox was stopped through the API, i.e. the
@@ -316,7 +316,7 @@ fn ready_condition(instance: &Instance, stop_seen: StopSeen) -> DriverCondition 
         status: status.to_string(),
         reason: reason.to_string(),
         message,
-        last_transition_time: String::new(),
+        transition_time: None,
     }
 }
 
@@ -1061,9 +1061,12 @@ mod tests {
         assert_eq!(status.sandbox_name, "sb-name");
         assert_eq!(status.instance_id, "sb-name");
         assert!(!status.deleting);
+        assert!(status.resolved_identity.is_none());
+        assert!(status.fence_evidence.is_none());
         assert_eq!(status.conditions.len(), 1);
         assert_eq!(status.conditions[0].r#type, "Ready");
         assert_eq!(status.conditions[0].status, "True");
+        assert!(status.conditions[0].transition_time.is_none());
     }
 
     #[test]

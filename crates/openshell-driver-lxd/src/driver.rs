@@ -236,6 +236,10 @@ impl LxdComputeDriver {
             // Sandboxes get their gateway token from the driver; there is no
             // platform credential for AuthenticateSandbox to verify.
             supports_sandbox_authentication: false,
+            driver_reports_runtime_readiness: false,
+            resource_capabilities: None,
+            rootfs_tar_staging_dir: String::new(),
+            rootfs_tar_max_bytes: 0,
         }
     }
 
@@ -1108,6 +1112,10 @@ mod tests {
             response.default_image,
             "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
         );
+        assert!(!response.driver_reports_runtime_readiness);
+        assert!(response.resource_capabilities.is_none());
+        assert_eq!(response.rootfs_tar_staging_dir, "");
+        assert_eq!(response.rootfs_tar_max_bytes, 0);
     }
 
     #[tokio::test]

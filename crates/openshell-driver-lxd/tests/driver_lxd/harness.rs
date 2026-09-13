@@ -573,6 +573,8 @@ impl Driver {
             .start_sandbox(Request::new(StartSandboxRequest {
                 sandbox_id: String::new(),
                 sandbox_name: name.to_string(),
+                launch_authentication: Vec::new(),
+                generation_id: String::new(),
             }))
             .await
             .map(|_| ())

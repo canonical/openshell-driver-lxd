@@ -21,8 +21,8 @@ parts:
   gateway:
     plugin: rust
     source: https://github.com/NVIDIA/OpenShell.git
-    source-commit: a72711697ddd0c81878f45922d5708bdbff8bb25
-    source-subdir: crates/openshell-server
+    source-commit: 7e7a8d5610f336f5f7f9f60da0951adbf295475d
+    source-subdir: crates/openshell-gateway
     build-packages:
       - pkg-config
       - libssl-dev
