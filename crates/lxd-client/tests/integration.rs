@@ -550,12 +550,10 @@ async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
     }
 }
 
-#[tokio::test]
-async fn create_image_from_split_streams_rootfs() {
-    let client = client();
-
-    // 1. Prepare minimal metadata.tar.xz
-    let temp_dir = tempfile::tempdir().unwrap();
+/// Builds a minimal split image (`metadata.tar.xz` bytes and a
+/// `rootfs.squashfs` path) in `dir`, or `None` if `xz` or `mksquashfs` is
+/// missing.
+async fn build_split_image(dir: &std::path::Path) -> Option<(Vec<u8>, PathBuf)> {
     let metadata_yaml = format!(
         "architecture: \"x86_64\"\ncreation_date: {}\nproperties:\n  description: \"test split image\"\n",
         SystemTime::now()
@@ -563,12 +561,12 @@ async fn create_image_from_split_streams_rootfs() {
             .unwrap_or_default()
             .as_secs()
     );
-    let meta_file_path = temp_dir.path().join("metadata.yaml");
+    let meta_file_path = dir.join("metadata.yaml");
     tokio::fs::write(&meta_file_path, metadata_yaml.as_bytes())
         .await
         .unwrap();
 
-    let meta_tar_path = temp_dir.path().join("metadata.tar");
+    let meta_tar_path = dir.join("metadata.tar");
     {
         let tar_file = std::fs::File::create(&meta_tar_path).unwrap();
         let mut builder = tar::Builder::new(tar_file);
@@ -578,31 +576,22 @@ async fn create_image_from_split_streams_rootfs() {
         builder.finish().unwrap();
     }
 
-    let xz_cmd = tokio::process::Command::new("xz")
+    let xz = tokio::process::Command::new("xz")
         .args(["-z", "-k", meta_tar_path.to_str().unwrap()])
         .output()
         .await;
+    if !matches!(&xz, Ok(output) if output.status.success()) {
+        return None;
+    }
+    let metadata_bytes = tokio::fs::read(dir.join("metadata.tar.xz")).await.unwrap();
 
-    let metadata_bytes = match xz_cmd {
-        Ok(output) if output.status.success() => {
-            let xz_path = temp_dir.path().join("metadata.tar.xz");
-            tokio::fs::read(&xz_path).await.unwrap()
-        }
-        _ => {
-            eprintln!("xz not available; skipping create_image_from_split_streams_rootfs");
-            return;
-        }
-    };
-
-    // 2. Prepare a small rootfs.squashfs using mksquashfs
-    let rootfs_dir = temp_dir.path().join("rootfs");
+    let rootfs_dir = dir.join("rootfs");
     tokio::fs::create_dir(&rootfs_dir).await.unwrap();
     tokio::fs::write(rootfs_dir.join("test.txt"), b"hello-split-image")
         .await
         .unwrap();
-    let squashfs_path = temp_dir.path().join("rootfs.squashfs");
-
-    let mksquash_output = tokio::process::Command::new("mksquashfs")
+    let squashfs_path = dir.join("rootfs.squashfs");
+    let mksquashfs = tokio::process::Command::new("mksquashfs")
         .args([
             rootfs_dir.to_str().unwrap(),
             squashfs_path.to_str().unwrap(),
@@ -610,13 +599,38 @@ async fn create_image_from_split_streams_rootfs() {
         ])
         .output()
         .await;
-
-    if mksquash_output.is_err() || !mksquash_output.unwrap().status.success() {
-        eprintln!("mksquashfs not available; skipping create_image_from_split_streams_rootfs");
-        return;
+    if !matches!(&mksquashfs, Ok(output) if output.status.success()) {
+        return None;
     }
 
-    // 3. Call create_image_from_split with path
+    Some((metadata_bytes, squashfs_path))
+}
+
+async fn fingerprint_of(client: &LxdClient, op_id: &str) -> String {
+    let finished_op = tokio::time::timeout(Duration::from_secs(60), client.wait_operation(op_id))
+        .await
+        .expect("image upload operation should not time out")
+        .expect("image upload operation should complete successfully");
+    finished_op
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("fingerprint"))
+        .and_then(|f| f.as_str())
+        .expect("operation response missing image fingerprint")
+        .to_string()
+}
+
+#[tokio::test]
+async fn create_image_from_split_streams_rootfs() {
+    let client = client();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let Some((metadata_bytes, squashfs_path)) = build_split_image(temp_dir.path()).await else {
+        eprintln!(
+            "xz or mksquashfs not available; skipping create_image_from_split_streams_rootfs"
+        );
+        return;
+    };
+
     let op = client
         .create_image_from_split(
             "metadata.tar.xz",
@@ -626,22 +640,134 @@ async fn create_image_from_split_streams_rootfs() {
         )
         .await
         .expect("create_image_from_split should succeed");
-
-    let finished_op = tokio::time::timeout(Duration::from_secs(60), client.wait_operation(&op.id))
-        .await
-        .expect("image upload operation should not time out")
-        .expect("image upload operation should complete successfully");
-
-    let fingerprint = finished_op
-        .metadata
-        .as_ref()
-        .and_then(|m| m.get("fingerprint"))
-        .and_then(|f| f.as_str())
-        .expect("operation response missing image fingerprint")
-        .to_string();
+    let fingerprint = fingerprint_of(&client, &op.id).await;
 
     // Clean up the created image in LXD
     if let Ok(del_op) = client.delete_image(&fingerprint).await {
         let _ = client.wait_operation(&del_op.id).await;
     }
+}
+
+/// Every request a project-scoped client makes lands in its project,
+/// including the raw uploads (storage volumes from a tarball, split images)
+/// and file reads that bypass the JSON request path. Without that, a driver
+/// running in a non-default project creates volumes and images in `default`
+/// and then waits for their operations in the wrong project.
+#[tokio::test]
+async fn raw_uploads_and_file_access_stay_in_the_client_project() {
+    let default_client = client();
+    let project = unique_name();
+    default_client
+        .create_project(&project)
+        .await
+        .expect("create_project should succeed");
+    let project_client = client().with_project(&project);
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // A volume uploaded as a tarball is created in the project.
+    let volume = format!("test-proj-vol-{}", unique_name());
+    let bin_path = temp_dir.path().join("openshell-sandbox");
+    tokio::fs::write(&bin_path, b"dummy-supervisor-binary")
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        project_client.ensure_supervisor_volume("default", &volume, &bin_path),
+    )
+    .await
+    .expect("volume upload in a project should not hang")
+    .expect("ensure_supervisor_volume in a project should succeed");
+    assert!(project_client
+        .storage_pool_volume_exists("default", "custom", &volume)
+        .await
+        .unwrap());
+    assert!(
+        !default_client
+            .storage_pool_volume_exists("default", "custom", &volume)
+            .await
+            .unwrap(),
+        "the volume must not be created in the default project"
+    );
+
+    // A split image upload lands in the project too, and an instance created
+    // from it there can have files pushed and read back.
+    let image_dir = temp_dir.path().join("image");
+    tokio::fs::create_dir(&image_dir).await.unwrap();
+    let mut fingerprint = None;
+    let mut instance = None;
+    if let Some((metadata_bytes, squashfs_path)) = build_split_image(&image_dir).await {
+        let op = project_client
+            .create_image_from_split(
+                "metadata.tar.xz",
+                &metadata_bytes,
+                "rootfs.squashfs",
+                &squashfs_path,
+            )
+            .await
+            .expect("create_image_from_split in a project should succeed");
+        let image = fingerprint_of(&project_client, &op.id).await;
+        fingerprint = Some(image.clone());
+
+        let alias = format!("test-proj-img-{}", unique_name());
+        project_client
+            .create_image_alias(&alias, &image, None)
+            .await
+            .expect("the uploaded image should exist in the project");
+        assert!(project_client.image_alias_exists(&alias).await.unwrap());
+
+        let name = unique_name();
+        let create_op = project_client
+            .create_instance(
+                &name,
+                &alias,
+                HashMap::new(),
+                sandbox_devices(),
+                vec![],
+                false,
+            )
+            .await
+            .expect("create_instance in a project should succeed");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            project_client.wait_operation(&create_op.id),
+        )
+        .await
+        .expect("create should not time out")
+        .expect("create should succeed");
+        instance = Some(name.clone());
+
+        project_client
+            .push_file_into_instance(&name, "/etc/openshell/auth/sandbox.jwt", b"token")
+            .await
+            .expect("pushing a file into a project instance should succeed");
+        let (content, mode) = project_client
+            .get_file_from_instance(&name, "/etc/openshell/auth/sandbox.jwt")
+            .await
+            .expect("reading a file from a project instance should succeed");
+        assert_eq!(&content[..], b"token");
+        assert_eq!(mode, 0o400);
+    } else {
+        eprintln!("xz or mksquashfs not available; skipping the image part");
+    }
+
+    if let Some(name) = instance {
+        if let Ok(op) = project_client.delete_instance(&name).await {
+            let _ = project_client.wait_operation(&op.id).await;
+        }
+    }
+    if let Some(fingerprint) = fingerprint {
+        if let Ok(op) = project_client.delete_image(&fingerprint).await {
+            let _ = project_client.wait_operation(&op.id).await;
+        }
+    }
+    if let Ok(op) = project_client
+        .delete_storage_pool_volume("default", "custom", &volume)
+        .await
+    {
+        let _ = project_client.wait_operation(&op.id).await;
+    }
+    default_client
+        .delete_project(&project)
+        .await
+        .expect("delete_project should succeed");
 }
