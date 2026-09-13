@@ -98,6 +98,12 @@ impl LxdComputeDriver {
             .await
     }
 
+    /// Clone of the LXD client, for the lifecycle watcher.
+    #[must_use]
+    pub fn lxd_client(&self) -> LxdClient {
+        self.lxd.clone()
+    }
+
     /// Report driver capabilities and defaults.
     #[must_use]
     pub fn capabilities(&self) -> GetCapabilitiesResponse {
