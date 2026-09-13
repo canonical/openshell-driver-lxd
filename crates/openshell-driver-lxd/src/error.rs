@@ -29,6 +29,14 @@ pub enum DriverError {
     /// driver's perspective.
     #[error("not found: {0}")]
     NotFound(String),
+
+    /// Image import or reference resolution failed.
+    #[error("image import failed: {0}")]
+    ImageImport(String),
+
+    /// DHCP client binary was not found or could not be read.
+    #[error("DHCP client error: {0}")]
+    DhcpClient(String),
 }
 
 impl From<DriverError> for Status {
@@ -60,6 +68,10 @@ impl From<DriverError> for Status {
                 Status::deadline_exceeded("timed out waiting for LXD operation to complete")
             }
             DriverError::NotFound(msg) => Status::not_found(msg),
+            DriverError::ImageImport(msg) => {
+                Status::internal(format!("image import failed: {msg}"))
+            }
+            DriverError::DhcpClient(msg) => Status::internal(format!("DHCP client error: {msg}")),
         }
     }
 }

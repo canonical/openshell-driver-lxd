@@ -208,6 +208,9 @@ pub struct Operation {
     /// Cluster member the operation is running on.
     #[serde(default)]
     pub location: String,
+    /// Additional metadata returned by the operation upon completion (e.g. image fingerprint).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 /// Lifecycle status of an [`Operation`], as reported by LXD's `status`

@@ -34,12 +34,13 @@ the `openshell` CLI driving them below.
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
 - [LXD](https://github.com/canonical/lxd), initialized with a `default` storage pool and an `lxdbr0` network
+- `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
+- `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
 ## Quickstart
 
-This walks through building the driver, publishing the sandbox image, and
-wiring both up to a real OpenShell gateway so you can create a sandbox
-end-to-end.
+This walks through building the driver and wiring it up to a real OpenShell
+gateway so you can create a sandbox end-to-end.
 
 1. **Install and initialize LXD**, if you haven't already:
 
@@ -48,27 +49,40 @@ end-to-end.
    lxd init --auto
    ```
 
-2. **Build and publish the sandbox container image** under the
-   `openshell-sandbox` alias (this drives `scripts/build-sandbox-image.sh`):
-
-   ```sh
-   make sandbox-image
-   ```
-
-3. **Build and run the driver:**
+2. **Build and run the driver:**
 
    ```sh
    make build
    ./target/debug/openshell-driver-lxd \
        --socket /tmp/openshell-driver.sock \
-       --default-image openshell-sandbox \
        --gateway-grpc-port 17670
    ```
+
+   No sandbox image needs to be pre-built or pre-loaded: the driver pulls the
+   default image (`--default-image`, the upstream community
+   `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`) from the
+   registry and imports it into LXD on first use, caching it by content
+   digest. Pass `--default-image <oci-ref>` to boot from a different image.
+
+   The supervisor binary comes from a *separate* image
+   (`--supervisor-image`, the upstream
+   `ghcr.io/nvidia/openshell/supervisor:latest`) and is mounted into every
+   sandbox from a storage volume. The two are deliberately distinct: the
+   supervisor image ships the binary on a minimal BusyBox rootfs and cannot
+   serve as a sandbox rootfs, because BusyBox's `ip` has no `netns`
+   subcommand and the supervisor's proxy mode needs it to isolate the
+   sandbox.
+
+   Importing an image needs scratch space for the OCI copy plus the unpacked
+   rootfs — several GiB for a real sandbox image. That scratch lives in
+   `--image-work-dir` (default `/var/cache/openshell/lxd-image-work`), which
+   deliberately defaults to a disk-backed path rather than `TMPDIR`/`/tmp`,
+   a memory-backed tmpfs on most modern distributions.
 
    `--gateway-grpc-port` must match the port the gateway is told to listen on
    below — the driver uses it to construct each sandbox's `OPENSHELL_ENDPOINT`.
 
-4. **Start an OpenShell gateway pointed at the driver's socket**, using the
+3. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. A plaintext gateway still enforces request
    authentication by default, so for local/dev use also pass a `--config`
    file disabling it:
@@ -95,7 +109,7 @@ end-to-end.
    shortcut — **not** for production use; see
    [Security limitations](#security-limitations).
 
-5. **Register the gateway with the CLI and create a sandbox:**
+4. **Register the gateway with the CLI and create a sandbox:**
 
    ```sh
    openshell gateway add http://127.0.0.1:17670 --local --name lxd-demo
@@ -120,9 +134,6 @@ end-to-end.
   default seccomp deny list (`kexec_load`, `open_by_handle_at`,
   `init_module`, `delete_module`), not a syscall allowlist scoped to what the
   supervisor actually needs.
-- **Every sandbox runs the same fixed base image**, regardless of
-  `template.image` in the request — per-template image selection isn't
-  consulted yet.
 - **`Ready=True` reflects LXD container status, not confirmed
   supervisor-to-gateway connectivity.** A sandbox can report `Ready=True` as
   soon as the LXD container reaches `Running`, before the supervisor inside
@@ -130,12 +141,84 @@ end-to-end.
   needs a guest-to-driver signal that containers don't provide; the fix lands
   with a planned microVM + `lxd-agent`-over-vsock transition, not before.
 
+## Images and Caching
+
+The driver supports per-sandbox OCI images specified via `template.image` in the
+gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
+`ghcr.io/org/custom-sandbox:v1`).
+
+- **Contract:** `template.image` specifies the Linux rootfs OCI image for the sandbox.
+  The driver automatically injects `/openshell-init.sh` and attaches the supervisor
+  (extracted from `--supervisor-image`), so the image does not need to bundle the supervisor.
+- **Digest-pinned resolution and caching:** On `create_sandbox`, the driver validates
+  the OCI reference and resolves the manifest digest for the host architecture
+  by reading the raw image index and selecting the matching `os`/`architecture`
+  entry, so two architectures of the same tag never share a cache entry. It maps
+  the digest to a local LXD image alias (e.g. `openshell-oci-<64-hex-sha256>`).
+  If the alias is already present in LXD, it is reused immediately.
+  If not cached, the driver pulls the image by digest using `skopeo`, unpacks it with
+  `umoci`, packs it into squashfs and metadata archives, and imports it via LXD's
+  split image REST API.
+- **Tag mutation:** Because the cache is keyed on content digest rather than tag,
+  if a tag points to a new digest, the driver will automatically pull and import the new
+  image on first use.
+- **Fallback:** If `template.image` is omitted or empty, the sandbox falls back to
+  `--default-image` (default: the upstream community `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`),
+  which is resolved and imported through the same on-demand path.
+- **Configuration flags:**
+  - `--supervisor-image`: OCI image reference to extract the OpenShell supervisor binary from (default: `ghcr.io/nvidia/openshell/supervisor:latest`).
+  - `--supervisor-bin`: optional path to a pre-extracted supervisor binary on the host (bypasses extraction).
+  - `--supervisor-cache-dir`: host directory for caching extracted supervisor binaries by content digest (default: `/var/cache/openshell/lxd-supervisor`).
+  - `--supervisor-storage-pool`: LXD storage pool for the supervisor and DHCP-client volumes. When unset, each sandbox's own pool (`driver_config.storage_pool`, itself defaulting to `default`) is used, so the auxiliary volumes always land beside the rootfs they attach to. Set it to pin every auxiliary volume to one pool.
+  - `--dhcp-client-bin`: optional path to a DHCP client binary on the host (defaults to searching PATH and standard locations for `udhcpc` or `busybox`).
+  - `--image-work-dir`: host scratch directory for image conversion (default: `/var/cache/openshell/lxd-image-work`). Must not be a small tmpfs such as `/tmp`.
+  - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
+  - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
+  - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
+
+### Supervisor Binary Delivery via Custom Storage Volume
+
+Upstream Docker and Podman drivers extract the supervisor binary (`/openshell-sandbox`) to a host cache and bind-mount it into sandboxes. For LXD, a host-path bind mount fails in clustered or distributed storage environments (e.g. Ceph) where containers may run on cluster nodes different from the driver host.
+
+`openshell-driver-lxd` instead packages the supervisor binary into a digest-keyed LXD custom storage volume (`openshell-supervisor-<digest>`) on the sandbox's own storage pool (or `--supervisor-storage-pool` when pinned), following the pattern established in `canonical/workshop` (`lxd_backend_sdk.go`):
+- **Volume layout & Mount distinction:** A `content-type: filesystem` storage volume is a filesystem tree. The volume contains `openshell-sandbox` at its root and is attached to each sandbox container as a read-only `disk` device mounted at directory `/opt/openshell/bin`. The injected guest init script (`/openshell-init.sh`) execs the binary at `/opt/openshell/bin/openshell-sandbox`.
+- **Clustered LXD safety:** Because the disk device refers to a named storage-pool volume rather than a local host path, LXD manages replication and cluster-wide attachment automatically.
+- **Idempotency & Race safety:** Volume creation is serialized in-process per pool and digest, and handles existing volume conflicts idempotently. Subsequent sandboxes reusing the same supervisor binary digest share the volume.
+
+### Fallback DHCP Client Delivery
+
+Guest networking on LXD containers relies on DHCP over `eth0`. Some base sandbox images (such as `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`) do not bundle any DHCP client.
+
+To guarantee sandboxes obtain an IP lease regardless of what packages are installed in the guest image:
+- The driver takes a static DHCP client (`udhcpc` or `busybox`) from the host environment (or `--dhcp-client-bin`) alongside the embedded event script (`udhcpc.script`).
+- On sandbox creation, a digest-keyed custom storage volume (`openshell-dhcp-client-<digest>`) is provisioned on the storage pool and mounted read-only at `/opt/openshell/net`.
+- In `/openshell-init.sh`, the init script probes for existing image-provided DHCP clients (`udhcpc`, `dhclient`, `dhcpcd`). If none are present on `PATH`, it runs the fallback client (`/opt/openshell/net/udhcpc`) with `/opt/openshell/net/udhcpc.script` in the background to acquire and apply the network lease.
+
+## Sandbox State Reporting
+
+The `Ready` condition's `reason` uses the cross-driver vocabulary upstream
+defines in `openshell-core::driver_utils`, because the gateway keys real
+behaviour off these exact strings — which reasons are transient (mapping to
+`Provisioning` rather than `Error`) and which are eligible for recovery when
+the gateway restarts:
+
+| LXD state | reason | gateway phase |
+| --- | --- | --- |
+| `Running` / `Ready` | — (`Ready=True`) | `Ready` |
+| `Stopped`, init exited by itself | `ContainerExited` | `Error` (terminal) |
+| `Stopped`, stop requested | `ContainerStopped` | `Stopped` |
+| `Stopped`, never started | `ContainerCreated` | `Provisioning` |
+| `Starting` | `ContainerStarting` | `Provisioning` |
+| `Frozen` | `ContainerPaused` | `Error` |
+
+LXD reports the same `Stopped` status however an instance went down, so the
+driver records `user.openshell.stop_intent` on the instance when it is asked
+to stop one. Without it a user-requested stop is indistinguishable from a
+crash and surfaces as `Error` instead of `Stopped`.
+
 ## Known limitations
 
 - GPU requests attach every host GPU; an exact requested `count` isn't honored.
-- No image auto-import — `make sandbox-image` (or an equivalent manual
-  import) is a prerequisite; the driver only fails fast if the alias is
-  missing at startup, it doesn't build or fetch one.
 - `lxd-client` opens a fresh connection per request; no connection pooling.
 - No MicroCloud / multi-node cluster scheduling — single LXD daemon only.
 - Not yet packaged as a snap for production distribution (see [Snap](#snap)
