@@ -30,6 +30,34 @@ pub(crate) const GUEST_SANDBOX_TOKEN_PATH: &str = "/etc/openshell/auth/sandbox.j
 /// SSH relay listener. The supervisor reads it via `OPENSHELL_SSH_SOCKET_PATH`.
 pub(crate) const GUEST_SSH_SOCKET_PATH: &str = "/run/openshell/ssh.sock";
 
+/// Environment variable carrying the sandbox's canonical main process to the
+/// supervisor (OpenShell v0.0.116 `openshell-core::sandbox_env::MAIN_PROCESS_SPEC`).
+pub(crate) const ENV_MAIN_PROCESS_SPEC: &str = "OPENSHELL_MAIN_PROCESS_SPEC";
+
+/// Version of the [`ENV_MAIN_PROCESS_SPEC`] encoding the supervisor accepts.
+const MAIN_PROCESS_SPEC_VERSION: u32 = 1;
+
+/// Encodes the sandbox's main process for [`ENV_MAIN_PROCESS_SPEC`]:
+/// `{"version":1,"command":[...],"tty":bool}`, the JSON form upstream's
+/// `MainProcessConfig` decodes.
+///
+/// An empty command means the supervisor's default interactive shell — the
+/// same fallback upstream applies — because the supervisor rejects a spec
+/// whose command is empty.
+pub fn main_process_spec(spec: &DriverSandboxSpec) -> String {
+    let (command, tty) = if spec.command.is_empty() {
+        (vec!["/bin/bash".to_string(), "-l".to_string()], true)
+    } else {
+        (spec.command.clone(), spec.tty)
+    };
+    serde_json::json!({
+        "version": MAIN_PROCESS_SPEC_VERSION,
+        "command": command,
+        "tty": tty,
+    })
+    .to_string()
+}
+
 /// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
 pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
 
@@ -220,9 +248,9 @@ fn lxc_target(instance: &Instance) -> String {
 
 /// Builds the LXD instance `config` map for `POST /1.0/instances`.
 ///
-/// Sets `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SANDBOX`, and
-/// `OPENSHELL_SSH_SOCKET_PATH` (pointing to [`GUEST_SSH_SOCKET_PATH`])
-/// unconditionally.
+/// Sets `OPENSHELL_SANDBOX_ID`, `OPENSHELL_SANDBOX`,
+/// `OPENSHELL_SSH_SOCKET_PATH` (pointing to [`GUEST_SSH_SOCKET_PATH`]) and
+/// [`ENV_MAIN_PROCESS_SPEC`] unconditionally.
 ///
 /// `gateway_endpoint` is the resolved `OPENSHELL_ENDPOINT` value
 /// (`http://<host-ip>:<gateway-grpc-port>`). When empty the env var is not
@@ -271,6 +299,12 @@ pub fn build_create_config(
     config.insert(
         format!("{ENV_PREFIX}OPENSHELL_SSH_SOCKET_PATH"),
         GUEST_SSH_SOCKET_PATH.to_string(),
+    );
+    // Without this the supervisor runs its default shell instead of the
+    // command the sandbox was created with.
+    config.insert(
+        format!("{ENV_PREFIX}{ENV_MAIN_PROCESS_SPEC}"),
+        main_process_spec(spec),
     );
     if !gateway_endpoint.is_empty() {
         config.insert(
@@ -964,6 +998,93 @@ mod tests {
                 "{key}"
             );
         }
+    }
+
+    fn decoded_main_process(config: &HashMap<String, String>) -> serde_json::Value {
+        let encoded = config
+            .get(&format!("environment.{ENV_MAIN_PROCESS_SPEC}"))
+            .expect("main process spec is always set");
+        serde_json::from_str(encoded).expect("main process spec is JSON")
+    }
+
+    #[test]
+    fn requested_command_is_delivered_as_the_main_process_spec() {
+        let spec = DriverSandboxSpec {
+            command: vec![
+                "sh".to_string(),
+                "-lc".to_string(),
+                "printf '%s\\n' \"quoted $VAR\" > /sandbox/out; echo ünïcode".to_string(),
+            ],
+            tty: false,
+            ..Default::default()
+        };
+
+        let config = build_create_config(
+            &identified_sandbox(),
+            &spec,
+            &DriverSandboxTemplate::default(),
+            "",
+            false,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded_main_process(&config),
+            serde_json::json!({
+                "version": 1,
+                "command": spec.command,
+                "tty": false,
+            })
+        );
+    }
+
+    /// Upstream's supervisor rejects an empty command, and falls back to an
+    /// interactive login shell when no spec is given; match that.
+    #[test]
+    fn empty_command_is_the_default_login_shell() {
+        let config = build_create_config(
+            &identified_sandbox(),
+            &DriverSandboxSpec::default(),
+            &DriverSandboxTemplate::default(),
+            "",
+            false,
+            0,
+        )
+        .unwrap();
+
+        assert_eq!(
+            decoded_main_process(&config),
+            serde_json::json!({
+                "version": 1,
+                "command": ["/bin/bash", "-l"],
+                "tty": true,
+            })
+        );
+    }
+
+    #[test]
+    fn request_environment_cannot_replace_the_main_process() {
+        let spec = DriverSandboxSpec {
+            command: vec!["true".to_string()],
+            environment: env(&[(
+                ENV_MAIN_PROCESS_SPEC,
+                "{\"version\":1,\"command\":[\"evil\"]}",
+            )]),
+            ..Default::default()
+        };
+        let template = DriverSandboxTemplate {
+            environment: env(&[(ENV_MAIN_PROCESS_SPEC, "{}")]),
+            ..Default::default()
+        };
+
+        let config =
+            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0).unwrap();
+
+        assert_eq!(
+            decoded_main_process(&config)["command"],
+            serde_json::json!(["true"])
+        );
     }
 
     #[test]
