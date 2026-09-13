@@ -452,6 +452,11 @@ impl LxdComputeDriver {
             if !instance.status.eq_ignore_ascii_case("Stopped") {
                 return Ok(());
             }
+            // Stopped because it was asked to be, while this start settled:
+            // restarting it would undo that stop.
+            if instance.config.contains_key(mapping::KEY_STOP_INTENT) {
+                return Ok(());
+            }
 
             tracing::warn!(
                 name = %name,
