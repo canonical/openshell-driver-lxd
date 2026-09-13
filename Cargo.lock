@@ -960,6 +960,7 @@ dependencies = [
  "computev1",
  "futures",
  "hyper-util",
+ "libc",
  "lxd-client",
  "prost-types",
  "regex",

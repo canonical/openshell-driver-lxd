@@ -163,6 +163,65 @@ async fn imports_are_cached_by_digest() {
     assert_eq!(driver.log().matches("image cache miss").count(), 1);
 }
 
+/// A converted image keeps the file ownership its layers specify. The
+/// supervisor runs the workload as the image's `sandbox` user, which must own
+/// and be able to write its workdir — as it would under Docker.
+#[tokio::test]
+async fn converted_image_keeps_file_ownership() {
+    let driver = Driver::start().await;
+    let name = unique_name("owner");
+    let _cleanup = driver.cleanup(&[&name]);
+    driver.create_running(&name).await;
+
+    let exec = |script: &str| {
+        let output = lxc_output(&["exec", &name, "--", "sh", "-c", script]);
+        assert!(
+            output.status.success(),
+            "{script}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+
+    let sandbox_ids = exec("echo $(id -u sandbox):$(id -g sandbox)");
+    assert_ne!(
+        sandbox_ids, "0:0",
+        "the base image defines a non-root sandbox user"
+    );
+    assert_eq!(
+        exec("stat -c %u:%g /sandbox"),
+        sandbox_ids,
+        "/sandbox owner"
+    );
+    assert_eq!(
+        exec("stat -c %u:%g /sandbox/.bashrc"),
+        sandbox_ids,
+        "files the image gives the sandbox user"
+    );
+    assert_eq!(
+        exec("stat -c %u:%g /etc/passwd"),
+        "0:0",
+        "system files stay root's"
+    );
+
+    let uid = sandbox_ids.split(':').next().unwrap();
+    let output = lxc_output(&[
+        "exec",
+        &name,
+        "--user",
+        uid,
+        "--",
+        "sh",
+        "-c",
+        "echo ok > /sandbox/.written",
+    ]);
+    assert!(
+        output.status.success(),
+        "the sandbox user cannot write its workdir: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// A reference pinned by both tag and digest imports: skopeo rejects that
 /// form, so the driver must resolve it by digest alone.
 #[tokio::test]

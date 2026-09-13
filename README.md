@@ -165,7 +165,7 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   the OCI reference and resolves the manifest digest for the host architecture
   by reading the raw image index and selecting the matching `os`/`architecture`
   entry, so two architectures of the same tag never share a cache entry. It maps
-  the digest to a local LXD image alias (e.g. `openshell-oci-<64-hex-sha256>`).
+  the digest to a local LXD image alias (e.g. `openshell-oci-r2-<64-hex-sha256>`, where `r2` is the conversion revision: a driver that converts images differently imports them again instead of reusing old conversions).
   If the alias is already present in LXD, it is reused immediately.
   If not cached, the driver pulls the image by digest using `skopeo`, unpacks it with
   `umoci`, packs it into squashfs and metadata archives, and imports it via LXD's

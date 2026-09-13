@@ -63,10 +63,18 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// Revision of the OCI-to-LXD conversion, part of every cache alias.
+///
+/// Bump it whenever the conversion produces a different image for the same
+/// OCI digest, so images converted the old way are imported again instead of
+/// being reused. Revision 2 keeps the image's file ownership.
+pub const CONVERSION_REVISION: u32 = 2;
+
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
-/// Strips any `sha256:` prefix and returns `<prefix><full 64 hex chars>`.
-/// Does not truncate the digest, ensuring distinct digests never collide.
+/// Strips any `sha256:` prefix and returns
+/// `<prefix>r<conversion revision>-<full 64 hex chars>`. Does not truncate the
+/// digest, ensuring distinct digests never collide.
 pub fn cache_alias(digest: &str) -> String {
     cache_alias_with_prefix(DEFAULT_CACHE_ALIAS_PREFIX, digest)
 }
@@ -74,7 +82,178 @@ pub fn cache_alias(digest: &str) -> String {
 /// Returns the cache alias using a custom prefix.
 pub fn cache_alias_with_prefix(prefix: &str, digest: &str) -> String {
     let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
-    format!("{prefix}{clean}")
+    format!("{prefix}r{CONVERSION_REVISION}-{clean}")
+}
+
+/// Extended attribute in which `umoci unpack --rootless` records each file's
+/// owner from the image layers, because it does not chown — neither as an
+/// unprivileged user nor as root.
+const ROOTLESS_OWNER_XATTR: &str = "user.rootlesscontainers";
+
+/// umoci's "unchanged" id in [`ROOTLESS_OWNER_XATTR`]: the file keeps the
+/// unpacking user's id, which stands for root.
+const ROOTLESS_NOOP_ID: u32 = u32::MAX;
+
+/// Decodes a [`ROOTLESS_OWNER_XATTR`] value, the rootlesscontainers protobuf
+/// `Resource { uint32 uid = 1; uint32 gid = 2; }`, into `(uid, gid)`.
+///
+/// A missing field and the no-op id both mean root.
+pub(crate) fn decode_rootless_owner(bytes: &[u8]) -> Option<(u32, u32)> {
+    let mut uid = 0;
+    let mut gid = 0;
+    let mut rest = bytes;
+    while let Some((&key, tail)) = rest.split_first() {
+        // Only varint fields are expected (wire type 0).
+        if key & 0x7 != 0 {
+            return None;
+        }
+        let mut value: u64 = 0;
+        let mut shift = 0;
+        let mut consumed = 0;
+        for &byte in tail {
+            consumed += 1;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift > 35 {
+                return None;
+            }
+        }
+        if consumed == 0 || tail[consumed - 1] & 0x80 != 0 {
+            return None;
+        }
+        let id = u32::try_from(value).ok()?;
+        let id = if id == ROOTLESS_NOOP_ID { 0 } else { id };
+        match key >> 3 {
+            1 => uid = id,
+            2 => gid = id,
+            _ => {}
+        }
+        rest = &tail[consumed..];
+    }
+    Some((uid, gid))
+}
+
+/// Reads [`ROOTLESS_OWNER_XATTR`] from `path` without following symlinks.
+#[cfg(target_os = "linux")]
+fn read_rootless_owner(path: &Path) -> std::io::Result<Option<(u32, u32)>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let c_name = CString::new(ROOTLESS_OWNER_XATTR).expect("static name has no NUL");
+    let mut buf = [0u8; 64];
+    // SAFETY: both strings are NUL-terminated and outlive the call, and the
+    // buffer length passed is the buffer's real length.
+    let len = unsafe {
+        libc::lgetxattr(
+            c_path.as_ptr(),
+            c_name.as_ptr(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if len < 0 {
+        let err = std::io::Error::last_os_error();
+        return match err.raw_os_error() {
+            // No record (a root-owned file) or no xattr support (a symlink).
+            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
+            _ => Err(err),
+        };
+    }
+    let len = usize::try_from(len).expect("non-negative length");
+    decode_rootless_owner(&buf[..len]).map(Some).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("malformed {ROOTLESS_OWNER_XATTR} on {}", path.display()),
+        )
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_rootless_owner(_path: &Path) -> std::io::Result<Option<(u32, u32)>> {
+    Ok(None)
+}
+
+/// Quotes a rootfs-relative path for a mksquashfs pseudo definition.
+fn pseudo_quote(path: &[u8]) -> Vec<u8> {
+    let mut quoted = Vec::with_capacity(path.len() + 2);
+    quoted.push(b'"');
+    for &byte in path {
+        if byte == b'"' || byte == b'\\' {
+            quoted.push(b'\\');
+        }
+        quoted.push(byte);
+    }
+    quoted.push(b'"');
+    quoted
+}
+
+/// Writes a mksquashfs pseudo file that gives every entry under `rootfs` the
+/// owner the image layers specify.
+///
+/// `umoci unpack --rootless` leaves every file owned by the unpacking user and
+/// records the real owner in [`ROOTLESS_OWNER_XATTR`]. Without restoring it,
+/// every file in the sandbox would belong to root (or to whoever ran the
+/// driver), and the sandbox user could not write to its own workdir. Each
+/// entry gets an `m` (modify) definition with its current mode and its
+/// recorded owner, root when there is no record. Returns the number of
+/// entries.
+pub(crate) fn write_ownership_pseudo_file(
+    rootfs: &Path,
+    pseudo_file: &Path,
+) -> Result<usize, DriverError> {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let io_err = |what: &str, path: &Path, e: std::io::Error| {
+        DriverError::ImageImport(format!("{what} {}: {e}", path.display()))
+    };
+    let file = std::fs::File::create(pseudo_file)
+        .map_err(|e| io_err("failed to create pseudo file", pseudo_file, e))?;
+    let mut out = std::io::BufWriter::new(file);
+    let mut count = 0;
+    let mut pending = vec![rootfs.to_path_buf()];
+
+    while let Some(dir) = pending.pop() {
+        let entries =
+            std::fs::read_dir(&dir).map_err(|e| io_err("failed to read directory", &dir, e))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| io_err("failed to read directory", &dir, e))?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|e| io_err("failed to stat", &path, e))?;
+            if metadata.is_dir() {
+                pending.push(path.clone());
+            }
+
+            let relative = path.strip_prefix(rootfs).expect("walk stays inside rootfs");
+            let relative = relative.as_os_str().as_bytes();
+            if relative.contains(&b'\n') {
+                // The pseudo file format cannot name it; it keeps the
+                // unpacking user as owner.
+                tracing::warn!(path = %path.display(), "cannot restore owner of a path containing a newline");
+                continue;
+            }
+            let (uid, gid) = read_rootless_owner(&path)
+                .map_err(|e| io_err("failed to read owner of", &path, e))?
+                .unwrap_or((0, 0));
+            let mode = metadata.mode() & 0o7777;
+
+            out.write_all(&pseudo_quote(relative))
+                .and_then(|()| writeln!(out, " m {mode:o} {uid} {gid}"))
+                .map_err(|e| io_err("failed to write pseudo file", pseudo_file, e))?;
+            count += 1;
+        }
+    }
+
+    out.flush()
+        .map_err(|e| io_err("failed to write pseudo file", pseudo_file, e))?;
+    Ok(count)
 }
 
 /// Returns `reference` with any leading `docker://` scheme and any trailing
@@ -497,12 +676,33 @@ impl OciImporter for SkopeoImporter {
         // Inject the minimal init script before repacking with mksquashfs.
         inject_init_script(&rootfs_dest)?;
 
-        // 3. mksquashfs <rootfs_dest> <squashfs_path> -noappend
+        // Restore the owners the image specifies, which the rootless unpack
+        // only recorded in xattrs.
+        let pseudo_path = temp_path.join("ownership.pseudo");
+        let entries = {
+            let rootfs = rootfs_dest.clone();
+            let pseudo = pseudo_path.clone();
+            tokio::task::spawn_blocking(move || write_ownership_pseudo_file(&rootfs, &pseudo))
+                .await
+                .map_err(|e| DriverError::ImageImport(format!("ownership scan panicked: {e}")))??
+        };
+        tracing::debug!(alias = %alias, entries, "restoring image file ownership");
+
+        // 3. mksquashfs <rootfs_dest> <squashfs_path>, with the image's
+        //    ownership applied and umoci's bookkeeping xattr left out.
         let cmd = tokio::process::Command::new(&self.mksquashfs_path)
             .args([
                 rootfs_dest.as_os_str(),
                 squashfs_path.as_os_str(),
                 std::ffi::OsStr::new("-noappend"),
+                std::ffi::OsStr::new("-root-uid"),
+                std::ffi::OsStr::new("0"),
+                std::ffi::OsStr::new("-root-gid"),
+                std::ffi::OsStr::new("0"),
+                std::ffi::OsStr::new("-pf"),
+                pseudo_path.as_os_str(),
+                std::ffi::OsStr::new("-xattrs-exclude"),
+                std::ffi::OsStr::new("^user\\.rootlesscontainers$"),
             ])
             .kill_on_drop(true)
             .output();
@@ -792,8 +992,107 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r2-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r2-".len() + 64);
+    }
+
+    /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
+    #[test]
+    fn rootless_owner_records_decode() {
+        // uid 998, gid 998
+        assert_eq!(
+            decode_rootless_owner(&[0x08, 0xe6, 0x07, 0x10, 0xe6, 0x07]),
+            Some((998, 998))
+        );
+        // uid unchanged (root), gid 42
+        assert_eq!(
+            decode_rootless_owner(&[0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x10, 0x2a]),
+            Some((0, 42))
+        );
+        assert_eq!(decode_rootless_owner(&[]), Some((0, 0)));
+        // Truncated varint and a non-varint field are rejected.
+        assert_eq!(decode_rootless_owner(&[0x08, 0xe6]), None);
+        assert_eq!(decode_rootless_owner(&[0x0a, 0x01]), None);
+    }
+
+    #[test]
+    fn pseudo_paths_are_quoted() {
+        assert_eq!(pseudo_quote(b"etc/passwd"), b"\"etc/passwd\"".to_vec());
+        assert_eq!(
+            pseudo_quote(br#"dir with space/fi"le\x"#),
+            br#""dir with space/fi\"le\\x""#.to_vec()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn set_rootless_owner(path: &Path, value: &[u8]) -> bool {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let c_name = CString::new(ROOTLESS_OWNER_XATTR).unwrap();
+        // SAFETY: NUL-terminated strings and a correctly sized value.
+        unsafe {
+            libc::lsetxattr(
+                c_path.as_ptr(),
+                c_name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            ) == 0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ownership_pseudo_file_restores_recorded_owners() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let rootfs = temp.path().join("rootfs");
+        std::fs::create_dir_all(rootfs.join("sandbox")).unwrap();
+        std::fs::write(rootfs.join("sandbox/.bashrc"), b"x").unwrap();
+        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
+        std::fs::write(rootfs.join("usr/bin/sudo"), b"x").unwrap();
+        for (path, mode) in [
+            ("sandbox", 0o755),
+            ("sandbox/.bashrc", 0o644),
+            ("usr", 0o755),
+            ("usr/bin", 0o755),
+            ("usr/bin/sudo", 0o4755),
+        ] {
+            std::fs::set_permissions(rootfs.join(path), std::fs::Permissions::from_mode(mode))
+                .unwrap();
+        }
+        std::os::unix::fs::symlink("sandbox/.bashrc", rootfs.join("link")).unwrap();
+
+        let owner_998 = [0x08, 0xe6, 0x07, 0x10, 0xe6, 0x07];
+        if !set_rootless_owner(&rootfs.join("sandbox"), &owner_998) {
+            eprintln!("user xattrs unsupported here; skipping");
+            return;
+        }
+        assert!(set_rootless_owner(
+            &rootfs.join("sandbox/.bashrc"),
+            &owner_998
+        ));
+
+        let pseudo = temp.path().join("ownership.pseudo");
+        let count = write_ownership_pseudo_file(&rootfs, &pseudo).unwrap();
+        let contents = std::fs::read_to_string(&pseudo).unwrap();
+        let mut lines: Vec<&str> = contents.lines().collect();
+        lines.sort_unstable();
+
+        assert_eq!(count, 6, "{contents}");
+        assert_eq!(
+            lines,
+            vec![
+                "\"link\" m 777 0 0",
+                "\"sandbox\" m 755 998 998",
+                "\"sandbox/.bashrc\" m 644 998 998",
+                "\"usr\" m 755 0 0",
+                "\"usr/bin\" m 755 0 0",
+                "\"usr/bin/sudo\" m 4755 0 0",
+            ]
+        );
     }
 
     #[test]
@@ -1051,7 +1350,7 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-{digest_hex}");
+        let expected_alias = format!("test-oci-r2-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer

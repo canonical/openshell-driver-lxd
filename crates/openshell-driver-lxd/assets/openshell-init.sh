@@ -21,12 +21,18 @@ ip link set lo up 2>/dev/null || true
 ip link set eth0 up 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 2. Create /sandbox and set ownership to the sandbox user (UID/GID 10001,
-#    matching upstream's convention).
+# 2. Make sure /sandbox exists. An image that ships it keeps its own
+#    ownership: the supervisor runs the workload as the image's sandbox user,
+#    whose uid differs between images. One that lacks it gets it owned by that
+#    user, when the image defines one.
 # ---------------------------------------------------------------------------
-mkdir -p /sandbox
-chown 10001:10001 /sandbox 2>/dev/null || true
-chmod 0755 /sandbox
+if [ ! -d /sandbox ]; then
+    mkdir -p /sandbox
+    chmod 0755 /sandbox
+    if _sandbox_uid=$(id -u sandbox 2>/dev/null) && _sandbox_gid=$(id -g sandbox 2>/dev/null); then
+        chown "${_sandbox_uid}:${_sandbox_gid}" /sandbox 2>/dev/null || true
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # 3. Fix /etc/resolv.conf.
