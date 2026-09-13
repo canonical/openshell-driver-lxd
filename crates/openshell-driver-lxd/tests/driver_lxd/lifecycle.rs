@@ -502,10 +502,9 @@ async fn init_that_keeps_exiting_is_reported_exited() {
     assert_eq!(cond.reason, "ContainerExited");
 }
 
-/// A sandbox that died should say why: the gateway shows the condition
-/// message to the user, and today it is empty ("ContainerExited:").
+/// A sandbox that died says why and where to look: the gateway shows the
+/// condition message to the user next to the reason.
 #[tokio::test]
-#[ignore = "known gap: an exited sandbox's Ready condition has no message"]
 async fn exited_sandbox_explains_why() {
     let driver = Driver::start().await;
     let name = unique_name("why");
@@ -520,5 +519,12 @@ async fn exited_sandbox_explains_why() {
         (cond.status == "False").then_some(cond)
     })
     .await;
-    assert!(!cond.message.is_empty(), "{cond:?}");
+    assert!(
+        cond.message
+            .contains(&format!("lxc console {name} --show-log")),
+        "{cond:?}"
+    );
+    assert!(driver
+        .console_log(&name)
+        .contains("odl-standin: exiting on start with 3"));
 }

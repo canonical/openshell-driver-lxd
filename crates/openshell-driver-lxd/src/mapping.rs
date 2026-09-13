@@ -133,39 +133,88 @@ const KEY_LAST_POWER: &str = "volatile.last_state.power";
 /// Maps an instance's observed state to the `Ready` condition.
 ///
 /// The reason strings mirror the cross-driver vocabulary in upstream's
-/// `openshell-core::driver_utils` (`ContainerExited`, `ContainerStopped`,
-/// `ContainerStarting`, `ContainerCreated`, `ContainerPaused`). This driver is
-/// out-of-tree and cannot import that crate, but the gateway keys real
-/// behaviour off these exact strings — which of them are transient (→
-/// `Provisioning` rather than `Error`) and which are eligible for recovery at
-/// gateway startup — so they must match upstream verbatim.
+/// `openshell-core::driver_utils` (`ContainerExited`, `ContainerStopped`) and
+/// the Podman and Docker drivers (`ContainerStarting`, `ContainerCreated`,
+/// `ContainerPaused`). This driver is out-of-tree and cannot import those,
+/// but the gateway keys real behaviour off these exact strings — which of
+/// them are transient (→ `Provisioning` rather than `Error`) and which are
+/// eligible for recovery at gateway startup — so they must match upstream
+/// verbatim.
+///
+/// The message is what the gateway shows the user next to the reason, so a
+/// sandbox that is not ready always says why, and where to look.
 fn ready_condition(instance: &Instance) -> DriverCondition {
-    let (status, reason) = match instance.status.as_str() {
+    let (status, reason, message) = match instance.status.as_str() {
         // A guest that signalled readiness over devlxd reports `Ready`; treat
         // it as running rather than falling through to `Unknown`.
-        "Running" | "Ready" => ("True", ""),
+        "Running" | "Ready" => ("True", "", String::new()),
         "Stopped" => {
             if !instance.config.contains_key(KEY_LAST_POWER) {
                 // Created but never started: still provisioning, not a failure.
-                ("False", CONDITION_CREATED)
+                (
+                    "False",
+                    CONDITION_CREATED,
+                    "sandbox instance is created but has not started yet".to_string(),
+                )
             } else if instance.config.contains_key(KEY_STOP_INTENT) {
-                ("False", CONDITION_STOPPED)
+                (
+                    "False",
+                    CONDITION_STOPPED,
+                    "sandbox instance was stopped on request".to_string(),
+                )
             } else {
-                ("False", CONDITION_EXITED)
+                (
+                    "False",
+                    CONDITION_EXITED,
+                    format!(
+                        "sandbox supervisor exited and the instance stopped; its output is in \
+                         `lxc console {} --show-log`",
+                        lxc_target(instance)
+                    ),
+                )
             }
         }
-        "Starting" => ("False", CONDITION_STARTING),
-        "Frozen" => ("False", CONDITION_PAUSED),
-        "Error" => ("False", "Error"),
+        "Starting" => (
+            "False",
+            CONDITION_STARTING,
+            "sandbox instance is starting".to_string(),
+        ),
+        "Frozen" => (
+            "False",
+            CONDITION_PAUSED,
+            "sandbox instance is frozen".to_string(),
+        ),
+        "Error" => (
+            "False",
+            "Error",
+            format!(
+                "LXD reports the sandbox instance in an error state; see `lxc info {} --show-log`",
+                lxc_target(instance)
+            ),
+        ),
         // "Unknown" status (not "False") → gateway maps to Provisioning, not Error.
-        _ => ("Unknown", "Unknown"),
+        other => (
+            "Unknown",
+            "Unknown",
+            format!("LXD reports unrecognized instance status {other:?}"),
+        ),
     };
     DriverCondition {
         r#type: "Ready".to_string(),
         status: status.to_string(),
         reason: reason.to_string(),
-        message: String::new(),
+        message,
         last_transition_time: String::new(),
+    }
+}
+
+/// How to name `instance` on an `lxc` command line: its name, plus
+/// `--project` outside the default project.
+fn lxc_target(instance: &Instance) -> String {
+    if instance.project.is_empty() || instance.project == lxd_client::DEFAULT_PROJECT {
+        instance.name.clone()
+    } else {
+        format!("{} --project {}", instance.name, instance.project)
     }
 }
 
@@ -607,6 +656,55 @@ mod tests {
         let cond = ready_condition(&instance_with("Frozen", &[]));
         assert_eq!(cond.status, "False");
         assert_eq!(cond.reason, CONDITION_PAUSED);
+    }
+
+    /// The gateway shows the message next to the reason; an empty one leaves
+    /// the user with `ContainerExited:` and nothing to go on.
+    #[test]
+    fn every_not_ready_state_explains_itself() {
+        let ran = ("volatile.last_state.power", "STOPPED");
+        for instance in [
+            instance_with("Stopped", &[]),
+            instance_with("Stopped", &[ran]),
+            instance_with("Stopped", &[ran, (KEY_STOP_INTENT, CONDITION_STOPPED)]),
+            instance_with("Starting", &[]),
+            instance_with("Frozen", &[]),
+            instance_with("Error", &[]),
+            instance_with("Weird", &[]),
+        ] {
+            let cond = ready_condition(&instance);
+            assert!(
+                !cond.message.is_empty(),
+                "{} {:?} has no message",
+                instance.status,
+                instance.config
+            );
+        }
+        assert_eq!(ready_condition(&instance_with("Running", &[])).message, "");
+    }
+
+    #[test]
+    fn exited_message_points_at_the_console_log() {
+        let ran = ("volatile.last_state.power", "STOPPED");
+
+        let cond = ready_condition(&instance_with("Stopped", &[ran]));
+        assert!(
+            cond.message.contains("`lxc console sb --show-log`"),
+            "{}",
+            cond.message
+        );
+
+        let in_project = Instance {
+            project: "sandboxes".to_string(),
+            ..instance_with("Stopped", &[ran])
+        };
+        let cond = ready_condition(&in_project);
+        assert!(
+            cond.message
+                .contains("`lxc console sb --project sandboxes --show-log`"),
+            "{}",
+            cond.message
+        );
     }
 
     #[test]
