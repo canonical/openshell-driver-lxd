@@ -158,13 +158,40 @@ impl LxdClient {
                 .await;
             match result {
                 Ok(()) => {}
-                // A directory that already exists is fine; LXD reports it with
-                // a 500/"already exists" style error. Anything else propagates.
-                Err(LxdError::Api { message, .. }) if message.contains("exists") => {}
-                Err(e) => return Err(e),
+                // A directory that already exists is fine. Rather than match
+                // on LXD's error wording — which varies by version and would
+                // silently swallow unrelated failures that happen to contain
+                // the word — ask whether the path is now a directory and only
+                // continue if it is.
+                Err(e) => {
+                    if !self.path_is_dir_in_instance(name, &prefix).await {
+                        return Err(e);
+                    }
+                }
             }
         }
         Ok(())
+    }
+
+    /// True if `guest_path` exists inside the instance and is a directory.
+    ///
+    /// Used to tell "the directory was already there" apart from a genuine
+    /// failure, without depending on the wording of LXD's error message.
+    /// Any error answering the question is reported as "not a directory" so
+    /// the caller propagates its original, more informative error.
+    async fn path_is_dir_in_instance(&self, name: &str, guest_path: &str) -> bool {
+        let encoded_path = encode(guest_path);
+        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        match self.get_raw_with_headers(&path).await {
+            Ok((headers, _)) => {
+                headers
+                    .get("X-LXD-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    == Some("directory")
+            }
+            Err(_) => false,
+        }
     }
 
     /// `GET /1.0/instances/<name>/files?path=<guest_path>`: fetches a file from
