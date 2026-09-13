@@ -952,35 +952,50 @@ async fn create_metadata_tar_xz(dir: &Path, metadata_yaml: &str) -> Result<Vec<u
 /// Injects the bundled init script into the unpacked rootfs at `GUEST_INIT_SCRIPT_PATH`
 /// with executable permissions (`0755`).
 fn inject_init_script(rootfs_dest: &Path) -> Result<(), DriverError> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // The script sits at the top of the rootfs, so the only path component
+    // an image controls is the file itself. An image may ship that path as a
+    // symlink (say to /etc/shadow): writing through it would let the image
+    // overwrite a host file as the driver's user. Whatever is there is
+    // removed without being followed, and the script is created fresh.
     let script_path = rootfs_dest.join(GUEST_INIT_SCRIPT_PATH.trim_start_matches('/'));
-    if let Some(parent) = script_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
+    match std::fs::symlink_metadata(&script_path) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(DriverError::ImageImport(format!(
+                "the image has a directory at {GUEST_INIT_SCRIPT_PATH}"
+            )));
+        }
+        Ok(_) => std::fs::remove_file(&script_path).map_err(|e| {
             DriverError::ImageImport(format!(
-                "failed to create parent directory for init script: {e}"
+                "failed to remove {} from the image: {e}",
+                script_path.display()
             ))
-        })?;
-    }
-    std::fs::write(&script_path, INIT_SCRIPT_CONTENTS).map_err(|e| {
-        DriverError::ImageImport(format!(
-            "failed to write init script to {}: {e}",
-            script_path.display()
-        ))
-    })?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).map_err(
-            |e| {
-                DriverError::ImageImport(format!(
-                    "failed to set permissions on init script {}: {e}",
-                    script_path.display()
-                ))
-            },
-        )?;
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(DriverError::ImageImport(format!(
+                "failed to stat {}: {e}",
+                script_path.display()
+            )))
+        }
     }
 
-    Ok(())
+    // `create_new` refuses to open anything that appeared in between,
+    // symlinks included.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&script_path)
+        .and_then(|mut file| file.write_all(INIT_SCRIPT_CONTENTS.as_bytes()))
+        .map_err(|e| {
+            DriverError::ImageImport(format!(
+                "failed to write init script to {}: {e}",
+                script_path.display()
+            ))
+        })
 }
 
 #[cfg(test)]
@@ -1500,6 +1515,36 @@ mod tests {
             let mode = metadata.permissions().mode() & 0o777;
             assert_eq!(mode, 0o755);
         }
+    }
+
+    /// An image that ships the script's path as a symlink must not get the
+    /// driver to write through it.
+    #[test]
+    fn init_script_is_not_written_through_a_symlink_in_the_image() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let rootfs = temp_dir.path().join("rootfs");
+        std::fs::create_dir_all(&rootfs).unwrap();
+        let host_file = temp_dir.path().join("host-secret");
+        std::fs::write(&host_file, "do not touch").unwrap();
+        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::os::unix::fs::symlink(&host_file, rootfs.join("openshell-init.sh")).unwrap();
+
+        inject_init_script(&rootfs).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&host_file).unwrap(), "do not touch");
+        let host_mode = std::fs::metadata(&host_file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(host_mode, 0o600);
+        let script = rootfs.join("openshell-init.sh");
+        assert!(!std::fs::symlink_metadata(&script)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(&script).unwrap(),
+            INIT_SCRIPT_CONTENTS
+        );
     }
 
     #[tokio::test]
