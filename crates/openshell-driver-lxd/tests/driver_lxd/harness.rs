@@ -72,15 +72,6 @@ pub fn unique_name(tag: &str) -> String {
     format!("odl-{tag}-{:x}{n}", nanos % 0xffff_ffff_ffff)
 }
 
-fn unique_project_name() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_nanos();
-    let n = NAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("odl-p-{:x}{n}", nanos % 0xffff_ffff_ffff)
-}
-
 /// The gateway-assigned id for a test sandbox. Deliberately different from
 /// the name so tests notice when one is used in place of the other.
 pub fn sandbox_id(name: &str) -> String {
@@ -228,72 +219,6 @@ pub fn lxc_output(args: &[&str]) -> std::process::Output {
         .expect("the lxc CLI must be on PATH")
 }
 
-/// An LXD project owned by one test driver instance.
-///
-/// The driver watch stream starts with a snapshot of everything in its project.
-/// Giving each test driver its own project keeps concurrent tests from
-/// flooding each other's watchers with unrelated sandboxes.
-struct IsolatedProject {
-    name: String,
-}
-
-impl IsolatedProject {
-    fn create() -> Self {
-        let name = unique_project_name();
-        lxc(&[
-            "project",
-            "create",
-            &name,
-            "-c",
-            "features.images=false",
-            "-c",
-            "features.profiles=false",
-        ]);
-        Self { name }
-    }
-}
-
-impl Drop for IsolatedProject {
-    fn drop(&mut self) {
-        let project = self.name.as_str();
-        let list = |args: &[&str]| -> Vec<String> {
-            lxc_output(args)
-                .stdout
-                .split(|b| *b == b'\n')
-                .map(|line| String::from_utf8_lossy(line).trim().to_string())
-                .filter(|line| !line.is_empty())
-                .collect()
-        };
-        for instance in list(&["list", "--project", project, "--format", "csv", "-c", "n"]) {
-            let _ = lxc_output(&["delete", "--force", &instance, "--project", project]);
-        }
-        for line in list(&[
-            "storage",
-            "volume",
-            "list",
-            "default",
-            "--project",
-            project,
-            "--format",
-            "csv",
-        ]) {
-            let mut fields = line.split(',');
-            if let (Some("custom"), Some(volume)) = (fields.next(), fields.next()) {
-                let _ = lxc_output(&[
-                    "storage",
-                    "volume",
-                    "delete",
-                    "default",
-                    volume,
-                    "--project",
-                    project,
-                ]);
-            }
-        }
-        let _ = lxc_output(&["project", "delete", project]);
-    }
-}
-
 /// Deletes the named instances when dropped, whether the test passed or not.
 pub struct Cleanup {
     project: String,
@@ -334,7 +259,6 @@ impl Drop for Cleanup {
 #[derive(Clone, Debug)]
 pub struct DriverOptions {
     pub project: String,
-    pub isolate_project: bool,
     pub default_image: String,
     /// `None` runs the stand-in supervisor; `Some(image)` extracts the real
     /// supervisor binary from `image`.
@@ -349,7 +273,6 @@ impl Default for DriverOptions {
     fn default() -> Self {
         Self {
             project: DEFAULT_PROJECT.to_string(),
-            isolate_project: true,
             default_image: SANDBOX_IMAGE.to_string(),
             supervisor_image: None,
             image_cache_alias_prefix: DEFAULT_IMAGE_CACHE_ALIAS_PREFIX.to_string(),
@@ -364,7 +287,6 @@ impl Default for DriverOptions {
 pub struct Driver {
     child: Mutex<Option<Child>>,
     options: DriverOptions,
-    _project: Option<IsolatedProject>,
     /// Holds the socket, log and supervisor cache. Kept on disk when a test
     /// fails so the log can be inspected.
     dir: Option<tempfile::TempDir>,
@@ -383,19 +305,12 @@ impl Driver {
     }
 
     /// Starts the process without waiting for it to serve.
-    pub fn spawn(mut options: DriverOptions) -> Self {
+    pub fn spawn(options: DriverOptions) -> Self {
         if options.default_image == SANDBOX_IMAGE
             && options.image_cache_alias_prefix == DEFAULT_IMAGE_CACHE_ALIAS_PREFIX
         {
             ensure_sandbox_image();
         }
-        let project = if options.isolate_project && options.project == DEFAULT_PROJECT {
-            let project = IsolatedProject::create();
-            options.project = project.name.clone();
-            Some(project)
-        } else {
-            None
-        };
         // Socket paths are capped at 108 bytes, so keep this directory short.
         let dir = tempfile::Builder::new()
             .prefix("odl-")
@@ -405,7 +320,6 @@ impl Driver {
             child: Mutex::new(None),
             project: options.project.clone(),
             options,
-            _project: project,
             dir: Some(dir),
         };
         driver.launch();

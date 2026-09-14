@@ -119,27 +119,6 @@ async fn driver_refuses_to_start_without_its_project() {
     );
 }
 
-/// The default harness setup gives each driver its own temporary LXD project,
-/// so concurrent tests do not see each other's watch snapshots.
-#[tokio::test]
-async fn default_test_drivers_are_isolated_from_each_other() {
-    let first = Driver::start().await;
-    let second = Driver::start().await;
-    let name = unique_name("iso");
-    let id = sandbox_id(&name);
-    let _cleanup = first.cleanup(&[&name]);
-
-    first.create_running(&name).await;
-
-    let status = second.get(&name).await.expect_err("other driver's project");
-    assert_eq!(status.code(), Code::NotFound);
-
-    let mut watch = second.watch().await;
-    watch
-        .expect_silence_about(&name, &id, Duration::from_secs(5))
-        .await;
-}
-
 /// A driver confined to a project creates, reports and deletes its sandboxes
 /// there and nowhere else, including the supervisor and DHCP-client volumes
 /// it provisions.
@@ -151,11 +130,7 @@ async fn sandboxes_stay_inside_the_driver_project() {
         ..Default::default()
     })
     .await;
-    let in_default = Driver::start_with(DriverOptions {
-        isolate_project: false,
-        ..Default::default()
-    })
-    .await;
+    let in_default = Driver::start().await;
     let name = unique_name("proj");
     let id = sandbox_id(&name);
     let _cleanup = in_project.cleanup(&[&name]);
