@@ -20,10 +20,11 @@ test-lxd-client: setup-lxd-test-env
 # `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus outbound access to
 # ghcr.io: the sandbox image is imported on first use. Sandboxes run a
 # stand-in supervisor built from examples/, not the real one, which needs a
-# gateway. `cargo test -p openshell-driver-lxd -- --ignored` runs the tests
-# for known gaps.
+# gateway. They also share one LXD daemon and default project, so run them
+# single-threaded to avoid cross-test interference in lifecycle watches.
+# `cargo test -p openshell-driver-lxd -- --ignored` runs the tests for known gaps.
 test-driver:
-	cargo test -p openshell-driver-lxd
+	cargo test -p openshell-driver-lxd -- --test-threads=1
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
