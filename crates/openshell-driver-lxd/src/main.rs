@@ -100,30 +100,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Fail fast with a clear diagnostic rather than letting the first
-    // create_sandbox call surface an opaque LXD 404. Only the check itself
-    // failing (e.g. LXD not reachable yet) is non-fatal here — that failure
-    // mode is already surfaced clearly wherever it's next hit.
-    match lxd.image_alias_exists(&config.default_image).await {
-        Ok(false) => {
-            error!(
-                image = %config.default_image,
-                "default sandbox image alias not found in LXD; run `make sandbox-image` \
-                 (or import it under this alias) before starting the driver"
-            );
-            std::process::exit(1);
-        }
-        Ok(true) => {}
-        Err(e) => {
-            warn!(
-                image = %config.default_image,
-                %e,
-                "could not verify default sandbox image alias exists; continuing anyway"
-            );
-        }
+    // Verify the remote LXD server supports the host architecture.
+    let host_arch = openshell_driver_lxd::image::host_lxd_arch();
+    if let Err(e) = lxd.verify_architecture(host_arch).await {
+        error!(
+            arch = %host_arch,
+            %e,
+            "LXD server does not support host architecture"
+        );
+        std::process::exit(1);
     }
 
+    let default_image = config.default_image.clone();
     let driver = LxdComputeDriver::new(config, lxd);
+
+    // Best-effort pre-warm of the default sandbox image. The driver pulls the
+    // image from the registry on demand, so a missing local image is not an
+    // error; pre-warming just makes the first create fast and surfaces an
+    // invalid reference or an unreachable registry early. Any failure is
+    // logged and otherwise ignored — the import is retried on first use.
+    //
+    // It runs in the background: a cold import takes minutes, and the socket
+    // already accepts connections, so blocking here would leave a connecting
+    // gateway waiting with no error until it finished. A create that arrives
+    // meanwhile waits on the same import rather than starting a second one.
+    let prewarm = driver.clone();
+    tokio::spawn(async move {
+        match prewarm.ensure_default_image().await {
+            Ok(alias) => {
+                info!(image = %default_image, %alias, "default sandbox image ready");
+            }
+            Err(e) => {
+                warn!(
+                    image = %default_image,
+                    %e,
+                    "could not pre-warm default sandbox image; it will be imported on first use"
+                );
+            }
+        }
+    });
+
     let service = ComputeDriverService::new(driver);
 
     Server::builder()

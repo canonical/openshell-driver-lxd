@@ -13,6 +13,8 @@ mod networks;
 mod operations;
 mod projects;
 pub mod resources;
+pub(crate) mod split_image_body;
+pub mod storage;
 mod types;
 
 pub use acls::{AclAction, AclProtocol, AclState, LxdNetworkAclRule};

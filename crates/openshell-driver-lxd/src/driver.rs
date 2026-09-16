@@ -2,16 +2,25 @@
 
 //! Core LXD compute driver logic, independent of the gRPC transport.
 
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
 use lxd_client::{LxdClient, LxdError};
+use tokio::sync::Mutex;
 
 use crate::config::Config;
+use crate::dhcp_client;
 use crate::error::DriverError;
+use crate::image::{self, digest_of_file, ImageCache, SkopeoImporter};
 use crate::mapping;
 
 const DRIVER_NAME: &str = "lxd";
+
+/// How long to let a freshly started sandbox settle before checking that its
+/// init is still up. See [`LxdComputeDriver::settle_after_start`].
+const SETTLE_DELAY: Duration = Duration::from_secs(3);
 
 /// Returns true if `err` indicates the instance was already stopped.
 ///
@@ -42,12 +51,59 @@ fn is_already_stopped(err: &LxdError) -> bool {
 pub struct LxdComputeDriver {
     config: Config,
     lxd: LxdClient,
+    image_cache: ImageCache,
+    supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    lifecycle_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
 }
 
 impl LxdComputeDriver {
     #[must_use]
     pub fn new(config: Config, lxd: LxdClient) -> Self {
-        Self { config, lxd }
+        let importer = Arc::new(SkopeoImporter::new(
+            lxd.clone(),
+            config.skopeo_path.clone(),
+            config.umoci_path.clone(),
+            config.mksquashfs_path.clone(),
+            config.image_work_dir.clone(),
+            Duration::from_secs(config.image_pull_timeout_secs),
+        ));
+        let image_cache = ImageCache::new(
+            lxd.clone(),
+            importer,
+            config.image_cache_alias_prefix.clone(),
+        );
+        Self::with_image_cache(config, lxd, image_cache)
+    }
+
+    #[must_use]
+    pub fn with_image_cache(config: Config, lxd: LxdClient, image_cache: ImageCache) -> Self {
+        Self {
+            config,
+            lxd,
+            image_cache,
+            supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Best-effort pre-warm of the default sandbox image so the first
+    /// `create_sandbox` need not block on a registry pull, and so a bad
+    /// default reference or an unreachable registry surfaces at startup
+    /// rather than on the first request. Importing requires the external
+    /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
+    /// otherwise ignored — the same import is retried on first use.
+    pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
+        self.image_cache
+            .resolve_alias(&self.config.default_image)
+            .await
+    }
+
+    /// Clone of the LXD client, for the lifecycle watcher.
+    #[must_use]
+    pub fn lxd_client(&self) -> LxdClient {
+        self.lxd.clone()
     }
 
     /// Report driver capabilities and defaults.
@@ -57,6 +113,11 @@ impl LxdComputeDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.config.default_image.clone(),
+            // The gateway would stop sandboxes when it shuts down and restart
+            // them with StartSandbox when it comes back, which this driver
+            // does not implement. Sandboxes keep running across gateway
+            // restarts instead.
+            gateway_manages_lifecycle: false,
         }
     }
 
@@ -81,6 +142,12 @@ impl LxdComputeDriver {
         let template = spec.template.as_ref().ok_or_else(|| {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
+
+        // An empty image means the default image, which is validated when it
+        // is resolved.
+        if !template.image.is_empty() {
+            image::validate_reference(&template.image)?;
+        }
 
         for key in template.labels.keys() {
             if !mapping::is_valid_label_key(key) {
@@ -183,8 +250,24 @@ impl LxdComputeDriver {
 
         let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(template).await?;
-        let config =
-            mapping::build_create_config(sandbox, spec, template, &gateway_endpoint, has_token)?;
+        let config = mapping::build_create_config(
+            sandbox,
+            spec,
+            template,
+            &gateway_endpoint,
+            has_token,
+            self.config.default_max_processes,
+        )?;
+
+        // Auxiliary volumes live on the sandbox's own pool unless the
+        // operator pinned them, so a request asking for a non-default
+        // `storage_pool` does not end up with its rootfs on one pool and its
+        // supervisor volume on another.
+        let aux_pool = self
+            .config
+            .supervisor_storage_pool
+            .as_deref()
+            .unwrap_or_else(|| mapping::storage_pool(template));
 
         let gpu = spec
             .resource_requirements
@@ -200,59 +283,239 @@ impl LxdComputeDriver {
                 "GpuResourceRequirements.count is ignored in v1; attaching all host GPUs"
             );
         }
-        let devices = mapping::build_create_devices(template, gpu.is_some());
+        // Resolve supervisor binary and digest
+        let (binary_path, digest) = match &self.config.supervisor_bin {
+            Some(path) => (path.clone(), digest_of_file(path)?),
+            None => self
+                .image_cache
+                .extract_supervisor_binary(
+                    &self.config.supervisor_image,
+                    &self.config.supervisor_cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+                })?,
+        };
+
+        // Ensure digest-keyed custom storage volume exists on the aux pool.
+        // Locks are keyed by pool *and* digest: the same binary on two pools
+        // is two distinct volumes.
+        let volume_name = mapping::supervisor_volume_name(&digest);
+        let vol_lock = {
+            let mut locks = self.supervisor_volume_locks.lock().await;
+            locks
+                .entry(format!("{aux_pool}/{digest}"))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = vol_lock.lock().await;
+            self.lxd
+                .ensure_supervisor_volume(aux_pool, &volume_name, &binary_path)
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "supervisor binary volume provisioning failed on pool {aux_pool:?}: {e}"
+                    ))
+                })?;
+        }
+
+        // Ensure digest-keyed custom storage volume exists for the DHCP client
+        let (dhcp_binary_bytes, dhcp_digest) =
+            dhcp_client::load_dhcp_client(self.config.dhcp_client_bin.as_deref()).await?;
+        let dhcp_volume_name = mapping::dhcp_client_volume_name(&dhcp_digest);
+        let dhcp_vol_lock = {
+            let mut locks = self.dhcp_client_volume_locks.lock().await;
+            locks
+                .entry(format!("{aux_pool}/{dhcp_digest}"))
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        {
+            let _guard = dhcp_vol_lock.lock().await;
+            self.lxd
+                .ensure_dhcp_client_volume(
+                    aux_pool,
+                    &dhcp_volume_name,
+                    &dhcp_binary_bytes,
+                    dhcp_client::DHCP_CLIENT_SCRIPT,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!(
+                        "DHCP client volume provisioning failed on pool {aux_pool:?}: {e}"
+                    ))
+                })?;
+        }
+
+        let devices = mapping::build_create_devices(
+            template,
+            gpu.is_some(),
+            aux_pool,
+            &volume_name,
+            aux_pool,
+            &dhcp_volume_name,
+        );
         let profiles = mapping::build_profiles(template);
 
-        // v1: always use the configured default image; template.image is
-        // accepted by ValidateSandboxCreate but not yet consulted.
-        if !template.image.is_empty() {
-            tracing::debug!(
-                image = %template.image,
-                default = %self.config.default_image,
-                "template.image is ignored in v1; using default image"
-            );
-        }
-        let image = &self.config.default_image;
+        let image_alias = if template.image.is_empty() {
+            self.image_cache
+                .resolve_alias(&self.config.default_image)
+                .await?
+        } else {
+            self.image_cache.resolve_alias(&template.image).await?
+        };
 
         // Create the instance stopped so we can push the token file before the
         // supervisor starts — avoids a race where the supervisor reads
         // OPENSHELL_SANDBOX_TOKEN_FILE before it has been written.
         let op = self
             .lxd
-            .create_instance(&sandbox.name, image, config, devices, profiles, false)
+            .create_instance(
+                &sandbox.name,
+                &image_alias,
+                config,
+                devices,
+                profiles,
+                false,
+            )
             .await?;
         self.wait_operation(&op.id).await?;
 
-        if has_token {
-            if let Err(push_err) = self
-                .lxd
-                .push_file_into_instance(
-                    &sandbox.name,
-                    mapping::GUEST_SANDBOX_TOKEN_PATH,
-                    spec.sandbox_token.as_bytes(),
-                )
-                .await
-            {
-                // The instance is stopped but unstarted; delete it rather than
-                // leaving an orphaned container.
-                let cleanup = async {
-                    let op = self.lxd.delete_instance(&sandbox.name).await?;
-                    self.wait_operation(&op.id).await
-                };
-                if let Err(e) = cleanup.await {
-                    tracing::warn!(
-                        name = %sandbox.name,
-                        %e,
-                        "failed to clean up instance after token push failure"
-                    );
-                }
-                return Err(push_err.into());
+        let post_create = async {
+            if has_token {
+                self.lxd
+                    .push_file_into_instance(
+                        &sandbox.name,
+                        mapping::GUEST_SANDBOX_TOKEN_PATH,
+                        spec.sandbox_token.as_bytes(),
+                    )
+                    .await?;
             }
+
+            let op = self.lxd.start_instance(&sandbox.name).await?;
+            self.wait_operation(&op.id).await?;
+            self.settle_after_start(&sandbox.name, &sandbox.id).await?;
+
+            Ok::<(), DriverError>(())
+        };
+
+        if let Err(post_err) = post_create.await {
+            tracing::warn!(
+                name = %sandbox.name,
+                %post_err,
+                "post-create step failed; cleaning up instance"
+            );
+            let cleanup = async {
+                if let Ok(op) = self.lxd.stop_instance(&sandbox.name, true).await {
+                    let _ = self.wait_operation(&op.id).await;
+                }
+                let op = self.lxd.delete_instance(&sandbox.name).await?;
+                self.wait_operation(&op.id).await
+            };
+            if let Err(cleanup_err) = cleanup.await {
+                tracing::warn!(
+                    name = %sandbox.name,
+                    %cleanup_err,
+                    "failed to clean up instance after post-create failure"
+                );
+            }
+            return Err(post_err);
         }
 
-        let op = self.lxd.start_instance(&sandbox.name).await?;
-        self.wait_operation(&op.id).await?;
+        Ok(())
+    }
 
+    async fn instance_lifecycle_lock(&self, name: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.lifecycle_locks.lock().await;
+        locks
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// Records that the driver stopped this sandbox deliberately (see
+    /// [`mapping::KEY_STOP_INTENT`]).
+    ///
+    /// Best-effort: the marker only refines the reason reported for a stopped
+    /// sandbox, so failing to write it must not fail the stop itself. Nothing
+    /// clears it because this driver exposes no start RPC — a stopped sandbox
+    /// is only ever deleted. A future `StartSandbox` would need to clear it so
+    /// a later crash is not reported as a deliberate stop.
+    async fn set_stop_intent(&self, name: &str) {
+        let mut config = HashMap::new();
+        config.insert(
+            mapping::KEY_STOP_INTENT.to_string(),
+            Some(mapping::CONDITION_STOPPED.to_string()),
+        );
+        if let Err(e) = self.lxd.patch_instance_config(name, config).await {
+            tracing::debug!(name = %name, %e, "could not record stop intent");
+        }
+    }
+
+    async fn clear_stop_intent(&self, name: &str) {
+        let mut config = HashMap::new();
+        config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
+        if let Err(e) = self.lxd.patch_instance_config(name, config).await {
+            tracing::debug!(name = %name, %e, "could not clear stop intent");
+        }
+    }
+
+    /// Restarts a sandbox whose init exited immediately after the first start.
+    ///
+    /// The container's init is the supervisor, so if it gives up during
+    /// start-up — for example because its first policy sync lost a race with
+    /// the gateway finishing the sandbox record — PID 1 exits, LXD reports
+    /// the instance `Stopped`, and nothing brings it back: LXD's
+    /// `boot.autorestart` is VM-only, and `boot.autostart` only covers daemon
+    /// restarts. A bounded retry turns that transient into a working sandbox
+    /// instead of one wedged in `Error`.
+    async fn settle_after_start(
+        &self,
+        name: &str,
+        expected_sandbox_id: &str,
+    ) -> Result<(), DriverError> {
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        for attempt in 0..self.config.start_retries {
+            // Give init long enough to fail; a supervisor that is going to
+            // exit on a start-up race does so within a few seconds.
+            tokio::time::sleep(SETTLE_DELAY).await;
+
+            let _guard = lifecycle_lock.lock().await;
+
+            let instance = match self.lxd.get_instance(name).await {
+                Ok(i) => i,
+                Err(LxdError::Api {
+                    status_code: 404, ..
+                }) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            if instance
+                .config
+                .get(mapping::KEY_SANDBOX_ID)
+                .map(String::as_str)
+                != Some(expected_sandbox_id)
+            {
+                return Ok(());
+            }
+            if !instance.status.eq_ignore_ascii_case("Stopped") {
+                return Ok(());
+            }
+            // Stopped because it was asked to be, while this start settled:
+            // restarting it would undo that stop.
+            if instance.config.contains_key(mapping::KEY_STOP_INTENT) {
+                return Ok(());
+            }
+
+            tracing::warn!(
+                name = %name,
+                attempt = attempt + 1,
+                "sandbox init exited immediately after start; restarting"
+            );
+            let op = self.lxd.start_instance(name).await?;
+            self.wait_operation(&op.id).await?;
+        }
         Ok(())
     }
 
@@ -275,14 +538,59 @@ impl LxdComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
-        self.get_managed_instance(name).await?;
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let _guard = lifecycle_lock.lock().await;
 
-        let op = match self.lxd.stop_instance(name, false).await {
+        let instance = self.get_managed_instance(name).await?;
+        if instance.status.eq_ignore_ascii_case("Stopped") {
+            return Ok(());
+        }
+
+        // Record that this stop was asked for, before issuing it. LXD reports
+        // the same `Stopped` status however an instance went down, so without
+        // this marker a requested stop is indistinguishable from the init
+        // dying and would be reported as `ContainerExited` — surfacing to the
+        // user as `Error` instead of `Stopped`.
+        self.set_stop_intent(name).await;
+
+        // Ask politely first, but with a deadline. The sandbox's init is the
+        // supervisor, which does not act on LXD's shutdown signal, so an
+        // unbounded graceful stop never completes: the LXD operation stays
+        // RUNNING, the instance stays up, and StopSandbox only fails once the
+        // driver's own operation timeout fires. Bounding it here means the
+        // graceful attempt fails fast and the forced stop below is what
+        // actually stops the sandbox.
+        let graceful = async {
+            let op = self
+                .lxd
+                .stop_instance_timeout(name, false, self.config.stop_timeout_secs)
+                .await?;
+            self.wait_operation(&op.id).await
+        };
+
+        match graceful.await {
+            Ok(()) => return Ok(()),
+            Err(DriverError::Lxd(ref e)) if is_already_stopped(e) => return Ok(()),
+            Err(e) => {
+                tracing::debug!(
+                    name = %name,
+                    %e,
+                    "graceful stop did not complete; forcing"
+                );
+            }
+        }
+
+        let op = match self.lxd.stop_instance(name, true).await {
+            Ok(op) => op,
             Err(e) if is_already_stopped(&e) => return Ok(()),
-            other => other?,
+            Err(e) => {
+                self.clear_stop_intent(name).await;
+                return Err(e.into());
+            }
         };
         if let Err(e) = self.wait_operation(&op.id).await {
             if !matches!(&e, DriverError::Lxd(lxd_err) if is_already_stopped(lxd_err)) {
+                self.clear_stop_intent(name).await;
                 return Err(e);
             }
         }
@@ -296,6 +604,9 @@ impl LxdComputeDriver {
     /// Deleted event) if the sandbox was deleted, or `None` if it was not
     /// found — the caller may retry safely.
     pub async fn delete_sandbox(&self, name: &str) -> Result<Option<String>, DriverError> {
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let _guard = lifecycle_lock.lock().await;
+
         let instance = match self.lxd.get_instance(name).await {
             Ok(i) => i,
             Err(LxdError::Api {
@@ -332,6 +643,12 @@ impl LxdComputeDriver {
             other => other?,
         };
         self.wait_operation(&op.id).await?;
+        {
+            let mut locks = self.lifecycle_locks.lock().await;
+            if Arc::strong_count(&lifecycle_lock) <= 2 {
+                locks.remove(name);
+            }
+        }
         Ok(Some(sandbox_id))
     }
 }
@@ -394,7 +711,10 @@ mod tests {
 
         assert_eq!(response.driver_name, "lxd");
         assert_eq!(response.driver_version, env!("CARGO_PKG_VERSION"));
-        assert_eq!(response.default_image, "openshell-sandbox");
+        assert_eq!(
+            response.default_image,
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+        );
     }
 
     #[tokio::test]
@@ -443,5 +763,278 @@ mod tests {
             .validate_sandbox_create(&sandbox)
             .await
             .expect("omitted gpu.count should be accepted");
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_explicit_gpu_count() {
+        let sandbox = sandbox_with_spec(spec_with_gpu_count(Some(1)));
+
+        driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("gpu.count >= 1 should be accepted");
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_requires_identity_spec_and_template() {
+        let complete = || sandbox_with_spec(spec_with_labels(HashMap::new()));
+        let cases = [
+            (
+                "sandbox.name",
+                DriverSandbox {
+                    name: String::new(),
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.id",
+                DriverSandbox {
+                    id: String::new(),
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.spec",
+                DriverSandbox {
+                    spec: None,
+                    ..complete()
+                },
+            ),
+            (
+                "sandbox.spec.template",
+                sandbox_with_spec(DriverSandboxSpec::default()),
+            ),
+        ];
+
+        for (field, sandbox) in cases {
+            let err = driver()
+                .validate_sandbox_create(&sandbox)
+                .await
+                .expect_err("incomplete sandbox should be rejected");
+            match err {
+                DriverError::InvalidArgument(msg) => {
+                    assert!(msg.contains(field), "expected {field} in {msg:?}");
+                }
+                other => panic!("expected InvalidArgument for missing {field}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_empty_label_key() {
+        let mut labels = HashMap::new();
+        labels.insert(String::new(), "value".to_string());
+        let sandbox = sandbox_with_spec(spec_with_labels(labels));
+
+        let err = driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("empty label key should be rejected");
+        assert!(matches!(err, DriverError::InvalidArgument(_)));
+    }
+
+    /// A malformed reference can never be imported, so it is refused as the
+    /// caller's mistake before CreateSandbox runs.
+    #[tokio::test]
+    async fn validate_sandbox_create_rejects_malformed_image_reference() {
+        let sandbox = sandbox_with_spec(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "UPPER/Case::bad".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        let err = driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect_err("malformed image reference should be rejected");
+        assert!(matches!(err, DriverError::InvalidArgument(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn validate_sandbox_create_accepts_a_well_formed_image_reference() {
+        let sandbox = sandbox_with_spec(DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+
+        driver()
+            .validate_sandbox_create(&sandbox)
+            .await
+            .expect("a well-formed reference should be accepted without contacting a registry");
+    }
+
+    #[test]
+    fn capabilities_report_configured_default_image() {
+        let config = Config::parse_from([
+            "openshell-driver-lxd",
+            "--default-image",
+            "registry.example.com/sandboxes/custom:v2",
+        ]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+
+        let response = LxdComputeDriver::new(config, lxd).capabilities();
+
+        assert_eq!(
+            response.default_image,
+            "registry.example.com/sandboxes/custom:v2"
+        );
+    }
+
+    /// Messages as LXD 6.9 reports them: synchronously (400) when the
+    /// instance is already stopped at request time, or on the operation when
+    /// it stopped while the request was in flight.
+    #[test]
+    fn already_stopped_is_recognized_from_sync_and_async_errors() {
+        let sync_already_stopped = LxdError::Api {
+            status_code: 400,
+            message: "The instance is already stopped".to_string(),
+        };
+        assert!(is_already_stopped(&sync_already_stopped));
+
+        let async_already_stopped = LxdError::OperationFailed {
+            description: "Stopping instance".to_string(),
+            err: "The instance is already stopped".to_string(),
+        };
+        assert!(is_already_stopped(&async_already_stopped));
+
+        let async_not_running = LxdError::OperationFailed {
+            description: "Stopping instance".to_string(),
+            err: "Instance is not running".to_string(),
+        };
+        assert!(is_already_stopped(&async_not_running));
+    }
+
+    /// Anything else must propagate: swallowing it would report a stop that
+    /// did not happen.
+    #[test]
+    fn other_errors_are_not_mistaken_for_already_stopped() {
+        let cases = [
+            LxdError::Api {
+                status_code: 400,
+                message: "Invalid config".to_string(),
+            },
+            // Only a 400 carries the synchronous "already stopped" meaning.
+            LxdError::Api {
+                status_code: 500,
+                message: "The instance is already stopped".to_string(),
+            },
+            LxdError::Api {
+                status_code: 404,
+                message: "Instance not found".to_string(),
+            },
+            LxdError::OperationFailed {
+                description: "Stopping instance".to_string(),
+                err: "Failed shutting down instance, status is \"Running\": context deadline exceeded"
+                    .to_string(),
+            },
+            LxdError::Io(std::io::Error::other("already stopped")),
+        ];
+
+        for err in cases {
+            assert!(!is_already_stopped(&err), "{err:?}");
+        }
+    }
+
+    struct MockAliasChecker {
+        exists: bool,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::ImageAliasChecker for MockAliasChecker {
+        async fn image_alias_exists(&self, _alias: &str) -> Result<bool, DriverError> {
+            Ok(self.exists)
+        }
+    }
+
+    struct MockImporter {
+        digest: String,
+        imported_alias: std::sync::Mutex<Option<String>>,
+    }
+
+    #[tonic::async_trait]
+    impl crate::image::OciImporter for MockImporter {
+        async fn resolve_digest(&self, _reference: &str) -> Result<String, DriverError> {
+            Ok(self.digest.clone())
+        }
+
+        async fn import(
+            &self,
+            _reference: &str,
+            _digest: &str,
+            alias: &str,
+        ) -> Result<(), DriverError> {
+            *self.imported_alias.lock().unwrap() = Some(alias.to_string());
+            Ok(())
+        }
+
+        async fn extract_supervisor_binary(
+            &self,
+            _reference: &str,
+            cache_dir: &std::path::Path,
+        ) -> Result<(std::path::PathBuf, String), DriverError> {
+            let target_dir = cache_dir.join("test-digest");
+            let binary_path = target_dir.join("openshell-sandbox");
+            if !binary_path.exists() {
+                std::fs::create_dir_all(&target_dir).unwrap();
+                std::fs::write(&binary_path, b"mock-supervisor").unwrap();
+            }
+            Ok((binary_path, self.digest.clone()))
+        }
+    }
+
+    #[tokio::test]
+    async fn create_sandbox_resolves_image_or_defaults() {
+        let config = Config::parse_from(["openshell-driver-lxd"]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket(PathBuf::from(DEFAULT_LXD_SOCKET))).unwrap();
+
+        let digest_hex = "ee".repeat(32);
+        let importer = Arc::new(MockImporter {
+            digest: format!("sha256:{digest_hex}"),
+            imported_alias: std::sync::Mutex::new(None),
+        });
+        let checker = Arc::new(MockAliasChecker { exists: true });
+        let cache =
+            ImageCache::with_checker(checker, importer, config.image_cache_alias_prefix.clone());
+
+        let driver = LxdComputeDriver::with_image_cache(config, lxd, cache);
+
+        // 1. Empty template.image falls back to default_image, which is now
+        //    itself an OCI reference resolved through the same import path.
+        let empty_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let _sb_empty = sandbox_with_spec(empty_spec);
+        assert_eq!(
+            driver.config.default_image,
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
+        );
+
+        // 2. Non-empty template.image resolves to the digest-derived alias
+        let custom_spec = DriverSandboxSpec {
+            template: Some(DriverSandboxTemplate {
+                image: "registry.example.com/custom:v1".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sb_custom = sandbox_with_spec(custom_spec);
+        let template = sb_custom.spec.unwrap().template.unwrap();
+        let resolved = driver
+            .image_cache
+            .resolve_alias(&template.image)
+            .await
+            .unwrap();
+        assert_eq!(resolved, format!("openshell-oci-r2-{digest_hex}"));
     }
 }

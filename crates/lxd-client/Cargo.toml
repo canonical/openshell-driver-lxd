@@ -17,8 +17,11 @@ http-body-util = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = "3"
 thiserror = { workspace = true }
 tracing = { workspace = true }
+libc = "0.2"
 
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }

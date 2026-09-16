@@ -20,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UnixStream;
 
 use crate::error::LxdError;
+use crate::split_image_body::SplitImageBody;
 use crate::types::LxdResponse;
 
 /// A unified raw transport stream used for WebSocket connections.
@@ -314,9 +315,14 @@ impl LxdClient {
 
     /// Opens a fresh connection and returns an HTTP/1.1 sender plus the value
     /// to use for the `Host` header.
-    async fn connect(
+    async fn connect<B>(
         &self,
-    ) -> Result<(hyper::client::conn::http1::SendRequest<Full<Bytes>>, String), LxdError> {
+    ) -> Result<(hyper::client::conn::http1::SendRequest<B>, String), LxdError>
+    where
+        B: hyper::body::Body + Send + 'static,
+        B::Data: Send,
+        B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
         let (raw, host) = self.connect_raw().await?;
         let sender = do_handshake(TokioIo::new(raw)).await?;
         Ok((sender, host))
@@ -413,11 +419,168 @@ impl LxdClient {
         self.request(Method::PUT, path, Some(body)).await
     }
 
+    pub(crate) async fn patch<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: Value,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        self.request(Method::PATCH, path, Some(body)).await
+    }
+
+    /// Queries the LXD server's supported architectures (`GET /1.0`).
+    pub async fn server_architectures(&self) -> Result<Vec<String>, LxdError> {
+        let response = self.get::<Value>("/1.0").await?;
+        let metadata = response.into_metadata()?;
+        let archs = metadata
+            .get("environment")
+            .and_then(|e| e.get("architectures"))
+            .and_then(|a| a.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Ok(archs)
+    }
+
+    /// Verifies that the LXD server supports the requested architecture.
+    pub async fn verify_architecture(&self, expected_arch: &str) -> Result<(), LxdError> {
+        let archs = self.server_architectures().await?;
+        if archs.is_empty() {
+            return Ok(());
+        }
+        if !archs.iter().any(|a| a == expected_arch) {
+            return Err(LxdError::Api {
+                status_code: 400,
+                message: format!(
+                    "LXD server does not support architecture '{expected_arch}'; supported architectures: {:?}",
+                    archs
+                ),
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) async fn delete<T: DeserializeOwned>(
         &self,
         path: &str,
     ) -> Result<LxdResponse<T>, LxdError> {
         self.request(Method::DELETE, path, None).await
+    }
+
+    /// POST raw bytes with arbitrary extra headers and return the deserialized response.
+    ///
+    /// Used for endpoints like image imports where the request payload is multipart/form-data
+    /// or binary data, but the response is LXD's standard JSON envelope.
+    pub(crate) async fn post_raw_response<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        extra_headers: &[(&str, &str)],
+        body: Bytes,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        let (mut sender, host) = self.connect().await?;
+
+        let decorated_path = self.decorate_path(path);
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(&decorated_path)
+            .header("Host", host)
+            .header("Content-Type", content_type);
+        for (name, value) in extra_headers {
+            builder = builder.header(*name, *value);
+        }
+        let request = builder.body(Full::new(body))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        let parsed: LxdResponse<T> = serde_json::from_slice(&resp_body)?;
+
+        if parsed.type_ == "error" {
+            let message = parsed
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
+            return Err(LxdError::Api {
+                status_code: parsed.error_code,
+                message,
+            });
+        }
+
+        Ok(parsed)
+    }
+
+    /// POST a streaming body with arbitrary content-type and return the deserialized response.
+    ///
+    /// Used for split image imports where the request payload streams a multi-gigabyte rootfs
+    /// file in bounded chunks, while the response is LXD's standard JSON envelope.
+    pub(crate) async fn post_streaming_response<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        content_type: &str,
+        body: SplitImageBody,
+    ) -> Result<LxdResponse<T>, LxdError> {
+        let (mut sender, host) = self.connect::<SplitImageBody>().await?;
+
+        let decorated_path = self.decorate_path(path);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(&decorated_path)
+            .header("Host", host)
+            .header("Content-Type", content_type)
+            .body(body)?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let resp_body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&resp_body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        let parsed: LxdResponse<T> = serde_json::from_slice(&resp_body)?;
+
+        if parsed.type_ == "error" {
+            let message = parsed
+                .error
+                .clone()
+                .unwrap_or_else(|| format!("LXD error {}", parsed.error_code));
+            return Err(LxdError::Api {
+                status_code: parsed.error_code,
+                message,
+            });
+        }
+
+        Ok(parsed)
     }
 
     /// POST raw bytes with arbitrary extra headers.
@@ -484,6 +647,43 @@ impl LxdClient {
         }
         Ok(())
     }
+
+    /// GET raw bytes with response headers.
+    pub(crate) async fn get_raw_with_headers(
+        &self,
+        path: &str,
+    ) -> Result<(hyper::HeaderMap, Bytes), LxdError> {
+        let (mut sender, host) = self.connect().await?;
+
+        let decorated_path = self.decorate_path(path);
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri(&decorated_path)
+            .header("Host", host)
+            .body(Full::new(Bytes::new()))?;
+
+        let response = sender.send_request(request).await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body().collect().await?.to_bytes();
+
+        if !status.is_success() {
+            let (status_code, message) = serde_json::from_slice::<LxdResponse<Value>>(&body)
+                .ok()
+                .filter(|r| r.type_ == "error")
+                .map(|r| {
+                    let msg = r.error.unwrap_or_else(|| format!("HTTP {status}"));
+                    (r.error_code, msg)
+                })
+                .unwrap_or_else(|| (status.as_u16(), format!("HTTP {status}")));
+            return Err(LxdError::Api {
+                status_code,
+                message,
+            });
+        }
+
+        Ok((headers, body))
+    }
 }
 
 impl fmt::Debug for LxdClient {
@@ -494,11 +694,12 @@ impl fmt::Debug for LxdClient {
     }
 }
 
-async fn do_handshake<IO>(
-    io: IO,
-) -> Result<hyper::client::conn::http1::SendRequest<Full<Bytes>>, LxdError>
+async fn do_handshake<IO, B>(io: IO) -> Result<hyper::client::conn::http1::SendRequest<B>, LxdError>
 where
     IO: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    B: hyper::body::Body + Send + 'static,
+    B::Data: Send,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     let (sender, conn) = hyper::client::conn::http1::handshake(io).await?;
     tokio::task::spawn(async move {

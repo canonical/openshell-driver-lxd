@@ -74,11 +74,57 @@ impl LxdClient {
     }
 
     /// `PUT /1.0/instances/<name>/state` with `{action: "stop", force}`.
+    ///
+    /// Equivalent to [`LxdClient::stop_instance_timeout`] with no deadline: a
+    /// graceful stop (`force == false`) then waits indefinitely for the
+    /// instance's init to exit.
     pub async fn stop_instance(&self, name: &str, force: bool) -> Result<Operation, LxdError> {
-        let body = json!({"action": "stop", "force": force});
+        self.stop_instance_timeout(name, force, 0).await
+    }
+
+    /// `PUT /1.0/instances/<name>/state` with `{action: "stop", force, timeout}`.
+    ///
+    /// `timeout_secs` bounds how long LXD waits for a graceful stop before the
+    /// operation fails; `0` means wait forever. Worth setting for any init that
+    /// might not act on LXD's shutdown signal, since the operation otherwise
+    /// never completes and the instance stays up.
+    pub async fn stop_instance_timeout(
+        &self,
+        name: &str,
+        force: bool,
+        timeout_secs: i64,
+    ) -> Result<Operation, LxdError> {
+        let body = json!({"action": "stop", "force": force, "timeout": timeout_secs});
         self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
             .await?
             .into_metadata()
+    }
+
+    /// `PATCH /1.0/instances/<name>`: merges `config` into the instance's
+    /// configuration, leaving keys that aren't mentioned untouched.
+    ///
+    /// A `null` value removes the key, which is how a caller clears a marker
+    /// it previously set.
+    pub async fn patch_instance_config(
+        &self,
+        name: &str,
+        config: HashMap<String, Option<String>>,
+    ) -> Result<(), LxdError> {
+        let config: serde_json::Map<String, serde_json::Value> = config
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k,
+                    v.map_or(serde_json::Value::Null, serde_json::Value::String),
+                )
+            })
+            .collect();
+        self.patch::<serde_json::Value>(
+            &format!("/1.0/instances/{}", encode(name)),
+            json!({ "config": config }),
+        )
+        .await?;
+        Ok(())
     }
 
     /// `DELETE /1.0/instances/<name>`.
@@ -104,6 +150,13 @@ impl LxdClient {
         guest_path: &str,
         content: &[u8],
     ) -> Result<(), LxdError> {
+        // LXD's file-push API does not create missing parent directories, so
+        // create each ancestor first. The old purpose-built sandbox image
+        // shipped the token directory as a placeholder; with arbitrary base
+        // images (e.g. the upstream supervisor image) it may not exist.
+        self.create_parent_dirs_in_instance(name, guest_path)
+            .await?;
+
         let encoded_path = encode(guest_path);
         self.post_raw(
             &format!("/1.0/instances/{name}/files?path={encoded_path}"),
@@ -118,5 +171,95 @@ impl LxdClient {
             hyper::body::Bytes::copy_from_slice(content),
         )
         .await
+    }
+
+    /// Creates every ancestor directory of `guest_path` inside the container,
+    /// shallowest first, tolerating directories that already exist. Uses the
+    /// LXD files API with `X-LXD-type: directory`; the container need not be
+    /// running (same overlay-access rules as file push).
+    async fn create_parent_dirs_in_instance(
+        &self,
+        name: &str,
+        guest_path: &str,
+    ) -> Result<(), LxdError> {
+        let mut prefix = String::new();
+        let components: Vec<&str> = guest_path.split('/').filter(|c| !c.is_empty()).collect();
+        // Skip the last component: it is the file itself, not a directory.
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            prefix.push('/');
+            prefix.push_str(component);
+            let encoded_path = encode(&prefix);
+            let result = self
+                .post_raw(
+                    &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                    "application/octet-stream",
+                    &[
+                        ("X-LXD-uid", "0"),
+                        ("X-LXD-gid", "0"),
+                        ("X-LXD-mode", "0755"),
+                        ("X-LXD-type", "directory"),
+                    ],
+                    hyper::body::Bytes::new(),
+                )
+                .await;
+            match result {
+                Ok(()) => {}
+                // A directory that already exists is fine. Rather than match
+                // on LXD's error wording — which varies by version and would
+                // silently swallow unrelated failures that happen to contain
+                // the word — ask whether the path is now a directory and only
+                // continue if it is.
+                Err(e) => {
+                    if !self.path_is_dir_in_instance(name, &prefix).await {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True if `guest_path` exists inside the instance and is a directory.
+    ///
+    /// Used to tell "the directory was already there" apart from a genuine
+    /// failure, without depending on the wording of LXD's error message.
+    /// Any error answering the question is reported as "not a directory" so
+    /// the caller propagates its original, more informative error.
+    async fn path_is_dir_in_instance(&self, name: &str, guest_path: &str) -> bool {
+        let encoded_path = encode(guest_path);
+        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        match self.get_raw_with_headers(&path).await {
+            Ok((headers, _)) => {
+                headers
+                    .get("X-LXD-type")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::trim)
+                    == Some("directory")
+            }
+            Err(_) => false,
+        }
+    }
+
+    /// `GET /1.0/instances/<name>/files?path=<guest_path>`: fetches a file from
+    /// an instance, returning its content and mode (e.g. `0o755`).
+    pub async fn get_file_from_instance(
+        &self,
+        name: &str,
+        guest_path: &str,
+    ) -> Result<(hyper::body::Bytes, u32), LxdError> {
+        let encoded_path = encode(guest_path);
+        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let (headers, body) = self.get_raw_with_headers(&path).await?;
+        let mode_str = headers
+            .get("X-LXD-mode")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("0644");
+        let clean_mode = mode_str.trim_start_matches('0');
+        let mode = if clean_mode.is_empty() {
+            0
+        } else {
+            u32::from_str_radix(clean_mode, 8).unwrap_or(0)
+        };
+        Ok((body, mode))
     }
 }

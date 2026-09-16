@@ -415,3 +415,410 @@ async fn push_file_into_stopped_instance() {
     .expect("delete should not time out")
     .expect("delete should succeed");
 }
+
+#[tokio::test]
+async fn ensure_supervisor_volume_lifecycle_and_idempotency() {
+    let client = client();
+    let vol_name = format!("test-sup-vol-{}", unique_name());
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let bin_path = temp_dir.path().join("openshell-sandbox");
+    tokio::fs::write(&bin_path, b"dummy-supervisor-binary")
+        .await
+        .unwrap();
+
+    // 1. Initial creation
+    client
+        .ensure_supervisor_volume("default", &vol_name, &bin_path)
+        .await
+        .expect("initial ensure_supervisor_volume should succeed");
+
+    // Check volume exists
+    let exists = client
+        .storage_pool_volume_exists("default", "custom", &vol_name)
+        .await
+        .expect("storage_pool_volume_exists should succeed");
+    assert!(exists);
+
+    // 2. Second call is an idempotent no-op (short circuits on exists check)
+    client
+        .ensure_supervisor_volume("default", &vol_name, &bin_path)
+        .await
+        .expect("second ensure_supervisor_volume should succeed idempotently");
+
+    // Clean up volume
+    if let Ok(op) = client
+        .delete_storage_pool_volume("default", "custom", &vol_name)
+        .await
+    {
+        let _ = client.wait_operation(&op.id).await;
+    }
+}
+
+#[tokio::test]
+async fn ensure_dhcp_client_volume_lifecycle_and_idempotency() {
+    let client = client();
+    let vol_name = format!("test-dhcp-vol-{}", unique_name());
+
+    let bin_bytes = b"dummy-udhcpc-binary";
+    let script_bytes = b"#!/bin/sh\necho test\n";
+
+    // 1. Initial creation
+    client
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .await
+        .expect("initial ensure_dhcp_client_volume should succeed");
+
+    // Check volume exists
+    let exists = client
+        .storage_pool_volume_exists("default", "custom", &vol_name)
+        .await
+        .expect("storage_pool_volume_exists should succeed");
+    assert!(exists);
+
+    // Verify files in the provisioned volume have executable permissions (0o755)
+    let inst_name = unique_name();
+    let mut devices = sandbox_devices();
+    let mut vol_device = HashMap::new();
+    vol_device.insert("type".to_string(), "disk".to_string());
+    vol_device.insert("pool".to_string(), "default".to_string());
+    vol_device.insert("source".to_string(), vol_name.clone());
+    vol_device.insert("path".to_string(), "/mnt/dhcp".to_string());
+    devices.insert("dhcp-vol".to_string(), vol_device);
+
+    let create_op = client
+        .create_instance(
+            &inst_name,
+            TEST_IMAGE_ALIAS,
+            HashMap::new(),
+            devices,
+            vec![],
+            true,
+        )
+        .await
+        .expect("create_instance with custom volume should succeed");
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        client.wait_operation(&create_op.id),
+    )
+    .await
+    .expect("create should not time out")
+    .expect("create should succeed");
+
+    let (bin_fetched, bin_mode) = client
+        .get_file_from_instance(&inst_name, "/mnt/dhcp/udhcpc")
+        .await
+        .expect("fetching udhcpc from instance should succeed");
+    assert_eq!(&bin_fetched[..], bin_bytes);
+    assert_eq!(bin_mode & 0o777, 0o755, "udhcpc must have mode 0o755");
+
+    let (script_fetched, script_mode) = client
+        .get_file_from_instance(&inst_name, "/mnt/dhcp/udhcpc.script")
+        .await
+        .expect("fetching udhcpc.script from instance should succeed");
+    assert_eq!(&script_fetched[..], script_bytes);
+    assert_eq!(
+        script_mode & 0o777,
+        0o755,
+        "udhcpc.script must have mode 0o755"
+    );
+
+    let stop_op = client
+        .stop_instance(&inst_name, true)
+        .await
+        .expect("stop_instance should succeed");
+    let _ = client.wait_operation(&stop_op.id).await;
+
+    let delete_inst_op = client
+        .delete_instance(&inst_name)
+        .await
+        .expect("delete_instance should succeed");
+    let _ = client.wait_operation(&delete_inst_op.id).await;
+
+    // 2. Second call is an idempotent no-op (short circuits on exists check)
+    client
+        .ensure_dhcp_client_volume("default", &vol_name, bin_bytes, script_bytes)
+        .await
+        .expect("second ensure_dhcp_client_volume should succeed idempotently");
+
+    // Clean up volume
+    if let Ok(op) = client
+        .delete_storage_pool_volume("default", "custom", &vol_name)
+        .await
+    {
+        let _ = client.wait_operation(&op.id).await;
+    }
+}
+
+/// Builds a minimal split image (`metadata.tar.xz` bytes and a
+/// `rootfs.squashfs` path) in `dir`, or `None` if `xz` or `mksquashfs` is
+/// missing.
+async fn build_split_image(dir: &std::path::Path) -> Option<(Vec<u8>, PathBuf)> {
+    let metadata_yaml = format!(
+        "architecture: \"x86_64\"\ncreation_date: {}\nproperties:\n  description: \"test split image\"\n",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    );
+    let meta_file_path = dir.join("metadata.yaml");
+    tokio::fs::write(&meta_file_path, metadata_yaml.as_bytes())
+        .await
+        .unwrap();
+
+    let meta_tar_path = dir.join("metadata.tar");
+    {
+        let tar_file = std::fs::File::create(&meta_tar_path).unwrap();
+        let mut builder = tar::Builder::new(tar_file);
+        builder
+            .append_path_with_name(&meta_file_path, "metadata.yaml")
+            .unwrap();
+        builder.finish().unwrap();
+    }
+
+    let xz = tokio::process::Command::new("xz")
+        .args(["-z", "-k", meta_tar_path.to_str().unwrap()])
+        .output()
+        .await;
+    if !matches!(&xz, Ok(output) if output.status.success()) {
+        return None;
+    }
+    let metadata_bytes = tokio::fs::read(dir.join("metadata.tar.xz")).await.unwrap();
+
+    let rootfs_dir = dir.join("rootfs");
+    tokio::fs::create_dir(&rootfs_dir).await.unwrap();
+    tokio::fs::write(rootfs_dir.join("test.txt"), b"hello-split-image")
+        .await
+        .unwrap();
+    let squashfs_path = dir.join("rootfs.squashfs");
+    let mksquashfs = tokio::process::Command::new("mksquashfs")
+        .args([
+            rootfs_dir.to_str().unwrap(),
+            squashfs_path.to_str().unwrap(),
+            "-noappend",
+        ])
+        .output()
+        .await;
+    if !matches!(&mksquashfs, Ok(output) if output.status.success()) {
+        return None;
+    }
+
+    Some((metadata_bytes, squashfs_path))
+}
+
+async fn fingerprint_of(client: &LxdClient, op_id: &str) -> String {
+    let finished_op = tokio::time::timeout(Duration::from_secs(60), client.wait_operation(op_id))
+        .await
+        .expect("image upload operation should not time out")
+        .expect("image upload operation should complete successfully");
+    finished_op
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("fingerprint"))
+        .and_then(|f| f.as_str())
+        .expect("operation response missing image fingerprint")
+        .to_string()
+}
+
+#[tokio::test]
+async fn create_image_from_split_streams_rootfs() {
+    let client = client();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let Some((metadata_bytes, squashfs_path)) = build_split_image(temp_dir.path()).await else {
+        eprintln!(
+            "xz or mksquashfs not available; skipping create_image_from_split_streams_rootfs"
+        );
+        return;
+    };
+
+    let op = client
+        .create_image_from_split(
+            "metadata.tar.xz",
+            &metadata_bytes,
+            "rootfs.squashfs",
+            &squashfs_path,
+        )
+        .await
+        .expect("create_image_from_split should succeed");
+    let fingerprint = fingerprint_of(&client, &op.id).await;
+
+    let aliases = client
+        .get_image_aliases(&fingerprint)
+        .await
+        .expect("get_image_aliases should succeed");
+    assert!(aliases.is_empty(), "newly imported image has no aliases");
+
+    let alias_name = unique_name();
+    client
+        .create_image_alias(&alias_name, &fingerprint, None)
+        .await
+        .expect("create_image_alias should succeed");
+
+    let aliases = client
+        .get_image_aliases(&fingerprint)
+        .await
+        .expect("get_image_aliases should succeed");
+    assert_eq!(aliases, vec![alias_name]);
+
+    // Clean up the created image in LXD
+    if let Ok(del_op) = client.delete_image(&fingerprint).await {
+        let _ = client.wait_operation(&del_op.id).await;
+    }
+}
+
+/// Every request a project-scoped client makes lands in its project,
+/// including the raw uploads (storage volumes from a tarball, split images)
+/// and file reads that bypass the JSON request path. Without that, a driver
+/// running in a non-default project creates volumes and images in `default`
+/// and then waits for their operations in the wrong project.
+#[tokio::test]
+async fn raw_uploads_and_file_access_stay_in_the_client_project() {
+    let default_client = client();
+    let project = unique_name();
+    default_client
+        .create_project(&project)
+        .await
+        .expect("create_project should succeed");
+    let project_client = client().with_project(&project);
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // A volume uploaded as a tarball is created in the project.
+    let volume = format!("test-proj-vol-{}", unique_name());
+    let bin_path = temp_dir.path().join("openshell-sandbox");
+    tokio::fs::write(&bin_path, b"dummy-supervisor-binary")
+        .await
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(60),
+        project_client.ensure_supervisor_volume("default", &volume, &bin_path),
+    )
+    .await
+    .expect("volume upload in a project should not hang")
+    .expect("ensure_supervisor_volume in a project should succeed");
+    assert!(project_client
+        .storage_pool_volume_exists("default", "custom", &volume)
+        .await
+        .unwrap());
+    assert!(
+        !default_client
+            .storage_pool_volume_exists("default", "custom", &volume)
+            .await
+            .unwrap(),
+        "the volume must not be created in the default project"
+    );
+
+    // A split image upload lands in the project too, and an instance created
+    // from it there can have files pushed and read back.
+    let image_dir = temp_dir.path().join("image");
+    tokio::fs::create_dir(&image_dir).await.unwrap();
+    let mut fingerprint = None;
+    let mut instance = None;
+    if let Some((metadata_bytes, squashfs_path)) = build_split_image(&image_dir).await {
+        let op = project_client
+            .create_image_from_split(
+                "metadata.tar.xz",
+                &metadata_bytes,
+                "rootfs.squashfs",
+                &squashfs_path,
+            )
+            .await
+            .expect("create_image_from_split in a project should succeed");
+        let image = fingerprint_of(&project_client, &op.id).await;
+        fingerprint = Some(image.clone());
+
+        let alias = format!("test-proj-img-{}", unique_name());
+        project_client
+            .create_image_alias(&alias, &image, None)
+            .await
+            .expect("the uploaded image should exist in the project");
+        assert!(project_client.image_alias_exists(&alias).await.unwrap());
+
+        let name = unique_name();
+        let create_op = project_client
+            .create_instance(
+                &name,
+                &alias,
+                HashMap::new(),
+                sandbox_devices(),
+                vec![],
+                false,
+            )
+            .await
+            .expect("create_instance in a project should succeed");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            project_client.wait_operation(&create_op.id),
+        )
+        .await
+        .expect("create should not time out")
+        .expect("create should succeed");
+        instance = Some(name.clone());
+
+        project_client
+            .push_file_into_instance(&name, "/etc/openshell/auth/sandbox.jwt", b"token")
+            .await
+            .expect("pushing a file into a project instance should succeed");
+        let (content, mode) = project_client
+            .get_file_from_instance(&name, "/etc/openshell/auth/sandbox.jwt")
+            .await
+            .expect("reading a file from a project instance should succeed");
+        assert_eq!(&content[..], b"token");
+        assert_eq!(mode, 0o400);
+    } else {
+        eprintln!("xz or mksquashfs not available; skipping the image part");
+    }
+
+    if let Some(name) = instance {
+        if let Ok(op) = project_client.delete_instance(&name).await {
+            let _ = project_client.wait_operation(&op.id).await;
+        }
+    }
+    if let Some(fingerprint) = fingerprint {
+        if let Ok(op) = project_client.delete_image(&fingerprint).await {
+            let _ = project_client.wait_operation(&op.id).await;
+        }
+    }
+    if let Ok(op) = project_client
+        .delete_storage_pool_volume("default", "custom", &volume)
+        .await
+    {
+        let _ = project_client.wait_operation(&op.id).await;
+    }
+    default_client
+        .delete_project(&project)
+        .await
+        .expect("delete_project should succeed");
+}
+
+#[tokio::test]
+async fn server_architectures_and_verify_architecture() {
+    let client = client();
+    let archs = client
+        .server_architectures()
+        .await
+        .expect("server_architectures should succeed");
+    assert!(
+        !archs.is_empty(),
+        "server architectures should not be empty"
+    );
+
+    // The host architecture must be supported by the local LXD
+    let host_arch = std::env::consts::ARCH;
+    client
+        .verify_architecture(host_arch)
+        .await
+        .expect("verify_architecture for host_arch should succeed");
+
+    // A completely foreign architecture should be rejected
+    let mismatch = client.verify_architecture("nonexistent-arch-12345").await;
+    assert!(
+        matches!(
+            mismatch,
+            Err(LxdError::Api {
+                status_code: 400,
+                ..
+            })
+        ),
+        "verify_architecture for mismatching architecture should return 400 error"
+    );
+}
