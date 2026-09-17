@@ -417,6 +417,179 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     );
 }
 
+/// With `--gateway-endpoint` sandboxes get that URL rather than one derived
+/// from their network, so a gateway that does not listen on the bridge — in
+/// an instance, or behind an OVN network — is reachable.
+#[tokio::test]
+async fn explicit_gateway_endpoint_reaches_the_instance() {
+    let endpoint = "http://192.0.2.10:17670";
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("endpoint");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    driver
+        .create(sandbox(&name))
+        .await
+        .expect("create_sandbox should succeed");
+
+    let config = lxd()
+        .get_instance(&name)
+        .await
+        .expect("raw get_instance")
+        .config;
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some(endpoint)
+    );
+}
+
+/// The init script points `host.openshell.internal` at the gateway endpoint's
+/// address, whether the endpoint names an IPv6 address or a host, and seeds
+/// nothing for a host it cannot resolve rather than writing a name where
+/// `/etc/hosts` needs an address.
+#[tokio::test]
+async fn host_alias_follows_the_gateway_endpoint() {
+    for (endpoint, expected) in [
+        ("http://[fd42::5]:17670", Some(vec!["fd42::5"])),
+        ("http://localhost:17670", Some(vec!["127.0.0.1", "::1"])),
+        ("http://gateway.invalid:17670", None),
+    ] {
+        let driver = Driver::start_with(DriverOptions {
+            extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
+            ..Default::default()
+        })
+        .await;
+        let name = unique_name("alias");
+        let _cleanup = driver.cleanup(&[&name]);
+        driver.create_running(&name).await;
+
+        // The init script logs the outcome before handing over to the
+        // supervisor.
+        let log = eventually(Duration::from_secs(60), "the init script", || async {
+            let log = driver.console_log(&name);
+            (log.contains("seeded /etc/hosts") || log.contains("not seeded")).then_some(log)
+        })
+        .await;
+        let (hosts, _) = lxd()
+            .get_file_from_instance(&name, "/etc/hosts")
+            .await
+            .expect("read /etc/hosts");
+        let alias = String::from_utf8_lossy(&hosts)
+            .lines()
+            .find(|line| line.contains("host.openshell.internal"))
+            .map(|line| {
+                line.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+
+        match expected {
+            Some(addresses) => assert!(
+                alias.as_deref().is_some_and(|a| addresses.contains(&a)),
+                "{endpoint}: alias {alias:?}, expected one of {addresses:?}; console:\n{log}"
+            ),
+            None => {
+                assert_eq!(alias, None, "{endpoint}: console:\n{log}");
+                assert!(
+                    log.contains("cannot resolve gateway host"),
+                    "{endpoint}: {log}"
+                );
+            }
+        }
+    }
+}
+
+/// With TLS materials sandboxes get an https endpoint and the materials at
+/// the paths the supervisor reads, readable by root only.
+#[tokio::test]
+async fn guest_tls_materials_reach_the_instance() {
+    let tls_dir = tempfile::tempdir().expect("create TLS dir");
+    let files = [
+        (
+            "ca.crt",
+            "--guest-tls-ca",
+            "OPENSHELL_TLS_CA",
+            "/etc/openshell/tls/client/ca.crt",
+        ),
+        (
+            "tls.crt",
+            "--guest-tls-cert",
+            "OPENSHELL_TLS_CERT",
+            "/etc/openshell/tls/client/tls.crt",
+        ),
+        (
+            "tls.key",
+            "--guest-tls-key",
+            "OPENSHELL_TLS_KEY",
+            "/etc/openshell/tls/client/tls.key",
+        ),
+    ];
+    let mut extra_args = Vec::new();
+    for (file, flag, _, _) in files {
+        let path = tls_dir.path().join(file);
+        std::fs::write(&path, format!("test {file}")).expect("write TLS material");
+        extra_args.extend([flag.to_string(), path.display().to_string()]);
+    }
+    extra_args.extend([
+        "--gateway-tls-server-name".to_string(),
+        "gateway.openshell.internal".to_string(),
+    ]);
+    let driver = Driver::start_with(DriverOptions {
+        allow_plaintext_gateway: false,
+        extra_args,
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("tls");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    driver
+        .create(sandbox(&name))
+        .await
+        .expect("create_sandbox should succeed");
+
+    let config = lxd()
+        .get_instance(&name)
+        .await
+        .expect("raw get_instance")
+        .config;
+    let expected_endpoint = format!("https://{}:17670", bridge_ipv4("lxdbr0").await);
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some(expected_endpoint.as_str())
+    );
+    assert_eq!(
+        config
+            .get("environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME")
+            .map(String::as_str),
+        Some("gateway.openshell.internal")
+    );
+    for (file, _, env, guest_path) in files {
+        assert_eq!(
+            config
+                .get(&format!("environment.{env}"))
+                .map(String::as_str),
+            Some(guest_path),
+            "{env}"
+        );
+        let (content, mode) = lxd()
+            .get_file_from_instance(&name, guest_path)
+            .await
+            .unwrap_or_else(|e| panic!("{guest_path} should exist in the sandbox: {e}"));
+        assert_eq!(content.as_ref(), format!("test {file}").as_bytes());
+        assert_eq!(mode, 0o400, "{guest_path}");
+    }
+}
+
 /// A rejected create must not leave anything behind in LXD.
 #[tokio::test]
 async fn invalid_creates_are_rejected_without_leftovers() {
@@ -436,10 +609,16 @@ async fn invalid_creates_are_rejected_without_leftovers() {
         fields: BTreeMap::from([("network".to_string(), string_value("odl-no-such-net"))]),
     });
 
+    let mut bad_pool = sandbox(&unique_name("badpool"));
+    template_mut(&mut bad_pool).driver_config = Some(Struct {
+        fields: BTreeMap::from([("storage_pool".to_string(), string_value("odl-no-such-pool"))]),
+    });
+
     for (request, code) in [
         (bad_label, Code::InvalidArgument),
         (bad_quantity, Code::InvalidArgument),
-        (bad_network, Code::NotFound),
+        (bad_network, Code::FailedPrecondition),
+        (bad_pool, Code::FailedPrecondition),
     ] {
         let name = request.name.clone();
         let _cleanup = driver.cleanup(&[&name]);

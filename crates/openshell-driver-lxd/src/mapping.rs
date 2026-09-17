@@ -19,8 +19,6 @@ const KEY_NAMESPACE: &str = "user.openshell.namespace";
 const KEY_WORKSPACE: &str = "user.openshell.workspace";
 const LABEL_PREFIX: &str = "user.openshell.label.";
 const ENV_PREFIX: &str = "environment.";
-const DEFAULT_STORAGE_POOL: &str = "default";
-const DEFAULT_NETWORK: &str = "lxdbr0";
 
 /// Identifies the guest-side path where the token file is bind-mounted.
 /// The supervisor finds it via `OPENSHELL_SANDBOX_TOKEN_FILE`.
@@ -58,6 +56,26 @@ pub fn main_process_spec(spec: &DriverSandboxSpec) -> String {
     .to_string()
 }
 
+/// Guest-side paths of the TLS materials the supervisor connects to the
+/// gateway with — the paths upstream's `openshell-core::driver_utils` gives
+/// every driver (OpenShell v0.0.116), so the layout matches the in-tree ones.
+pub(crate) const GUEST_TLS_CA_PATH: &str = "/etc/openshell/tls/client/ca.crt";
+pub(crate) const GUEST_TLS_CERT_PATH: &str = "/etc/openshell/tls/client/tls.crt";
+pub(crate) const GUEST_TLS_KEY_PATH: &str = "/etc/openshell/tls/client/tls.key";
+
+/// Points the supervisor at the TLS materials pushed to [`GUEST_TLS_CA_PATH`],
+/// [`GUEST_TLS_CERT_PATH`] and [`GUEST_TLS_KEY_PATH`] (upstream's
+/// `OPENSHELL_TLS_CA`, `OPENSHELL_TLS_CERT` and `OPENSHELL_TLS_KEY`).
+pub fn insert_guest_tls_environment(config: &mut HashMap<String, String>) {
+    for (name, path) in [
+        ("OPENSHELL_TLS_CA", GUEST_TLS_CA_PATH),
+        ("OPENSHELL_TLS_CERT", GUEST_TLS_CERT_PATH),
+        ("OPENSHELL_TLS_KEY", GUEST_TLS_KEY_PATH),
+    ] {
+        config.insert(format!("{ENV_PREFIX}{name}"), path.to_string());
+    }
+}
+
 /// Guest-side directory where the digest-keyed supervisor storage volume is mounted.
 pub(crate) const GUEST_SUPERVISOR_BIN_DIR: &str = "/opt/openshell/bin";
 
@@ -79,17 +97,6 @@ pub(crate) fn dhcp_client_volume_name(digest: &str) -> String {
     let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
     format!("openshell-dhcp-client-{clean}")
 }
-
-/// LXD system containers ignore OCI entrypoints and run their own init. To ensure
-/// network interfaces (lo, eth0) are brought up and an IPv4 lease is obtained
-/// via DHCP before the supervisor starts, `lxc.init.cmd` is pointed at the
-/// injected init script (`/openshell-init.sh`) which performs one-shot network
-/// initialization and then exec-replaces itself into `/opt/openshell/bin/openshell-sandbox`
-/// (mounted from a custom storage volume disk device).
-/// Publishing an instance to an image does *not* carry this kind of instance config
-/// forward, so it has to be set on every create, not just once on the image.
-const KEY_RAW_LXC: &str = "raw.lxc";
-pub(crate) const RAW_LXC_INIT_CMD: &str = "lxc.init.cmd = /openshell-init.sh";
 
 /// Maps an [`Instance`] to a [`DriverSandbox`] observation. `spec` is left
 /// unset, per the proto's own doc comment: "Drivers may omit this in observed
@@ -273,12 +280,6 @@ pub fn build_create_config(
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
     config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
-    config.insert(KEY_RAW_LXC.to_string(), RAW_LXC_INIT_CMD.to_string());
-    // The supervisor installs its own seccomp BPF filter around the agent
-    // process and uses clone/unshare for namespace setup. security.nesting
-    // enables those paths.
-    config.insert("security.nesting".to_string(), "true".to_string());
-
     // template.environment takes precedence over spec.environment on key
     // collision, plus the two driver-injected vars the supervisor needs to
     // reach the gateway.
@@ -384,11 +385,11 @@ fn max_processes(template: &DriverSandboxTemplate) -> Option<u32> {
 }
 
 /// Builds the LXD `devices` map for `POST /1.0/instances`: a root disk on
-/// the configured (or default) storage pool, a NIC on the configured (or
-/// default) network, a read-only supervisor disk volume, a read-only DHCP client
-/// disk volume, and an optional GPU device.
+/// the placement's storage pool, a NIC on its network, a read-only supervisor
+/// disk volume, a read-only DHCP client disk volume, and an optional GPU
+/// device.
 pub fn build_create_devices(
-    template: &DriverSandboxTemplate,
+    placement: Placement<'_>,
     gpu: bool,
     supervisor_pool: &str,
     supervisor_volume: &str,
@@ -399,13 +400,13 @@ pub fn build_create_devices(
 
     let mut root = HashMap::new();
     root.insert("type".to_string(), "disk".to_string());
-    root.insert("pool".to_string(), storage_pool(template).to_string());
+    root.insert("pool".to_string(), placement.storage_pool.to_string());
     root.insert("path".to_string(), "/".to_string());
     devices.insert("root".to_string(), root);
 
     let mut eth0 = HashMap::new();
     eth0.insert("type".to_string(), "nic".to_string());
-    eth0.insert("network".to_string(), network(template).to_string());
+    eth0.insert("network".to_string(), placement.network.to_string());
     devices.insert("eth0".to_string(), eth0);
 
     let mut supervisor = HashMap::new();
@@ -445,20 +446,34 @@ pub fn build_profiles(template: &DriverSandboxTemplate) -> Vec<String> {
     profiles
 }
 
-/// Returns the LXD network a sandbox's NIC attaches to: `driver_config.network`,
-/// defaulting to `lxdbr0`.
-pub fn network(template: &DriverSandboxTemplate) -> &str {
-    struct_get_str(template.driver_config.as_ref(), "network").unwrap_or(DEFAULT_NETWORK)
+/// Where a sandbox lives in LXD: the network its NIC attaches to and the
+/// storage pool its root disk is on.
+///
+/// The storage pool also places the supervisor and DHCP-client volumes, so
+/// those auxiliary volumes land on the same pool as the rootfs they attach to
+/// unless the operator pins them with `--supervisor-storage-pool`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Placement<'a> {
+    pub network: &'a str,
+    pub storage_pool: &'a str,
 }
 
-/// Returns the LXD storage pool a sandbox's root disk lives on:
-/// `driver_config.storage_pool`, defaulting to `default`.
-///
-/// Also used to place the supervisor and DHCP-client volumes, so those
-/// auxiliary volumes land on the same pool as the rootfs they attach to
-/// unless the operator pins them with `--supervisor-storage-pool`.
-pub(crate) fn storage_pool(template: &DriverSandboxTemplate) -> &str {
-    struct_get_str(template.driver_config.as_ref(), "storage_pool").unwrap_or(DEFAULT_STORAGE_POOL)
+impl<'a> Placement<'a> {
+    /// The request's `driver_config.network` and `driver_config.storage_pool`,
+    /// each falling back to the driver's configured default when unset, so
+    /// users need not know how the LXD behind the gateway is laid out.
+    pub fn resolve(
+        template: &'a DriverSandboxTemplate,
+        default_network: &'a str,
+        default_storage_pool: &'a str,
+    ) -> Self {
+        let driver_config = template.driver_config.as_ref();
+        Self {
+            network: struct_get_str(driver_config, "network").unwrap_or(default_network),
+            storage_pool: struct_get_str(driver_config, "storage_pool")
+                .unwrap_or(default_storage_pool),
+        }
+    }
 }
 
 pub(crate) fn is_valid_label_key(key: &str) -> bool {
@@ -494,6 +509,11 @@ mod tests {
 
     use super::*;
 
+    const DEFAULTS: Placement<'static> = Placement {
+        network: "lxdbr0",
+        storage_pool: "default",
+    };
+
     #[test]
     fn test_dhcp_client_volume_name() {
         assert_eq!(
@@ -508,14 +528,8 @@ mod tests {
 
     #[test]
     fn build_create_devices_omits_gpu_by_default() {
-        let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
-            false,
-            "default",
-            "vol1",
-            "default",
-            "dhcp-vol1",
-        );
+        let devices =
+            build_create_devices(DEFAULTS, false, "default", "vol1", "default", "dhcp-vol1");
 
         assert!(!devices.contains_key("gpu0"));
         assert!(devices.contains_key("root"));
@@ -526,14 +540,8 @@ mod tests {
 
     #[test]
     fn build_create_devices_attaches_gpu_when_requested() {
-        let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
-            true,
-            "default",
-            "vol1",
-            "default",
-            "dhcp-vol1",
-        );
+        let devices =
+            build_create_devices(DEFAULTS, true, "default", "vol1", "default", "dhcp-vol1");
 
         let gpu0 = devices.get("gpu0").expect("gpu0 device should be present");
         assert_eq!(gpu0.get("type"), Some(&"gpu".to_string()));
@@ -546,7 +554,7 @@ mod tests {
         let sup_vol_name = supervisor_volume_name(digest);
         let dhcp_vol_name = dhcp_client_volume_name(digest);
         let devices = build_create_devices(
-            &DriverSandboxTemplate::default(),
+            DEFAULTS,
             false,
             "custom-pool",
             &sup_vol_name,
@@ -574,8 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn guest_supervisor_paths_and_init_cmd_contract() {
-        assert_eq!(RAW_LXC_INIT_CMD, "lxc.init.cmd = /openshell-init.sh");
+    fn guest_supervisor_paths_contract() {
         assert_eq!(GUEST_SUPERVISOR_BIN_DIR, "/opt/openshell/bin");
         assert_eq!(
             GUEST_SUPERVISOR_BIN_PATH,
@@ -901,14 +908,15 @@ mod tests {
         );
         assert_eq!(config.get(KEY_NAMESPACE).map(String::as_str), Some("ns"));
         assert_eq!(config.get(KEY_WORKSPACE).map(String::as_str), Some("ws"));
-        assert_eq!(
-            config.get("raw.lxc").map(String::as_str),
-            Some(RAW_LXC_INIT_CMD)
+        // The image boots the init script as /sbin/init; low-level keys
+        // would make restricted projects refuse the sandbox.
+        assert!(
+            !config.keys().any(|key| key.starts_with("raw.")),
+            "{config:?}"
         );
-        assert_eq!(
-            config.get("security.nesting").map(String::as_str),
-            Some("true")
-        );
+        // The supervisor's namespaces, nftables fence and seccomp filter work
+        // in an unnested container; nesting is only set when asked for.
+        assert!(!config.contains_key("security.nesting"), "{config:?}");
         assert_eq!(
             config
                 .get("environment.OPENSHELL_SANDBOX_ID")
@@ -1344,10 +1352,38 @@ mod tests {
     }
 
     #[test]
-    fn network_and_storage_pool_default_and_override() {
+    fn guest_tls_environment_names_the_pushed_files() {
+        let mut config = HashMap::new();
+        insert_guest_tls_environment(&mut config);
+
+        for (key, value) in [
+            (
+                "environment.OPENSHELL_TLS_CA",
+                "/etc/openshell/tls/client/ca.crt",
+            ),
+            (
+                "environment.OPENSHELL_TLS_CERT",
+                "/etc/openshell/tls/client/tls.crt",
+            ),
+            (
+                "environment.OPENSHELL_TLS_KEY",
+                "/etc/openshell/tls/client/tls.key",
+            ),
+        ] {
+            assert_eq!(config.get(key).map(String::as_str), Some(value), "{key}");
+        }
+    }
+
+    #[test]
+    fn placement_defaults_and_override() {
         let defaults = DriverSandboxTemplate::default();
-        assert_eq!(network(&defaults), "lxdbr0");
-        assert_eq!(storage_pool(&defaults), "default");
+        assert_eq!(
+            Placement::resolve(&defaults, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "local",
+            }
+        );
 
         let custom = DriverSandboxTemplate {
             driver_config: driver_config(&[
@@ -1356,8 +1392,26 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert_eq!(network(&custom), "sandboxbr0");
-        assert_eq!(storage_pool(&custom), "fast");
+        assert_eq!(
+            Placement::resolve(&custom, "ovn0", "local"),
+            Placement {
+                network: "sandboxbr0",
+                storage_pool: "fast",
+            }
+        );
+
+        // Only one of them set: the other keeps the driver's default.
+        let pool_only = DriverSandboxTemplate {
+            driver_config: driver_config(&[("storage_pool", string_value("remote"))]),
+            ..Default::default()
+        };
+        assert_eq!(
+            Placement::resolve(&pool_only, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "remote",
+            }
+        );
 
         // Wrong types are ignored rather than half-applied.
         let wrong_types = DriverSandboxTemplate {
@@ -1377,21 +1431,23 @@ mod tests {
             ]),
             ..Default::default()
         };
-        assert_eq!(network(&wrong_types), "lxdbr0");
-        assert_eq!(storage_pool(&wrong_types), "default");
+        assert_eq!(
+            Placement::resolve(&wrong_types, "ovn0", "local"),
+            Placement {
+                network: "ovn0",
+                storage_pool: "local",
+            }
+        );
     }
 
     #[test]
-    fn devices_follow_driver_config_network_and_pool() {
-        let template = DriverSandboxTemplate {
-            driver_config: driver_config(&[
-                ("network", string_value("sandboxbr0")),
-                ("storage_pool", string_value("fast")),
-            ]),
-            ..Default::default()
+    fn devices_follow_placement() {
+        let placement = Placement {
+            network: "sandboxbr0",
+            storage_pool: "fast",
         };
 
-        let devices = build_create_devices(&template, false, "fast", "sup", "fast", "dhcp");
+        let devices = build_create_devices(placement, false, "fast", "sup", "fast", "dhcp");
 
         let root = devices.get("root").expect("root device");
         assert_eq!(root.get("pool").map(String::as_str), Some("fast"));

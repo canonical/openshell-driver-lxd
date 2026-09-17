@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use computev1::pb::{DriverSandbox, DriverSandboxTemplate, GetCapabilitiesResponse};
-use lxd_client::{LxdClient, LxdError};
+use computev1::pb::{DriverSandbox, GetCapabilitiesResponse};
+use lxd_client::{LxdClient, LxdError, NetworkType};
 use tokio::sync::Mutex;
 
 use crate::config::Config;
@@ -113,10 +113,10 @@ impl LxdComputeDriver {
             driver_name: DRIVER_NAME.to_string(),
             driver_version: env!("CARGO_PKG_VERSION").to_string(),
             default_image: self.config.default_image.clone(),
-            // The gateway would stop sandboxes when it shuts down and restart
-            // them with StartSandbox when it comes back, which this driver
-            // does not implement. Sandboxes keep running across gateway
-            // restarts instead.
+            // The gateway would stop every sandbox when it shuts down and
+            // start them again when it comes back. Sandboxes keep running
+            // across gateway restarts instead; StartSandbox is only for
+            // sandboxes that were stopped.
             gateway_manages_lifecycle: false,
         }
     }
@@ -248,9 +248,16 @@ impl LxdComputeDriver {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
 
+        let placement = mapping::Placement::resolve(
+            template,
+            &self.config.default_network,
+            &self.config.default_storage_pool,
+        );
+        let network = self.check_placement(placement).await?;
+
         let has_token = !spec.sandbox_token.is_empty();
-        let gateway_endpoint = self.resolve_gateway_endpoint(template).await?;
-        let config = mapping::build_create_config(
+        let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
+        let mut config = mapping::build_create_config(
             sandbox,
             spec,
             template,
@@ -258,6 +265,30 @@ impl LxdComputeDriver {
             has_token,
             self.config.default_max_processes,
         )?;
+
+        // Files the supervisor needs before it starts. The TLS materials are
+        // read now, before anything is created, so a missing or unreadable
+        // one fails the create without leaving an instance behind.
+        let mut guest_files = Vec::new();
+        if has_token {
+            guest_files.push((
+                mapping::GUEST_SANDBOX_TOKEN_PATH,
+                spec.sandbox_token.as_bytes().to_vec(),
+            ));
+        }
+        if self.config.guest_tls().is_some() {
+            guest_files.extend(self.read_guest_tls_files().await?);
+            mapping::insert_guest_tls_environment(&mut config);
+            if let Some(name) = &self.config.gateway_tls_server_name {
+                config.insert(
+                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
+                    name.clone(),
+                );
+            }
+        }
+        if self.config.sandbox_nesting {
+            config.insert("security.nesting".to_string(), "true".to_string());
+        }
 
         // Auxiliary volumes live on the sandbox's own pool unless the
         // operator pinned them, so a request asking for a non-default
@@ -267,7 +298,7 @@ impl LxdComputeDriver {
             .config
             .supervisor_storage_pool
             .as_deref()
-            .unwrap_or_else(|| mapping::storage_pool(template));
+            .unwrap_or(placement.storage_pool);
 
         let gpu = spec
             .resource_requirements
@@ -350,7 +381,7 @@ impl LxdComputeDriver {
         }
 
         let devices = mapping::build_create_devices(
-            template,
+            placement,
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -367,9 +398,9 @@ impl LxdComputeDriver {
             self.image_cache.resolve_alias(&template.image).await?
         };
 
-        // Create the instance stopped so we can push the token file before the
-        // supervisor starts — avoids a race where the supervisor reads
-        // OPENSHELL_SANDBOX_TOKEN_FILE before it has been written.
+        // Create the instance stopped so we can push the token and TLS files
+        // before the supervisor starts — avoids a race where the supervisor
+        // reads them before they have been written.
         let op = self
             .lxd
             .create_instance(
@@ -384,15 +415,7 @@ impl LxdComputeDriver {
         self.wait_operation(&op.id).await?;
 
         let post_create = async {
-            if has_token {
-                self.lxd
-                    .push_file_into_instance(
-                        &sandbox.name,
-                        mapping::GUEST_SANDBOX_TOKEN_PATH,
-                        spec.sandbox_token.as_bytes(),
-                    )
-                    .await?;
-            }
+            self.push_guest_files(&sandbox.name, &guest_files).await?;
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
@@ -435,14 +458,120 @@ impl LxdComputeDriver {
             .clone()
     }
 
+    /// Reads the configured sandbox TLS materials, paired with the paths they
+    /// go to in the sandbox. Read on every use, so rotated files reach the
+    /// next sandbox that is created or started.
+    async fn read_guest_tls_files(&self) -> Result<Vec<(&'static str, Vec<u8>)>, DriverError> {
+        let Some(tls) = self.config.guest_tls() else {
+            return Ok(Vec::new());
+        };
+        let mut files = Vec::with_capacity(3);
+        for (guest_path, host_path) in [
+            (mapping::GUEST_TLS_CA_PATH, tls.ca),
+            (mapping::GUEST_TLS_CERT_PATH, tls.cert),
+            (mapping::GUEST_TLS_KEY_PATH, tls.key),
+        ] {
+            let content = tokio::fs::read(host_path).await.map_err(|e| {
+                DriverError::FailedPrecondition(format!(
+                    "could not read the sandbox TLS material {}: {e}",
+                    host_path.display()
+                ))
+            })?;
+            files.push((guest_path, content));
+        }
+        Ok(files)
+    }
+
+    /// Pushes files into a stopped sandbox, readable by root only: the
+    /// supervisor runs as root, the workload it starts does not.
+    async fn push_guest_files(
+        &self,
+        name: &str,
+        files: &[(&str, Vec<u8>)],
+    ) -> Result<(), DriverError> {
+        for (guest_path, content) in files {
+            self.lxd
+                .push_file_into_instance(name, guest_path, content)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Starts a stopped sandbox again, idempotently.
+    ///
+    /// The instance keeps its token and configuration across a stop; the TLS
+    /// materials are pushed again so a restarted sandbox gets the current
+    /// ones. The stop marker is cleared before starting, so a sandbox that
+    /// later exits by itself is reported as `ContainerExited` rather than as
+    /// stopped on request, but restored if the start fails.
+    pub async fn start_sandbox(&self, name: &str) -> Result<(), DriverError> {
+        let lifecycle_lock = self.instance_lifecycle_lock(name).await;
+        let sandbox_id = {
+            let _guard = lifecycle_lock.lock().await;
+
+            let instance = self.get_managed_instance(name).await?;
+            // Settling re-reads the instance; the id tells a restart of this
+            // sandbox from one that reused the name in the meantime.
+            let sandbox_id = instance
+                .config
+                .get(mapping::KEY_SANDBOX_ID)
+                .cloned()
+                .unwrap_or_default();
+            match instance.status.as_str() {
+                "Stopped" => {}
+                // Already up, or on its way there.
+                "Running" | "Ready" | "Starting" => return Ok(()),
+                // Anything else — paused, stopping, broken — would not be running
+                // after an "OK" here.
+                other => {
+                    return Err(DriverError::FailedPrecondition(format!(
+                        "sandbox instance is {other}, not stopped; it can be started once it has stopped"
+                    )));
+                }
+            }
+
+            let tls_files = self.read_guest_tls_files().await?;
+            self.push_guest_files(name, &tls_files).await?;
+
+            let had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
+            if had_stop_intent {
+                let mut config = HashMap::new();
+                config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
+                self.lxd.patch_instance_config(name, config).await?;
+            }
+
+            let op = match self.lxd.start_instance(name).await {
+                Ok(op) => op,
+                Err(e) => {
+                    if had_stop_intent {
+                        self.set_stop_intent(name).await;
+                    }
+                    return Err(e.into());
+                }
+            };
+            if let Err(e) = self.wait_operation(&op.id).await {
+                if had_stop_intent {
+                    if let Ok(current) = self.lxd.get_instance(name).await {
+                        if current.status.eq_ignore_ascii_case("Stopped") {
+                            self.set_stop_intent(name).await;
+                        }
+                    }
+                }
+                return Err(e);
+            }
+
+            sandbox_id
+        };
+
+        self.settle_after_start(name, &sandbox_id).await
+    }
+
     /// Records that the driver stopped this sandbox deliberately (see
     /// [`mapping::KEY_STOP_INTENT`]).
     ///
     /// Best-effort: the marker only refines the reason reported for a stopped
-    /// sandbox, so failing to write it must not fail the stop itself. Nothing
-    /// clears it because this driver exposes no start RPC — a stopped sandbox
-    /// is only ever deleted. A future `StartSandbox` would need to clear it so
-    /// a later crash is not reported as a deliberate stop.
+    /// sandbox, so failing to write it must not fail the stop itself.
+    /// [`Self::start_sandbox`] clears it.
     async fn set_stop_intent(&self, name: &str) {
         let mut config = HashMap::new();
         config.insert(
@@ -519,22 +648,73 @@ impl LxdComputeDriver {
         Ok(())
     }
 
-    /// Resolves `OPENSHELL_ENDPOINT` from the sandbox's own target network's
-    /// host-side bridge IP and the configured gateway gRPC port.
-    async fn resolve_gateway_endpoint(
+    /// Confirms that the network and storage pool a sandbox is placed on
+    /// exist, before anything slow (an image import) or anything that would
+    /// need cleaning up (volumes, the instance) happens. Returns the network.
+    ///
+    /// A missing one is a `FailedPrecondition` naming it and how to choose
+    /// another, which the gateway passes on to the user as is; LXD's own 404
+    /// ("Network not found") names neither.
+    async fn check_placement(
         &self,
-        template: &DriverSandboxTemplate,
+        placement: mapping::Placement<'_>,
+    ) -> Result<lxd_client::Network, DriverError> {
+        let project = &self.config.project;
+        let network = match self.lxd.get_network(placement.network).await {
+            Ok(network) => network,
+            Err(LxdError::Api {
+                status_code: 404, ..
+            }) => {
+                return Err(DriverError::FailedPrecondition(format!(
+                    "LXD network {:?} does not exist in project {project:?}; set the sandbox's \
+                     driver_config.network or the driver's --default-network to an existing one",
+                    placement.network
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if !self.lxd.storage_pool_exists(placement.storage_pool).await? {
+            return Err(DriverError::FailedPrecondition(format!(
+                "LXD storage pool {:?} does not exist; set the sandbox's \
+                 driver_config.storage_pool or the driver's --default-storage-pool to an existing one",
+                placement.storage_pool
+            )));
+        }
+        Ok(network)
+    }
+
+    /// Resolves `OPENSHELL_ENDPOINT`: `--gateway-endpoint` when set, otherwise
+    /// the host-side address of the sandbox's network and the configured
+    /// gateway gRPC port.
+    fn resolve_gateway_endpoint(
+        &self,
+        network_name: &str,
+        network: &lxd_client::Network,
     ) -> Result<String, DriverError> {
-        let network_name = mapping::network(template);
-        let network = self.lxd.get_network(network_name).await?;
+        if let Some(endpoint) = &self.config.gateway_endpoint {
+            return Ok(endpoint.clone());
+        }
+        // An OVN network's address is its virtual router's, which nothing on
+        // the host can listen on; deriving the endpoint from it would send
+        // every supervisor to the router.
+        if network.type_ == NetworkType::Ovn {
+            return Err(DriverError::FailedPrecondition(format!(
+                "network {network_name:?} is an OVN network, whose address belongs to its \
+                 virtual router rather than the gateway; set the driver's --gateway-endpoint \
+                 to the URL sandboxes reach the gateway at"
+            )));
+        }
         let cidr = network.config.get("ipv4.address").ok_or_else(|| {
-            DriverError::InvalidArgument(format!(
+            DriverError::FailedPrecondition(format!(
                 "network {network_name:?} has no ipv4.address configured"
             ))
         })?;
         let host_ip = cidr.split('/').next().unwrap_or(cidr);
         let port = self.config.gateway_grpc_port;
-        Ok(format!("http://{host_ip}:{port}"))
+        Ok(format!(
+            "{}://{host_ip}:{port}",
+            self.config.gateway_scheme()
+        ))
     }
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
@@ -1035,6 +1215,6 @@ mod tests {
             .resolve_alias(&template.image)
             .await
             .unwrap();
-        assert_eq!(resolved, format!("openshell-oci-r2-{digest_hex}"));
+        assert_eq!(resolved, format!("openshell-oci-r3-{digest_hex}"));
     }
 }

@@ -2,7 +2,7 @@
 
 OpenShell Compute driver for LXD
 
-**Status:** Early development. The core sandbox lifecycle (create/get/list/stop/delete,
+**Status:** Early development. The core sandbox lifecycle (create/get/list/stop/start/delete,
 token delivery, exec) works end-to-end against a real OpenShell gateway. A
 number of features are not yet implemented — see
 [Known limitations](#known-limitations) below.
@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd), initialized with a `default` storage pool and an `lxdbr0` network
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools))
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -49,14 +49,35 @@ gateway so you can create a sandbox end-to-end.
    lxd init --auto
    ```
 
-2. **Build and run the driver:**
+2. **Create the gateway's PKI.** Sandboxes connect to the gateway over
+   mutual TLS, and the driver refuses to start without the materials to give
+   them. The gateway release generates a CA, server and client certificates
+   and the sandbox-token signing key; the server certificate must name the
+   address sandboxes reach the gateway at:
+
+   ```sh
+   BRIDGE_IP="$(lxc network get lxdbr0 ipv4.address | cut -d/ -f1)"
+   PKI=/tmp/openshell-pki
+   openshell-gateway generate-certs --output-dir "$PKI" --server-san "$BRIDGE_IP"
+   ```
+
+3. **Build and run the driver:**
 
    ```sh
    make build
    ./target/debug/openshell-driver-lxd \
        --socket /tmp/openshell-driver.sock \
-       --gateway-grpc-port 17670
+       --gateway-grpc-port 17670 \
+       --guest-tls-ca "$PKI/ca.crt" \
+       --guest-tls-cert "$PKI/client/tls.crt" \
+       --guest-tls-key "$PKI/client/tls.key"
    ```
+
+   The CA, client certificate and key are copied into every sandbox for its
+   supervisor, and sandboxes are pointed at `https://<bridge address>:17670`.
+   `--allow-plaintext-gateway` replaces the three TLS flags with a plaintext
+   gateway, for local testing only; the repository's test environment uses
+   it.
 
    No sandbox image needs to be pre-built or pre-loaded: the driver pulls the
    default image (`--default-image`, the upstream community
@@ -81,37 +102,32 @@ gateway so you can create a sandbox end-to-end.
 
    `--gateway-grpc-port` must match the port the gateway is told to listen on
    below — the driver uses it to construct each sandbox's `OPENSHELL_ENDPOINT`.
+   A gateway that is not on the bridge needs `--gateway-endpoint` instead (see
+   [Reaching the gateway](#reaching-the-gateway)).
 
-3. **Start an OpenShell gateway pointed at the driver's socket**, using the
+4. **Start an OpenShell gateway pointed at the driver's socket**, using the
    out-of-tree driver flags. The gateway must be able to mint sandbox tokens
    (`gateway_jwt`), or every supervisor exits with "no sandbox token source
-   available". A plaintext gateway still enforces request authentication by
-   default, so for local/dev use the config also disables it. This is the
-   setup the upstream test suites run against OpenShell v0.0.116 (config
-   schema `version = 1` and `--drivers`; later gateways use `version = 2`
-   and `--compute-driver`):
+   available". This is for OpenShell v0.0.116 (config schema `version = 1`
+   and `--drivers`; later gateways use `version = 2` and
+   `--compute-driver`):
 
    ```sh
-   openssl genpkey -algorithm ed25519 -out /tmp/openshell-jwt.pem
-   openssl pkey -in /tmp/openshell-jwt.pem -pubout -out /tmp/openshell-jwt.pub
-   echo lxd-demo > /tmp/openshell-jwt.kid
-
-   cat > /tmp/openshell-gateway.toml <<'EOF'
+   cat > /tmp/openshell-gateway.toml <<EOF
    [openshell]
    version = 1
 
-   [openshell.gateway.auth]
-   allow_unauthenticated_users = true
-
    [openshell.gateway.gateway_jwt]
-   signing_key_path = "/tmp/openshell-jwt.pem"
-   public_key_path = "/tmp/openshell-jwt.pub"
-   kid_path = "/tmp/openshell-jwt.kid"
+   signing_key_path = "$PKI/jwt/signing.pem"
+   public_key_path = "$PKI/jwt/public.pem"
+   kid_path = "$PKI/jwt/kid"
    EOF
 
-   BRIDGE_IP="$(lxc network get lxdbr0 ipv4.address | cut -d/ -f1)"
    openshell-gateway \
-       --disable-tls \
+       --tls-cert "$PKI/server/tls.crt" \
+       --tls-key "$PKI/server/tls.key" \
+       --tls-client-ca "$PKI/ca.crt" \
+       --enable-mtls-auth true \
        --bind-address "$BRIDGE_IP" \
        --port 17670 \
        --drivers lxd \
@@ -122,20 +138,21 @@ gateway so you can create a sandbox end-to-end.
 
    The gateway binds to the `lxdbr0` bridge address: the default loopback-only
    bind is unreachable from sandboxes, and the driver points each sandbox's
-   `OPENSHELL_ENDPOINT` at that address. `--disable-tls` plus
-   `allow_unauthenticated_users` are a plaintext, unauthenticated dev
-   shortcut — **not** for production use; see
-   [Security limitations](#security-limitations).
+   `OPENSHELL_ENDPOINT` at that address. With a client CA the gateway requires
+   a client certificate on every connection, from the CLI and from sandboxes
+   alike.
 
    Run the supervisor released with the gateway: pass
    `--supervisor-image ghcr.io/nvidia/openshell/supervisor:<gateway version>`
    to the driver. A supervisor from a different release than the gateway can
    fail to sync policy and exit.
 
-4. **Register the gateway with the CLI and create a sandbox:**
+5. **Register the gateway with the CLI and create a sandbox.** The CLI
+   imports the client certificate from `OPENSHELL_LOCAL_TLS_DIR`:
 
    ```sh
-   openshell gateway add "http://$BRIDGE_IP:17670" --local --name lxd-demo
+   OPENSHELL_LOCAL_TLS_DIR="$PKI" \
+       openshell gateway add "https://$BRIDGE_IP:17670" --local --name lxd-demo
    openshell gateway select lxd-demo
 
    openshell sandbox create --name demo -- id
@@ -145,14 +162,22 @@ gateway so you can create a sandbox end-to-end.
 
 ## Security limitations
 
+- **Every sandbox holds the same gateway client certificate.** As with
+  upstream's Docker driver, the certificate and key passed with
+  `--guest-tls-cert`/`--guest-tls-key` are copied into each sandbox (mode
+  `0400`, owned by root, for the supervisor). The gateway identifies a
+  sandbox by its sandbox token, not its certificate, and a gateway with
+  mTLS authentication accepts that certificate as a client, so root inside a
+  sandbox holds a credential the gateway trusts.
 - **No default-deny egress or sandbox-to-sandbox network isolation.**
   Sandboxes can reach each other and the network freely today. `lxd-client`
   has the Network ACL APIs needed to build this, but nothing in the driver
   calls them yet.
-- **`security.nesting=true` is the container's trust boundary.** This grants
-  the `userns` capability, relaxes `/proc/sys` and cgroup mount restrictions,
-  and allows AppArmor-stacking access — independent of
-  `security.privileged`, which is not set.
+- **`--sandbox-nesting` widens the container's trust boundary.** Sandboxes
+  are unprivileged and unnested by default. Nesting, for workloads that run
+  containers themselves, grants the `userns` capability, relaxes `/proc/sys`
+  and cgroup mount restrictions, and allows AppArmor-stacking access —
+  independent of `security.privileged`, which is never set.
 - **PID limits are enforced, other cgroup limits are not.** Every sandbox
   gets `limits.processes` (`--default-max-processes`, default 4096) so one
   sandbox cannot fork-bomb its co-tenants, but there is no I/O or PID-cgroup
@@ -177,6 +202,51 @@ gateway so you can create a sandbox end-to-end.
   instance `Stopped` with nothing to bring it back: LXD's `boot.autorestart`
   is VM-only and `boot.autostart` only covers daemon restarts.
 
+## Networks and Storage Pools
+
+Every sandbox gets a NIC on one LXD network and its root disk on one storage
+pool. The operator sets where sandboxes go by default, so users creating
+sandboxes need not know how the LXD behind the gateway is laid out:
+
+- `--default-network` (default `lxdbr0`): the network sandboxes attach to.
+  On MicroCloud this is usually the OVN network `default`.
+- `--default-storage-pool` (default `default`): the pool for root disks. On
+  MicroCloud this is usually `local` or `remote`.
+
+A request can still choose per sandbox with `driver_config.network` and
+`driver_config.storage_pool` (for example
+`openshell sandbox create --driver-config-json '{"lxd":{"storage_pool":"remote"}}'`).
+A create naming a network or pool that does not exist in the driver's
+project fails straight away with `FailedPrecondition`, before any image is
+imported.
+
+### Reaching a remote LXD
+
+With `--lxd-url https://<address>:8443` plus `--lxd-client-cert` and
+`--lxd-client-key` the driver talks to LXD over the network instead of its
+local socket. LXD's self-signed certificate names only the host's hostname
+and loopback addresses, so a server reached by IP address fails ordinary
+verification. Pass the certificate LXD presents with `--lxd-server-cert` to
+trust exactly that certificate, as `lxc remote add` does; on a cluster member
+such as a MicroCloud node that is `/var/snap/lxd/common/lxd/cluster.crt`.
+`--lxd-server-ca` instead verifies against a CA, including the host name. Trust
+the client certificate in LXD restricted to the driver's project:
+`lxc config trust add client.crt --restricted --projects <project>`.
+
+### Reaching the gateway
+
+Each sandbox's supervisor connects back to the gateway at
+`OPENSHELL_ENDPOINT`. By default the driver derives it from the host-side
+address of the sandbox's network and `--gateway-grpc-port`, which suits a
+gateway listening on an LXD bridge on the same machine. Anywhere else — a
+gateway in an instance or on another machine, or sandboxes on an OVN network,
+whose address belongs to its virtual router — set it explicitly with
+`--gateway-endpoint` (for example `https://10.131.189.2:17670`). A sandbox on
+an OVN network without `--gateway-endpoint` is refused with
+`FailedPrecondition` rather than pointed at the router. When sandboxes reach
+the gateway at an address its certificate does not name, `--gateway-tls-server-name`
+sets the name they verify the certificate against instead.
+
 ## Images and Caching
 
 The driver supports per-sandbox OCI images specified via `template.image` in the
@@ -190,11 +260,17 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   the OCI reference and resolves the manifest digest for the host architecture
   by reading the raw image index and selecting the matching `os`/`architecture`
   entry, so two architectures of the same tag never share a cache entry. It maps
-  the digest to a local LXD image alias (e.g. `openshell-oci-r2-<64-hex-sha256>`, where `r2` is the conversion revision: a driver that converts images differently imports them again instead of reusing old conversions).
+  the digest to a local LXD image alias (e.g. `openshell-oci-r3-<64-hex-sha256>`, where `r3` is the conversion revision: a driver that converts images differently imports them again instead of reusing old conversions).
   If the alias is already present in LXD, it is reused immediately.
   If not cached, the driver pulls the image by digest using `skopeo`, unpacks it with
   `umoci`, packs it into squashfs and metadata archives, and imports it via LXD's
   split image REST API.
+- **Init:** Conversion adds the driver's init script as `/openshell-init.sh`
+  and points `/sbin/init` at it, replacing any init the image ships. LXD
+  starts `/sbin/init` in a container, and the script sets up networking and
+  hands over to the supervisor. The driver sets no `raw.*` keys and, unless
+  `--sandbox-nesting` is given, no `security.nesting`, so sandboxes run in a
+  restricted project with its default restrictions.
 - **Tag mutation:** Because the cache is keyed on content digest rather than tag,
   if a tag points to a new digest, the driver will automatically pull and import the new
   image on first use.
@@ -265,7 +341,9 @@ the gateway restarts:
 LXD reports the same `Stopped` status however an instance went down, so the
 driver records `user.openshell.stop_intent` on the instance when it is asked
 to stop one. Without it a user-requested stop is indistinguishable from a
-crash and surfaces as `Error` instead of `Stopped`.
+crash and surfaces as `Error` instead of `Stopped`. Starting the sandbox again
+(`openshell sandbox start`) clears the marker and pushes the current TLS
+materials before the instance starts.
 
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
 stop never completes on its own. `stop_sandbox` bounds the graceful attempt

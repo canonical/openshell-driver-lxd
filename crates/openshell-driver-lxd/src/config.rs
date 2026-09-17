@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
@@ -25,6 +25,12 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// sandbox rootfs — BusyBox's `ip` has no `netns` subcommand, so the
 /// supervisor's proxy mode fails to isolate and exits at boot.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+
+/// Default LXD network sandboxes attach to.
+pub const DEFAULT_NETWORK: &str = "lxdbr0";
+
+/// Default LXD storage pool for sandbox root disks.
+pub const DEFAULT_STORAGE_POOL: &str = "default";
 
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
@@ -96,6 +102,18 @@ pub struct Config {
     /// it.
     #[arg(long, default_value = DEFAULT_PROJECT)]
     pub project: String,
+
+    /// LXD network sandboxes attach to unless a request sets
+    /// `driver_config.network`. On MicroCloud this is typically the OVN
+    /// network `default`.
+    #[arg(long, default_value = DEFAULT_NETWORK)]
+    pub default_network: String,
+
+    /// LXD storage pool for sandbox root disks unless a request sets
+    /// `driver_config.storage_pool`. On MicroCloud this is typically `local`
+    /// or `remote`.
+    #[arg(long, default_value = DEFAULT_STORAGE_POOL)]
+    pub default_storage_pool: String,
 
     /// OCI image reference to extract the OpenShell supervisor binary from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
@@ -183,19 +201,181 @@ pub struct Config {
 
     /// PEM CA certificate to verify the remote LXD server cert.
     /// Omit to use the built-in webpki CA bundle.
-    #[arg(long, requires = "lxd_url")]
+    #[arg(long, requires = "lxd_url", conflicts_with = "lxd_server_cert")]
     pub lxd_server_ca: Option<PathBuf>,
 
+    /// PEM certificate the remote LXD presents, trusted exactly whatever
+    /// names it carries, as `lxc remote add` does. LXD's own certificate
+    /// names only its hostname and loopback, so use this to reach LXD by IP
+    /// address (on a cluster member, the file is `cluster.crt`).
+    #[arg(long, requires = "lxd_url")]
+    pub lxd_server_cert: Option<PathBuf>,
+
     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
-    /// sandboxes. The host is resolved from the sandbox's own LXD bridge
-    /// network at create time.
+    /// sandboxes when --gateway-endpoint is unset. The host is then resolved
+    /// from the sandbox's own LXD bridge network at create time.
     #[arg(long, default_value_t = DEFAULT_GATEWAY_GRPC_PORT)]
     pub gateway_grpc_port: u16,
+
+    /// URL sandboxes reach the gateway at (OPENSHELL_ENDPOINT), e.g.
+    /// `http://10.0.0.5:17670`. When unset, it is the host-side address of the
+    /// sandbox's network plus --gateway-grpc-port, which only reaches a gateway
+    /// listening on that bridge. Set it when the gateway runs anywhere else —
+    /// in an instance, on another machine — and on OVN networks, whose
+    /// address belongs to their virtual router.
+    #[arg(long, value_parser = parse_gateway_endpoint)]
+    pub gateway_endpoint: Option<String>,
+
+    /// Set `security.nesting` on sandboxes, for workloads that run containers
+    /// themselves. The supervisor does not need it: its network namespace,
+    /// nftables rules and seccomp filter work without. Nesting relaxes the
+    /// container's AppArmor confinement, and a restricted project refuses it
+    /// unless `restricted.containers.nesting=allow`.
+    #[arg(long)]
+    pub sandbox_nesting: bool,
+
+    /// PEM CA certificate sandboxes verify the gateway's certificate against.
+    /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
+    /// for the supervisor's mutual-TLS connection to the gateway; the
+    /// gateway endpoint is then `https`. Read on every create, so rotated
+    /// files reach new sandboxes.
+    #[arg(long, requires_all = ["guest_tls_cert", "guest_tls_key"])]
+    pub guest_tls_ca: Option<PathBuf>,
+
+    /// PEM client certificate sandboxes present to the gateway.
+    #[arg(long, requires_all = ["guest_tls_ca", "guest_tls_key"])]
+    pub guest_tls_cert: Option<PathBuf>,
+
+    /// PEM private key of --guest-tls-cert.
+    #[arg(long, requires_all = ["guest_tls_ca", "guest_tls_cert"])]
+    pub guest_tls_key: Option<PathBuf>,
+
+    /// Name sandboxes verify the gateway's certificate against, instead of
+    /// the gateway endpoint's host (OPENSHELL_GATEWAY_TLS_SERVER_NAME). For
+    /// a gateway reached at an address its certificate does not name, e.g.
+    /// through a forward or NAT.
+    #[arg(long, value_parser = parse_tls_server_name)]
+    pub gateway_tls_server_name: Option<String>,
+
+    /// Let sandboxes reach the gateway over plaintext HTTP instead of TLS.
+    /// Sandbox tokens, policy and credentials then cross the network
+    /// unencrypted, so this is only for local testing.
+    #[arg(long, conflicts_with_all = ["guest_tls_ca", "guest_tls_cert", "guest_tls_key"])]
+    pub allow_plaintext_gateway: bool,
 
     /// Deadline, in seconds, to wait for an LXD operation to complete before
     /// failing the RPC with DeadlineExceeded.
     #[arg(long, default_value_t = DEFAULT_OPERATION_TIMEOUT_SECS)]
     pub operation_timeout_secs: u64,
+}
+
+/// Host paths of the TLS materials sandboxes connect to the gateway with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestTls<'a> {
+    pub ca: &'a Path,
+    pub cert: &'a Path,
+    pub key: &'a Path,
+}
+
+impl Config {
+    /// The TLS materials for sandboxes, when configured.
+    #[must_use]
+    pub fn guest_tls(&self) -> Option<GuestTls<'_>> {
+        Some(GuestTls {
+            ca: self.guest_tls_ca.as_deref()?,
+            cert: self.guest_tls_cert.as_deref()?,
+            key: self.guest_tls_key.as_deref()?,
+        })
+    }
+
+    /// Scheme of the gateway endpoint the driver derives from a network.
+    #[must_use]
+    pub fn gateway_scheme(&self) -> &'static str {
+        if self.guest_tls().is_some() {
+            "https"
+        } else {
+            "http"
+        }
+    }
+
+    /// Checks that sandboxes will reach the gateway over TLS, or that
+    /// plaintext was explicitly allowed, and that `--gateway-endpoint`
+    /// agrees. clap enforces the rest (all three TLS files or none, and not
+    /// alongside `--allow-plaintext-gateway`).
+    pub fn validate(&self) -> Result<(), String> {
+        let tls = self.guest_tls().is_some();
+        if !tls && !self.allow_plaintext_gateway {
+            return Err(
+                "sandboxes connect to the gateway over TLS: set --guest-tls-ca, \
+                 --guest-tls-cert and --guest-tls-key (--allow-plaintext-gateway permits a \
+                 plaintext gateway for local testing)"
+                    .to_string(),
+            );
+        }
+        if !tls && self.gateway_tls_server_name.is_some() {
+            return Err(
+                "--gateway-tls-server-name needs --guest-tls-ca, --guest-tls-cert and \
+                 --guest-tls-key: without TLS there is no certificate to verify"
+                    .to_string(),
+            );
+        }
+        match self.gateway_endpoint.as_deref() {
+            Some(endpoint) if tls && !endpoint.starts_with("https://") => Err(format!(
+                "--gateway-endpoint {endpoint} is not https, but sandboxes are given TLS \
+                 materials; use an https:// endpoint"
+            )),
+            Some(endpoint) if !tls && !endpoint.starts_with("http://") => Err(format!(
+                "--gateway-endpoint {endpoint} is https, which needs --guest-tls-ca, \
+                 --guest-tls-cert and --guest-tls-key"
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+/// Validates `--gateway-tls-server-name`: an IP address or a DNS name.
+fn parse_tls_server_name(value: &str) -> Result<String, String> {
+    if value.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(value.to_string());
+    }
+    let valid_label = |label: &str| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    };
+    if value.len() <= 253 && value.split('.').all(valid_label) {
+        Ok(value.to_string())
+    } else {
+        Err(format!("{value:?} is not a DNS name or an IP address"))
+    }
+}
+
+/// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
+/// nothing past the port, which is all the supervisor uses. Returns it
+/// normalized (lowercase scheme and host, no surrounding whitespace) and
+/// without a trailing slash.
+fn parse_gateway_endpoint(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme must be http or https, not {:?}",
+            url.scheme()
+        ));
+    }
+    if !url.host_str().is_some_and(|host| !host.is_empty()) {
+        return Err("the URL names no host".to_string());
+    }
+    if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+        return Err("the URL must not have a path, query or fragment".to_string());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("the URL must not carry credentials".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
 }
 
 #[cfg(test)]
@@ -215,11 +395,14 @@ mod tests {
 
         assert_eq!(config.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(config.project, DEFAULT_PROJECT);
+        assert_eq!(config.default_network, DEFAULT_NETWORK);
+        assert_eq!(config.default_storage_pool, DEFAULT_STORAGE_POOL);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
         assert!(config.supervisor_bin.is_none());
         assert!(config.lxd_url.is_none());
         assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
+        assert!(config.gateway_endpoint.is_none());
     }
 
     /// A graceful stop always runs to its deadline (the supervisor ignores
@@ -272,6 +455,164 @@ mod tests {
         ])
         .expect("url with cert and key should parse");
         assert_eq!(complete.lxd_url.as_deref(), Some("https://10.0.0.1:8443"));
+    }
+
+    #[test]
+    fn gateway_endpoint_is_an_http_or_https_url() {
+        for (value, expected) in [
+            ("http://10.0.0.5:17670", "http://10.0.0.5:17670"),
+            (
+                "https://gateway.example:17670/",
+                "https://gateway.example:17670",
+            ),
+            ("https://[fd42::5]:17670", "https://[fd42::5]:17670"),
+            (
+                " HTTPS://Gateway.Example:17670/ ",
+                "https://gateway.example:17670",
+            ),
+        ] {
+            let config =
+                Config::try_parse_from(["openshell-driver-lxd", "--gateway-endpoint", value])
+                    .unwrap_or_else(|e| panic!("{value}: {e}"));
+            assert_eq!(config.gateway_endpoint.as_deref(), Some(expected));
+        }
+
+        for value in [
+            "10.0.0.5:17670",
+            "grpc://10.0.0.5:17670",
+            "http://10.0.0.5:17670/api",
+            "http://user:secret@10.0.0.5:17670",
+            "file:///tmp/sock",
+        ] {
+            assert!(
+                Config::try_parse_from(["openshell-driver-lxd", "--gateway-endpoint", value])
+                    .is_err(),
+                "{value} should be rejected"
+            );
+        }
+    }
+
+    const TLS_ARGS: [&str; 6] = [
+        "--guest-tls-ca",
+        "/etc/openshell/tls/ca.crt",
+        "--guest-tls-cert",
+        "/etc/openshell/tls/client/tls.crt",
+        "--guest-tls-key",
+        "/etc/openshell/tls/client/tls.key",
+    ];
+
+    fn parse(args: &[&str]) -> Result<Config, clap::Error> {
+        Config::try_parse_from(std::iter::once("openshell-driver-lxd").chain(args.iter().copied()))
+    }
+
+    #[test]
+    fn tls_to_the_gateway_is_required_unless_plaintext_is_allowed() {
+        let neither = parse(&[]).unwrap();
+        assert!(neither.validate().is_err());
+
+        let tls = parse(&TLS_ARGS).unwrap();
+        assert_eq!(tls.validate(), Ok(()));
+        assert_eq!(tls.gateway_scheme(), "https");
+        assert_eq!(
+            tls.guest_tls(),
+            Some(GuestTls {
+                ca: Path::new("/etc/openshell/tls/ca.crt"),
+                cert: Path::new("/etc/openshell/tls/client/tls.crt"),
+                key: Path::new("/etc/openshell/tls/client/tls.key"),
+            })
+        );
+
+        let plaintext = parse(&["--allow-plaintext-gateway"]).unwrap();
+        assert_eq!(plaintext.validate(), Ok(()));
+        assert_eq!(plaintext.gateway_scheme(), "http");
+        assert_eq!(plaintext.guest_tls(), None);
+    }
+
+    #[test]
+    fn tls_materials_come_together_and_not_with_plaintext() {
+        assert!(parse(&TLS_ARGS[..4]).is_err());
+        assert!(parse(&["--guest-tls-key", "/k"]).is_err());
+
+        let mut both = TLS_ARGS.to_vec();
+        both.push("--allow-plaintext-gateway");
+        assert!(parse(&both).is_err());
+    }
+
+    #[test]
+    fn tls_server_name_needs_tls_and_a_valid_name() {
+        let mut named = TLS_ARGS.to_vec();
+        named.extend(["--gateway-tls-server-name", "gateway.openshell.internal"]);
+        assert_eq!(
+            parse(&named).unwrap().gateway_tls_server_name.as_deref(),
+            Some("gateway.openshell.internal")
+        );
+
+        let mut address = TLS_ARGS.to_vec();
+        address.extend(["--gateway-tls-server-name", "10.131.189.2"]);
+        assert!(parse(&address).is_ok());
+
+        for bad in ["", "-gateway", "gate way", "gateway..internal"] {
+            let mut args = TLS_ARGS.to_vec();
+            args.extend(["--gateway-tls-server-name", bad]);
+            assert!(parse(&args).is_err(), "{bad:?} should be rejected");
+        }
+
+        // Without TLS materials there is no certificate to verify.
+        let plaintext = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-tls-server-name",
+            "gateway.openshell.internal",
+        ])
+        .unwrap();
+        assert!(plaintext.validate().is_err());
+    }
+
+    #[test]
+    fn gateway_endpoint_scheme_matches_the_transport() {
+        let mut tls_https = TLS_ARGS.to_vec();
+        tls_https.extend(["--gateway-endpoint", "https://10.0.0.5:17670"]);
+        assert_eq!(parse(&tls_https).unwrap().validate(), Ok(()));
+
+        let mut tls_http = TLS_ARGS.to_vec();
+        tls_http.extend(["--gateway-endpoint", "http://10.0.0.5:17670"]);
+        assert!(parse(&tls_http).unwrap().validate().is_err());
+
+        let plaintext_https = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-endpoint",
+            "https://10.0.0.5:17670",
+        ])
+        .unwrap();
+        assert!(plaintext_https.validate().is_err());
+
+        let plaintext_http = parse(&[
+            "--allow-plaintext-gateway",
+            "--gateway-endpoint",
+            "http://10.0.0.5:17670",
+        ])
+        .unwrap();
+        assert_eq!(plaintext_http.validate(), Ok(()));
+    }
+
+    #[test]
+    fn server_cert_pin_and_ca_are_alternatives() {
+        let remote = [
+            "--lxd-url",
+            "https://192.168.1.166:8443",
+            "--lxd-client-cert",
+            "/c",
+            "--lxd-client-key",
+            "/k",
+        ];
+        let mut pinned = remote.to_vec();
+        pinned.extend(["--lxd-server-cert", "/etc/openshell/lxd/server.crt"]);
+        assert!(parse(&pinned).is_ok());
+
+        let mut both = pinned.clone();
+        both.extend(["--lxd-server-ca", "/ca.crt"]);
+        assert!(parse(&both).is_err());
+
+        assert!(parse(&["--lxd-server-cert", "/s.crt"]).is_err());
     }
 
     #[test]

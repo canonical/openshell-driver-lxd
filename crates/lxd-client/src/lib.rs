@@ -22,5 +22,6 @@ pub use client::{LxdClient, LxdEndpoint, LxdHttpsConfig, DEFAULT_PROJECT};
 pub use error::LxdError;
 pub use types::{
     Instance, InstanceState, InstanceStateCpu, InstanceStateDisk, InstanceStateMemory,
-    InstanceStateNetwork, InstanceStateNetworkAddress, LxdEvent, LxdServerInfo, Network, Operation,
+    InstanceStateNetwork, InstanceStateNetworkAddress, LxdEvent, LxdServerInfo, Network,
+    NetworkType, Operation,
 };
