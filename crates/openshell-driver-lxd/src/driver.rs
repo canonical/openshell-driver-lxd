@@ -6,9 +6,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use computev1::pb::{DriverSandbox, GetCapabilitiesResponse};
+use computev1::pb::{
+    gateway_listener_requirement, DriverSandbox, GatewayListenerRequirement,
+    GetCapabilitiesResponse,
+};
 use lxd_client::{LxdClient, LxdError, NetworkType};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 use crate::config::Config;
 use crate::dhcp_client;
@@ -21,6 +24,16 @@ const DRIVER_NAME: &str = "lxd";
 /// How long to let a freshly started sandbox settle before checking that its
 /// init is still up. See [`LxdComputeDriver::settle_after_start`].
 const SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+/// How long LXD may take to clear `volatile.last_state.power` after a
+/// sandbox's init exits, before that key can be read as "LXD stopped it".
+///
+/// LXD writes the key when the instance starts and rewrites it as part of
+/// finishing the stop, so an init that exited by itself reads as stopped but
+/// still `RUNNING` until then. Measured at 0.62–0.75s over 20 stops on LXD
+/// 6.9; three times the longest leaves room on a loaded host.
+/// See [`LxdComputeDriver::confirm_runtime_restart`].
+const RUNTIME_RESTART_SETTLE: Duration = Duration::from_millis(2250);
 
 /// Returns true if `err` indicates the instance was already stopped.
 ///
@@ -55,6 +68,10 @@ pub struct LxdComputeDriver {
     supervisor_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     dhcp_client_volume_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     lifecycle_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
+    /// Held shared from provisioning a sandbox's auxiliary volumes until its
+    /// instance uses them, and exclusively by clean-up, which would otherwise
+    /// see those volumes unused and remove them.
+    volume_use: Arc<RwLock<()>>,
 }
 
 impl LxdComputeDriver {
@@ -85,6 +102,7 @@ impl LxdComputeDriver {
             supervisor_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
+            volume_use: Arc::new(RwLock::new(())),
         }
     }
 
@@ -100,10 +118,107 @@ impl LxdComputeDriver {
             .await
     }
 
+    /// The supervisor binary on the host and its digest, extracting it from
+    /// the supervisor image on first use.
+    async fn resolve_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
+        match &self.config.supervisor_bin {
+            Some(path) => Ok((path.clone(), digest_of_file(path)?)),
+            None => self
+                .image_cache
+                .extract_supervisor_binary(
+                    &self.config.supervisor_image,
+                    &self.config.supervisor_cache_dir,
+                )
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+                }),
+        }
+    }
+
+    /// Removes images, volumes and host files the driver no longer uses (see
+    /// `crate::gc`). Best-effort: failures are logged and retried on the
+    /// next run.
+    pub async fn collect_garbage(&self) {
+        // Without the current supervisor digest nothing supervisor-related
+        // can be told apart from what is in use, so those are left alone.
+        let supervisor_digest = match self.resolve_supervisor().await {
+            Ok((_, digest)) => Some(digest),
+            Err(e) => {
+                tracing::warn!(%e, "could not resolve the supervisor; keeping its volumes and cache");
+                None
+            }
+        };
+
+        // Likewise for the DHCP client: it is resolved from the host, so
+        // without its digest the volume in use cannot be told from a stale one.
+        let dhcp_digest =
+            match dhcp_client::load_dhcp_client(self.config.dhcp_client_bin.as_deref()).await {
+                Ok((_, digest)) => Some(digest),
+                Err(e) => {
+                    tracing::warn!(%e, "could not resolve the DHCP client; keeping its volumes");
+                    None
+                }
+            };
+
+        let volume_use = self.volume_use.write().await;
+        let lxd = match (&supervisor_digest, &dhcp_digest) {
+            (Some(supervisor), Some(dhcp)) => {
+                let keep = vec![
+                    mapping::supervisor_volume_name(supervisor),
+                    mapping::dhcp_client_volume_name(dhcp),
+                ];
+                crate::gc::collect_lxd(&self.lxd, &self.config.image_cache_alias_prefix, &keep)
+                    .await
+            }
+            // Keep every auxiliary volume by treating none as removable.
+            _ => {
+                crate::gc::collect_lxd_images_only(&self.lxd, &self.config.image_cache_alias_prefix)
+                    .await
+            }
+        };
+        drop(volume_use);
+
+        let host_entries = crate::gc::collect_host(
+            &self.config.supervisor_cache_dir,
+            if self.config.supervisor_bin.is_some() {
+                None
+            } else {
+                supervisor_digest.as_deref()
+            },
+            &self.config.image_work_dir,
+            std::time::SystemTime::now(),
+        );
+
+        tracing::debug!(
+            images = lxd.images,
+            volumes = lxd.volumes,
+            host_entries,
+            "clean-up finished"
+        );
+    }
+
     /// Clone of the LXD client, for the lifecycle watcher.
     #[must_use]
     pub fn lxd_client(&self) -> LxdClient {
         self.lxd.clone()
+    }
+
+    /// Listeners the gateway should bind besides its main one: the
+    /// sandbox-callback listener, when configured.
+    #[must_use]
+    pub fn gateway_listener_requirements(&self) -> Vec<GatewayListenerRequirement> {
+        self.config
+            .gateway_callback_listener
+            .map(|address| GatewayListenerRequirement {
+                reason: "sandboxes reach the gateway here; serve sandbox-callable RPCs only"
+                    .to_string(),
+                selector: Some(gateway_listener_requirement::Selector::ExactBindAddress(
+                    address.to_string(),
+                )),
+            })
+            .into_iter()
+            .collect()
     }
 
     /// Report driver capabilities and defaults.
@@ -118,6 +233,9 @@ impl LxdComputeDriver {
             // across gateway restarts instead; StartSandbox is only for
             // sandboxes that were stopped.
             gateway_manages_lifecycle: false,
+            // Sandboxes get their gateway token from the driver; there is no
+            // platform credential for AuthenticateSandbox to verify.
+            supports_sandbox_authentication: false,
         }
     }
 
@@ -210,16 +328,58 @@ impl LxdComputeDriver {
 
     pub async fn get_sandbox(&self, name: &str) -> Result<DriverSandbox, DriverError> {
         let instance = self.get_managed_instance(name).await?;
+        let instance = self.confirm_runtime_restart(instance).await;
         Ok(mapping::instance_to_driver_sandbox(&instance))
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, DriverError> {
         let instances = self.lxd.list_instances().await?;
-        Ok(instances
+        let mut sandboxes: Vec<DriverSandbox> = Vec::new();
+        let mut unsettled: Vec<usize> = Vec::new();
+        for instance in instances
             .iter()
             .filter(|i| i.config.contains_key(mapping::KEY_SANDBOX_ID))
-            .map(mapping::instance_to_driver_sandbox)
-            .collect())
+        {
+            if mapping::stopped_by_the_runtime(instance) {
+                unsettled.push(sandboxes.len());
+            }
+            sandboxes.push(mapping::instance_to_driver_sandbox(instance));
+        }
+
+        // One wait covers every sandbox that looked stopped by LXD, so a list
+        // costs at most a single settle however many of them there are.
+        if !unsettled.is_empty() {
+            tokio::time::sleep(RUNTIME_RESTART_SETTLE).await;
+            for index in unsettled {
+                let Ok(instance) = self.lxd.get_instance(&sandboxes[index].name).await else {
+                    continue;
+                };
+                sandboxes[index] = mapping::instance_to_driver_sandbox(&instance);
+            }
+        }
+        Ok(sandboxes)
+    }
+
+    /// Re-reads a sandbox that looks stopped by LXD itself, once the marker
+    /// it is recognized by has had time to settle.
+    ///
+    /// `volatile.last_state.power` stays `RUNNING` for about a second after
+    /// an init exits (see [`RUNTIME_RESTART_SETTLE`]), so reporting straight
+    /// off the first read would call every sandbox that just died a runtime
+    /// restart. A marker still set after the wait is a real one: LXD stopped
+    /// the sandbox and has not brought it back.
+    async fn confirm_runtime_restart(
+        &self,
+        instance: lxd_client::Instance,
+    ) -> lxd_client::Instance {
+        if !mapping::stopped_by_the_runtime(&instance) {
+            return instance;
+        }
+        tokio::time::sleep(RUNTIME_RESTART_SETTLE).await;
+        self.lxd
+            .get_instance(&instance.name)
+            .await
+            .unwrap_or(instance)
     }
 
     /// Resolves an instance name from a gateway-assigned `sandbox_id` by
@@ -257,6 +417,14 @@ impl LxdComputeDriver {
 
         let has_token = !spec.sandbox_token.is_empty();
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
+        let egress_acl = if self.config.restrict_sandbox_egress {
+            Some(
+                self.ensure_egress_acl(placement.network, &network, &gateway_endpoint)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut config = mapping::build_create_config(
             sandbox,
             spec,
@@ -314,20 +482,19 @@ impl LxdComputeDriver {
                 "GpuResourceRequirements.count is ignored in v1; attaching all host GPUs"
             );
         }
-        // Resolve supervisor binary and digest
-        let (binary_path, digest) = match &self.config.supervisor_bin {
-            Some(path) => (path.clone(), digest_of_file(path)?),
-            None => self
-                .image_cache
-                .extract_supervisor_binary(
-                    &self.config.supervisor_image,
-                    &self.config.supervisor_cache_dir,
-                )
-                .await
-                .map_err(|e| {
-                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
-                })?,
+        let (binary_path, digest) = self.resolve_supervisor().await?;
+
+        // Resolved before the volumes are provisioned: an import can take
+        // minutes, and clean-up waits while volumes are provisioned but unused.
+        let image_alias = if template.image.is_empty() {
+            self.image_cache
+                .resolve_alias(&self.config.default_image)
+                .await?
+        } else {
+            self.image_cache.resolve_alias(&template.image).await?
         };
+
+        let volume_use = self.volume_use.read().await;
 
         // Ensure digest-keyed custom storage volume exists on the aux pool.
         // Locks are keyed by pool *and* digest: the same binary on two pools
@@ -382,6 +549,7 @@ impl LxdComputeDriver {
 
         let devices = mapping::build_create_devices(
             placement,
+            egress_acl.as_deref(),
             gpu.is_some(),
             aux_pool,
             &volume_name,
@@ -389,14 +557,6 @@ impl LxdComputeDriver {
             &dhcp_volume_name,
         );
         let profiles = mapping::build_profiles(template);
-
-        let image_alias = if template.image.is_empty() {
-            self.image_cache
-                .resolve_alias(&self.config.default_image)
-                .await?
-        } else {
-            self.image_cache.resolve_alias(&template.image).await?
-        };
 
         // Create the instance stopped so we can push the token and TLS files
         // before the supervisor starts — avoids a race where the supervisor
@@ -413,6 +573,7 @@ impl LxdComputeDriver {
             )
             .await?;
         self.wait_operation(&op.id).await?;
+        drop(volume_use);
 
         let post_create = async {
             self.push_guest_files(&sandbox.name, &guest_files).await?;
@@ -681,6 +842,58 @@ impl LxdComputeDriver {
             )));
         }
         Ok(network)
+    }
+
+    /// Brings the egress ACL for sandboxes on `network_name` up to date and
+    /// returns its name (see [`crate::egress`]).
+    ///
+    /// Done on every create, before anything slow, so a changed gateway
+    /// endpoint reaches the ACL; an ACL that is already right is not
+    /// rewritten.
+    async fn ensure_egress_acl(
+        &self,
+        network_name: &str,
+        network: &lxd_client::Network,
+        gateway_endpoint: &str,
+    ) -> Result<String, DriverError> {
+        if network.type_ != NetworkType::Ovn {
+            return Err(DriverError::FailedPrecondition(format!(
+                "--restrict-sandbox-egress needs sandboxes on an OVN network, where LXD applies \
+                 ACLs to each NIC; {network_name:?} is a {} network",
+                network.type_
+            )));
+        }
+
+        let url = url::Url::parse(gateway_endpoint).map_err(|e| {
+            DriverError::FailedPrecondition(format!(
+                "gateway endpoint {gateway_endpoint:?} is not a URL: {e}"
+            ))
+        })?;
+        let port = url.port_or_known_default().unwrap_or(443);
+        let gateway: Vec<std::net::SocketAddr> = match url.host() {
+            Some(url::Host::Ipv4(ip)) => vec![(ip, port).into()],
+            Some(url::Host::Ipv6(ip)) => vec![(ip, port).into()],
+            Some(url::Host::Domain(host)) => tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| {
+                    DriverError::FailedPrecondition(format!(
+                        "cannot resolve gateway endpoint host {host:?} for the egress ACL: {e}"
+                    ))
+                })?
+                .collect(),
+            None => Vec::new(),
+        };
+        if gateway.is_empty() {
+            return Err(DriverError::FailedPrecondition(format!(
+                "gateway endpoint {gateway_endpoint:?} names no address for the egress ACL"
+            )));
+        }
+
+        let name = crate::egress::acl_name(network_name);
+        self.lxd
+            .ensure_network_acl(&name, crate::egress::rules(&gateway))
+            .await?;
+        Ok(name)
     }
 
     /// Resolves `OPENSHELL_ENDPOINT`: `--gateway-endpoint` when set, otherwise

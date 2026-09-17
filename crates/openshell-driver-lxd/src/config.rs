@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -74,6 +75,10 @@ pub const DEFAULT_OPERATION_TIMEOUT_SECS: u64 = 60;
 
 /// Default prefix for digest-derived LXD image aliases.
 pub const DEFAULT_IMAGE_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
+
+/// Default interval, in seconds, between clean-ups of what the driver no
+/// longer uses.
+pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
@@ -170,6 +175,14 @@ pub struct Config {
     /// Deadline, in seconds, for pulling and importing OCI images before failing.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
     pub image_pull_timeout_secs: u64,
+    /// Seconds between clean-ups of what the driver no longer uses: images
+    /// from older conversion revisions, unused supervisor and DHCP-client
+    /// volumes, cached supervisor binaries for other digests and abandoned
+    /// scratch directories. The first clean-up runs at start-up. `0` disables
+    /// clean-up, for drivers that share an LXD project with others.
+    #[arg(long, default_value_t = DEFAULT_CLEANUP_INTERVAL_SECS)]
+    pub cleanup_interval_secs: u64,
+
     /// Prefix for digest-derived LXD image aliases.
     #[arg(long, default_value = DEFAULT_IMAGE_CACHE_ALIAS_PREFIX)]
     pub image_cache_alias_prefix: String,
@@ -201,15 +214,21 @@ pub struct Config {
 
     /// PEM CA certificate to verify the remote LXD server cert.
     /// Omit to use the built-in webpki CA bundle.
-    #[arg(long, requires = "lxd_url", conflicts_with = "lxd_server_cert")]
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_cert", "lxd_server_fingerprint"])]
     pub lxd_server_ca: Option<PathBuf>,
 
     /// PEM certificate the remote LXD presents, trusted exactly whatever
     /// names it carries, as `lxc remote add` does. LXD's own certificate
     /// names only its hostname and loopback, so use this to reach LXD by IP
     /// address (on a cluster member, the file is `cluster.crt`).
-    #[arg(long, requires = "lxd_url")]
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_ca", "lxd_server_fingerprint"])]
     pub lxd_server_cert: Option<PathBuf>,
+
+    /// SHA-256 fingerprint of the remote LXD server certificate (hex, case-
+    /// insensitive, colons optional). When set, the TLS handshake pins trust to
+    /// this digest and skips CA/hostname verification.
+    #[arg(long, requires = "lxd_url", conflicts_with_all = ["lxd_server_ca", "lxd_server_cert"])]
+    pub lxd_server_fingerprint: Option<String>,
 
     /// gRPC port the gateway listens on, used to build OPENSHELL_ENDPOINT for
     /// sandboxes when --gateway-endpoint is unset. The host is then resolved
@@ -226,6 +245,19 @@ pub struct Config {
     #[arg(long, value_parser = parse_gateway_endpoint)]
     pub gateway_endpoint: Option<String>,
 
+    /// Address the gateway should additionally listen on for sandbox
+    /// callbacks, e.g. `169.254.17.1:17670`. The driver hands it to the
+    /// gateway as a listener requirement, and the gateway binds it accepting
+    /// only the methods a sandbox may call. It filters by method, not by
+    /// caller: a client certificate the gateway trusts is still a user there
+    /// for the methods users may call too (OpenShell v0.0.116:
+    /// `GetSandboxConfig`, `UpdateConfig`, `GetDraftPolicy`). The port must be
+    /// the gateway's own port and the address one its main listener does not
+    /// already cover. Point --gateway-endpoint at it, directly or through
+    /// forwarding.
+    #[arg(long, value_parser = parse_callback_listener)]
+    pub gateway_callback_listener: Option<SocketAddr>,
+
     /// Set `security.nesting` on sandboxes, for workloads that run containers
     /// themselves. The supervisor does not need it: its network namespace,
     /// nftables rules and seccomp filter work without. Nesting relaxes the
@@ -233,6 +265,17 @@ pub struct Config {
     /// unless `restricted.containers.nesting=allow`.
     #[arg(long)]
     pub sandbox_nesting: bool,
+
+    /// Confine sandbox networking with an LXD network ACL: a sandbox may
+    /// reach the gateway endpoint and public internet addresses (plus the DNS
+    /// servers its network hands out, which LXD always allows), and nothing
+    /// else — no private or otherwise non-public address, so not a LAN, LXD
+    /// host or other sandbox on such addresses — and nothing may connect to
+    /// it. The driver manages one ACL per network, `openshell-egress-<network>`,
+    /// in its project. Needs sandboxes on an OVN network, where LXD applies
+    /// ACLs to individual NICs.
+    #[arg(long)]
+    pub restrict_sandbox_egress: bool,
 
     /// PEM CA certificate sandboxes verify the gateway's certificate against.
     /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
@@ -352,6 +395,21 @@ fn parse_tls_server_name(value: &str) -> Result<String, String> {
     } else {
         Err(format!("{value:?} is not a DNS name or an IP address"))
     }
+}
+
+/// Validates `--gateway-callback-listener`: a concrete address and port, which
+/// is all the gateway accepts for a driver-requested listener.
+fn parse_callback_listener(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|e| format!("not an IP:port address: {e}"))?;
+    if address.ip().is_unspecified() || address.ip().is_multicast() {
+        return Err(format!("{} is not a single unicast address", address.ip()));
+    }
+    if address.port() == 0 {
+        return Err("the port must not be 0".to_string());
+    }
+    Ok(address)
 }
 
 /// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
@@ -592,6 +650,26 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plaintext_http.validate(), Ok(()));
+    }
+
+    #[test]
+    fn callback_listener_is_a_concrete_address() {
+        let config = parse(&["--gateway-callback-listener", "169.254.17.1:17670"]).unwrap();
+        assert_eq!(
+            config.gateway_callback_listener,
+            Some("169.254.17.1:17670".parse().unwrap())
+        );
+        for value in [
+            "0.0.0.0:17670",
+            "169.254.17.1",
+            "169.254.17.1:0",
+            "[ff02::1]:17670",
+        ] {
+            assert!(
+                parse(&["--gateway-callback-listener", value]).is_err(),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]

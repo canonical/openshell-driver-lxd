@@ -83,6 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             client_key,
             server_ca: config.lxd_server_ca.clone(),
             server_cert: config.lxd_server_cert.clone(),
+            server_fingerprint: config.lxd_server_fingerprint.clone(),
         })
     } else {
         LxdEndpoint::UnixSocket(config.lxd_socket.clone())
@@ -130,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let default_image = config.default_image.clone();
+    let cleanup_interval = std::time::Duration::from_secs(config.cleanup_interval_secs);
     let driver = LxdComputeDriver::new(config, lxd);
 
     // Best-effort pre-warm of the default sandbox image. The driver pulls the
@@ -142,6 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // already accepts connections, so blocking here would leave a connecting
     // gateway waiting with no error until it finished. A create that arrives
     // meanwhile waits on the same import rather than starting a second one.
+    //
+    // Once pre-warming is done the same task cleans up what earlier driver
+    // versions and releases left behind, and repeats that periodically.
     let prewarm = driver.clone();
     tokio::spawn(async move {
         match prewarm.ensure_default_image().await {
@@ -155,6 +160,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "could not pre-warm default sandbox image; it will be imported on first use"
                 );
             }
+        }
+        if cleanup_interval.is_zero() {
+            return;
+        }
+        loop {
+            prewarm.collect_garbage().await;
+            tokio::time::sleep(cleanup_interval).await;
         }
     });
 

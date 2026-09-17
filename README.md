@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools))
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -166,13 +166,21 @@ gateway so you can create a sandbox end-to-end.
   upstream's Docker driver, the certificate and key passed with
   `--guest-tls-cert`/`--guest-tls-key` are copied into each sandbox (mode
   `0400`, owned by root, for the supervisor). The gateway identifies a
-  sandbox by its sandbox token, not its certificate, and a gateway with
-  mTLS authentication accepts that certificate as a client, so root inside a
-  sandbox holds a credential the gateway trusts.
-- **No default-deny egress or sandbox-to-sandbox network isolation.**
-  Sandboxes can reach each other and the network freely today. `lxd-client`
-  has the Network ACL APIs needed to build this, but nothing in the driver
-  calls them yet.
+  sandbox by its sandbox token, not its certificate, and a gateway with mTLS
+  authentication accepts that certificate as a user, whatever role its
+  subject names (roles are only checked with OIDC). Root inside a sandbox can
+  therefore act as a gateway user. A callback listener
+  (`--gateway-callback-listener`) plus `--restrict-sandbox-egress` narrows
+  that to the methods both sandboxes and users may call, but does not close
+  it: on OpenShell v0.0.116, a sandbox with only the certificate could read
+  another sandbox's config and draft policy (`GetSandboxConfig`,
+  `GetDraftPolicy`) and got past authorization on `UpdateConfig`. Closing it
+  needs the gateway to refuse certificate-only callers on callback listeners.
+- **Sandbox network isolation is opt-in.** Inside a sandbox the supervisor
+  forces the workload through its policy proxy, but the sandbox itself can
+  reach other sandboxes, the LXD host and the LAN unless the driver runs with
+  `--restrict-sandbox-egress` on an OVN network (see
+  [Restricting sandbox egress](#restricting-sandbox-egress)).
 - **`--sandbox-nesting` widens the container's trust boundary.** Sandboxes
   are unprivileged and unnested by default. Nesting, for workloads that run
   containers themselves, grants the `userns` capability, relaxes `/proc/sys`
@@ -229,8 +237,10 @@ and loopback addresses, so a server reached by IP address fails ordinary
 verification. Pass the certificate LXD presents with `--lxd-server-cert` to
 trust exactly that certificate, as `lxc remote add` does; on a cluster member
 such as a MicroCloud node that is `/var/snap/lxd/common/lxd/cluster.crt`.
-`--lxd-server-ca` instead verifies against a CA, including the host name. Trust
-the client certificate in LXD restricted to the driver's project:
+Alternatively, pin the SHA-256 fingerprint of the server certificate with
+`--lxd-server-fingerprint` (hex, colons optional), which skips CA and hostname
+checks. `--lxd-server-ca` instead verifies against a CA, including the host name.
+Trust the client certificate in LXD restricted to the driver's project:
 `lxc config trust add client.crt --restricted --projects <project>`.
 
 ### Reaching the gateway
@@ -246,6 +256,51 @@ an OVN network without `--gateway-endpoint` is refused with
 `FailedPrecondition` rather than pointed at the router. When sandboxes reach
 the gateway at an address its certificate does not name, `--gateway-tls-server-name`
 sets the name they verify the certificate against instead.
+
+Every sandbox holds the gateway client certificate (see
+[Security limitations](#security-limitations)), so a sandbox that reaches the
+gateway's main listener can use its whole API. `--gateway-callback-listener
+<ip>:<port>` asks the gateway to also bind that address accepting only the
+methods a sandbox may call (upstream's compute-driver callback listener).
+That filters by method, not by caller, so the certificate still acts as a
+user for the methods users may call too. The port must be the gateway's own,
+and the address one its main listener does not cover — for example a
+link-local address on a dummy interface next to the gateway, reached through
+a DNAT or an LXD network forward. Point `--gateway-endpoint` at it and keep
+sandboxes from reaching the main listener, for instance with
+[egress ACLs](#restricting-sandbox-egress).
+
+### Restricting sandbox egress
+
+The supervisor inside each sandbox already forces the workload through its
+policy proxy, like it does for every OpenShell driver. The sandbox container
+as a whole, supervisor included, would still be on an ordinary network, able
+to reach the LAN, the LXD host and other sandboxes. With
+`--restrict-sandbox-egress` the driver puts every sandbox NIC behind an LXD
+network ACL, `openshell-egress-<network>`, that it keeps in its project. The
+ACL allows:
+
+- TCP to the gateway endpoint's address and port, and
+- public internet addresses: every IPv4 address outside the private, shared,
+  loopback, link-local, documentation and reserved ranges, and global
+  unicast IPv6 (`2000::/3`).
+
+Everything else is rejected, and nothing may open a connection to a sandbox.
+LXD evaluates reject rules before allow rules, so the public internet is
+listed as the complement of the non-public ranges rather than as "allow
+everything, reject private ranges", which would also reject a gateway on a
+private address. DNS needs no rule: LXD lets an OVN NIC reach the DNS servers
+its network hands out regardless of ACLs.
+
+"Public" is decided by address alone. The LAN, the LXD host and the gateway's
+main listener are only kept out while they use non-public addresses; on
+public IPv4 or global IPv6 addresses the public-internet rule lets sandboxes
+reach them.
+
+This needs sandboxes on an OVN network, where LXD applies ACLs to individual
+NICs; on a bridge network the create fails with `FailedPrecondition`. The ACL
+is brought up to date on every create, so a changed gateway endpoint reaches
+it, and left untouched when it already matches.
 
 ## Images and Caching
 
@@ -288,6 +343,7 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   - `--start-retries`: how many times to restart a sandbox whose init exits immediately after the first start (default: 1; `0` disables).
   - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
+  - `--cleanup-interval-secs`: how often the driver removes what it no longer uses (default: 21600, and once at start-up; `0` disables). It removes images converted by an older conversion revision, supervisor and DHCP-client volumes that no instance uses and that are not the current ones, cached supervisor binaries for other digests, and scratch directories abandoned for over a day. In LXD it only touches its own project's images and volumes, never the `default` project's that a project without its own images or volumes shares. Disable it when several drivers share one LXD project.
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
 
 ### Supervisor Binary Delivery via Custom Storage Volume
@@ -334,6 +390,7 @@ the gateway restarts:
 | `Running` / `Ready` | — (`Ready=True`) | `Ready` |
 | `Stopped`, init exited by itself | `ContainerExited` | `Error` (terminal) |
 | `Stopped`, stop requested | `ContainerStopped` | `Stopped` |
+| `Stopped` by LXD shutting down, not restarted | `ContainerRuntimeRestart` | `Error` (see below) |
 | `Stopped`, never started | `ContainerCreated` | `Provisioning` |
 | `Starting` | `ContainerStarting` | `Provisioning` |
 | `Frozen` | `ContainerPaused` | `Error` |
@@ -344,6 +401,13 @@ to stop one. Without it a user-requested stop is indistinguishable from a
 crash and surfaces as `Error` instead of `Stopped`. Starting the sandbox again
 (`openshell sandbox start`) clears the marker and pushes the current TLS
 materials before the instance starts.
+
+`volatile.last_state.power=RUNNING` on a stopped instance means LXD stopped it
+while it was running, on its own or the host's shutdown, and did not start it
+again. Its reason, `ContainerRuntimeRestart`, is what upstream's Docker and
+Podman drivers give such containers. The gateway still shows it as `Error`:
+from v0.1.0-pre.1 it restarts sandboxes with that reason at startup, but only
+for drivers that report `gateway_manages_lifecycle`, and this driver does not.
 
 Note that the supervisor does not act on LXD's shutdown signal, so a graceful
 stop never completes on its own. `stop_sandbox` bounds the graceful attempt

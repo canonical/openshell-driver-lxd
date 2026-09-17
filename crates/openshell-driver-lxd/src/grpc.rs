@@ -8,8 +8,9 @@ use std::pin::Pin;
 use computev1::pb::compute_driver_server::ComputeDriver;
 use computev1::pb::DriverSandbox;
 use computev1::pb::{
-    watch_sandboxes_event, CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
+    watch_sandboxes_event, AuthenticateSandboxRequest, AuthenticateSandboxResponse,
+    CreateSandboxRequest, CreateSandboxResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    DeleteWorkspaceRequest, DeleteWorkspaceResponse, EnsureWorkspaceRequest,
     EnsureWorkspaceResponse, GetCapabilitiesRequest, GetCapabilitiesResponse,
     GetGatewayListenerRequirementsRequest, GetGatewayListenerRequirementsResponse,
     GetSandboxRequest, GetSandboxResponse, ListSandboxesRequest, ListSandboxesResponse,
@@ -95,8 +96,25 @@ impl ComputeDriver for ComputeDriverService {
         Ok(Response::new(self.driver.capabilities()))
     }
 
-    /// Sandboxes reach the gateway at the address the operator binds it to
-    /// (the LXD bridge), so no additional listener is needed.
+    /// The driver delivers each sandbox its gateway-minted token itself, so
+    /// there is no platform credential to exchange for one — as with
+    /// upstream's Docker, Podman and VM drivers; only Kubernetes verifies
+    /// service-account tokens. Capabilities say so
+    /// (`supports_sandbox_authentication: false`), and the gateway does not
+    /// call this.
+    async fn authenticate_sandbox(
+        &self,
+        _request: Request<AuthenticateSandboxRequest>,
+    ) -> Result<Response<AuthenticateSandboxResponse>, Status> {
+        Err(
+            DriverError::Unimplemented("the LXD driver does not authenticate sandbox credentials")
+                .into(),
+        )
+    }
+
+    /// Asks the gateway for a sandbox-callback listener when one is
+    /// configured (`--gateway-callback-listener`); otherwise sandboxes use the
+    /// gateway's main listener and nothing extra is needed.
     ///
     /// Answering rather than leaving the RPC unimplemented matters: the
     /// gateway calls it at startup and aborts on any error other than
@@ -105,9 +123,9 @@ impl ComputeDriver for ComputeDriverService {
         &self,
         _request: Request<GetGatewayListenerRequirementsRequest>,
     ) -> Result<Response<GetGatewayListenerRequirementsResponse>, Status> {
-        Ok(Response::new(
-            GetGatewayListenerRequirementsResponse::default(),
-        ))
+        Ok(Response::new(GetGatewayListenerRequirementsResponse {
+            requirements: self.driver.gateway_listener_requirements(),
+        }))
     }
 
     async fn start_sandbox(
@@ -394,9 +412,9 @@ mod tests {
     }
 
     /// The gateway calls this at startup and aborts on any error but
-    /// `Unimplemented`; the driver needs no extra listeners.
+    /// `Unimplemented`; without a callback listener the driver needs none.
     #[tokio::test]
-    async fn gateway_listener_requirements_are_empty() {
+    async fn gateway_listener_requirements_are_empty_by_default() {
         let response = service()
             .get_gateway_listener_requirements(Request::new(
                 GetGatewayListenerRequirementsRequest {},
@@ -405,6 +423,52 @@ mod tests {
             .expect("listener requirements should be answered")
             .into_inner();
         assert!(response.requirements.is_empty());
+    }
+
+    #[tokio::test]
+    async fn gateway_listener_requirements_carry_the_callback_listener() {
+        use computev1::pb::gateway_listener_requirement::Selector;
+
+        let config = Config::parse_from([
+            "openshell-driver-lxd",
+            "--gateway-callback-listener",
+            "169.254.17.1:17670",
+        ]);
+        let lxd =
+            LxdClient::new(LxdEndpoint::UnixSocket("/nonexistent/lxd.socket".into())).unwrap();
+        let response = ComputeDriverService::without_watcher(LxdComputeDriver::new(config, lxd))
+            .get_gateway_listener_requirements(Request::new(
+                GetGatewayListenerRequirementsRequest {},
+            ))
+            .await
+            .expect("listener requirements should be answered")
+            .into_inner();
+
+        assert_eq!(response.requirements.len(), 1);
+        assert_eq!(
+            response.requirements[0].selector,
+            Some(Selector::ExactBindAddress("169.254.17.1:17670".to_string()))
+        );
+        assert!(!response.requirements[0].reason.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sandbox_authentication_is_declined_and_advertised_as_such() {
+        let service = service();
+        let status = service
+            .authenticate_sandbox(Request::new(AuthenticateSandboxRequest {
+                credential: "anything".to_string(),
+            }))
+            .await
+            .expect_err("the driver has no sandbox credentials to verify");
+        assert_eq!(status.code(), Code::Unimplemented);
+
+        let capabilities = service
+            .get_capabilities(Request::new(GetCapabilitiesRequest {}))
+            .await
+            .expect("capabilities")
+            .into_inner();
+        assert!(!capabilities.supports_sandbox_authentication);
     }
 
     #[tokio::test]
