@@ -119,14 +119,19 @@ impl LxdComputeDriver {
     }
 
     /// The supervisor binary on the host and its digest, extracting it from
-    /// the supervisor image on first use.
+    /// the sandbox binary image on first use.
     async fn resolve_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
-        match &self.config.supervisor_bin {
+        let binary_path = self
+            .config
+            .sandbox_bin
+            .as_ref()
+            .or(self.config.supervisor_bin.as_ref());
+        match binary_path {
             Some(path) => Ok((path.clone(), digest_of_file(path)?)),
             None => self
                 .image_cache
                 .extract_supervisor_binary(
-                    &self.config.supervisor_image,
+                    &self.config.sandbox_binary_image,
                     &self.config.supervisor_cache_dir,
                 )
                 .await
@@ -324,7 +329,10 @@ impl LxdComputeDriver {
             }) => return Err(not_found()),
             Err(e) => return Err(e.into()),
         };
-        if !instance.config.contains_key(mapping::KEY_SANDBOX_ID) {
+        if !instance.config.contains_key(mapping::KEY_SANDBOX_ID)
+            || instance.config.get(mapping::KEY_ROLE).map(String::as_str)
+                == Some(mapping::ROLE_SUPERVISOR)
+        {
             return Err(not_found());
         }
         Ok(instance)
@@ -333,21 +341,34 @@ impl LxdComputeDriver {
     pub async fn get_sandbox(&self, name: &str) -> Result<DriverSandbox, DriverError> {
         let instance = self.get_managed_instance(name).await?;
         let instance = self.confirm_runtime_restart(instance).await;
-        Ok(mapping::instance_to_driver_sandbox(&instance))
+        let mut sandbox = mapping::instance_to_driver_sandbox(&instance);
+
+        let sup_name = mapping::supervisor_instance_name(name);
+        if let Ok(sup_instance) = self.lxd.get_instance(&sup_name).await {
+            mapping::aggregate_companion_status(&mut sandbox, Some(&sup_instance));
+        }
+
+        Ok(sandbox)
     }
 
     pub async fn list_sandboxes(&self) -> Result<Vec<DriverSandbox>, DriverError> {
         let instances = self.lxd.list_instances().await?;
         let mut sandboxes: Vec<DriverSandbox> = Vec::new();
         let mut unsettled: Vec<usize> = Vec::new();
-        for instance in instances
-            .iter()
-            .filter(|i| i.config.contains_key(mapping::KEY_SANDBOX_ID))
-        {
+        for instance in instances.iter().filter(|i| {
+            i.config.contains_key(mapping::KEY_SANDBOX_ID)
+                && i.config.get(mapping::KEY_ROLE).map(String::as_str)
+                    != Some(mapping::ROLE_SUPERVISOR)
+        }) {
             if mapping::stopped_by_the_runtime(instance) {
                 unsettled.push(sandboxes.len());
             }
-            sandboxes.push(mapping::instance_to_driver_sandbox(instance));
+            let mut sb = mapping::instance_to_driver_sandbox(instance);
+            let sup_name = mapping::supervisor_instance_name(&instance.name);
+            if let Some(sup_instance) = instances.iter().find(|i| i.name == sup_name) {
+                mapping::aggregate_companion_status(&mut sb, Some(sup_instance));
+            }
+            sandboxes.push(sb);
         }
 
         // One wait covers every sandbox that looked stopped by LXD, so a list
@@ -358,7 +379,12 @@ impl LxdComputeDriver {
                 let Ok(instance) = self.lxd.get_instance(&sandboxes[index].name).await else {
                     continue;
                 };
-                sandboxes[index] = mapping::instance_to_driver_sandbox(&instance);
+                let mut sb = mapping::instance_to_driver_sandbox(&instance);
+                let sup_name = mapping::supervisor_instance_name(&instance.name);
+                if let Ok(sup_instance) = self.lxd.get_instance(&sup_name).await {
+                    mapping::aggregate_companion_status(&mut sb, Some(&sup_instance));
+                }
+                sandboxes[index] = sb;
             }
         }
         Ok(sandboxes)
@@ -397,7 +423,11 @@ impl LxdComputeDriver {
         let instances = self.lxd.list_instances().await?;
         Ok(instances
             .into_iter()
-            .find(|i| i.config.get(mapping::KEY_SANDBOX_ID).map(String::as_str) == Some(sandbox_id))
+            .find(|i| {
+                i.config.get(mapping::KEY_SANDBOX_ID).map(String::as_str) == Some(sandbox_id)
+                    && i.config.get(mapping::KEY_ROLE).map(String::as_str)
+                        != Some(mapping::ROLE_SUPERVISOR)
+            })
             .map(|i| i.name))
     }
 
@@ -434,30 +464,9 @@ impl LxdComputeDriver {
             spec,
             template,
             &gateway_endpoint,
-            has_token,
             self.config.default_max_processes,
         )?;
 
-        // Files the supervisor needs before it starts. The TLS materials are
-        // read now, before anything is created, so a missing or unreadable
-        // one fails the create without leaving an instance behind.
-        let mut guest_files = Vec::new();
-        if has_token {
-            guest_files.push((
-                mapping::GUEST_SANDBOX_TOKEN_PATH,
-                spec.sandbox_token.as_bytes().to_vec(),
-            ));
-        }
-        if self.config.guest_tls().is_some() {
-            guest_files.extend(self.read_guest_tls_files().await?);
-            mapping::insert_guest_tls_environment(&mut config);
-            if let Some(name) = &self.config.gateway_tls_server_name {
-                config.insert(
-                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
-                    name.clone(),
-                );
-            }
-        }
         if self.config.sandbox_nesting {
             config.insert("security.nesting".to_string(), "true".to_string());
         }
@@ -497,6 +506,11 @@ impl LxdComputeDriver {
         } else {
             self.image_cache.resolve_alias(&template.image).await?
         };
+
+        let supervisor_image_alias = self
+            .image_cache
+            .resolve_alias(&self.config.supervisor_image)
+            .await?;
 
         let volume_use = self.volume_use.read().await;
 
@@ -562,9 +576,7 @@ impl LxdComputeDriver {
         );
         let profiles = mapping::build_profiles(template);
 
-        // Create the instance stopped so we can push the token and TLS files
-        // before the supervisor starts — avoids a race where the supervisor
-        // reads them before they have been written.
+        // 1. Create workload instance
         let op = self
             .lxd
             .create_instance(
@@ -577,13 +589,87 @@ impl LxdComputeDriver {
             )
             .await?;
         self.wait_operation(&op.id).await?;
+
+        // 2. Configure and create companion supervisor instance
+        let sup_name = mapping::supervisor_instance_name(&sandbox.name);
+        let mut sup_config = mapping::build_supervisor_config(sandbox, &gateway_endpoint);
+        let mut sup_guest_files = Vec::new();
+        if has_token {
+            sup_guest_files.push((
+                mapping::GUEST_SANDBOX_TOKEN_PATH,
+                spec.sandbox_token.as_bytes().to_vec(),
+            ));
+            sup_config.insert(
+                "environment.OPENSHELL_SANDBOX_TOKEN_FILE".to_string(),
+                mapping::GUEST_SANDBOX_TOKEN_PATH.to_string(),
+            );
+        }
+        if self.config.guest_tls().is_some() {
+            sup_guest_files.extend(self.read_guest_tls_files().await?);
+            mapping::insert_guest_tls_environment(&mut sup_config);
+            if let Some(name) = &self.config.gateway_tls_server_name {
+                sup_config.insert(
+                    "environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME".to_string(),
+                    name.clone(),
+                );
+            }
+        }
+        let desc_bytes =
+            serde_json::to_vec_pretty(&mapping::build_backend_descriptor(&sandbox.name, spec))
+                .map_err(|e| {
+                    DriverError::Internal(format!("failed to serialize backend descriptor: {e}"))
+                })?;
+        sup_guest_files.push((mapping::GUEST_DESCRIPTOR_PATH, desc_bytes));
+
+        let auth_bytes = serde_json::to_vec_pretty(&mapping::build_auth_bundle(sandbox, spec))
+            .map_err(|e| DriverError::Internal(format!("failed to serialize auth bundle: {e}")))?;
+        sup_guest_files.push((mapping::GUEST_AUTH_BUNDLE_PATH, auth_bytes));
+
+        let sup_devices = mapping::build_supervisor_devices(
+            placement,
+            egress_acl.as_deref(),
+            aux_pool,
+            &volume_name,
+            aux_pool,
+            &dhcp_volume_name,
+        );
+        let sup_create = self
+            .lxd
+            .create_instance(
+                &sup_name,
+                &supervisor_image_alias,
+                sup_config,
+                sup_devices,
+                vec!["default".to_string()],
+                false,
+            )
+            .await;
+
+        let sup_op = match sup_create {
+            Ok(op) => op,
+            Err(e) => {
+                let _ = self.lxd.delete_instance(&sandbox.name).await;
+                drop(volume_use);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = self.wait_operation(&sup_op.id).await {
+            let _ = self.lxd.delete_instance(&sup_name).await;
+            let _ = self.lxd.delete_instance(&sandbox.name).await;
+            drop(volume_use);
+            return Err(e);
+        }
         drop(volume_use);
 
         let post_create = async {
-            self.push_guest_files(&sandbox.name, &guest_files).await?;
+            self.push_guest_files(&sup_name, &sup_guest_files).await?;
 
             let op = self.lxd.start_instance(&sandbox.name).await?;
             self.wait_operation(&op.id).await?;
+
+            let sup_start = self.lxd.start_instance(&sup_name).await?;
+            self.wait_operation(&sup_start.id).await?;
+
             self.settle_after_start(&sandbox.name, &sandbox.id).await?;
 
             Ok::<(), DriverError>(())
@@ -596,6 +682,10 @@ impl LxdComputeDriver {
                 "post-create step failed; cleaning up instance"
             );
             let cleanup = async {
+                if let Ok(op) = self.lxd.stop_instance(&sup_name, true).await {
+                    let _ = self.wait_operation(&op.id).await;
+                }
+                let _ = self.lxd.delete_instance(&sup_name).await;
                 if let Ok(op) = self.lxd.stop_instance(&sandbox.name, true).await {
                     let _ = self.wait_operation(&op.id).await;
                 }
@@ -670,6 +760,7 @@ impl LxdComputeDriver {
     /// later exits by itself is reported as `ContainerExited` rather than as
     /// stopped on request, but restored if the start fails.
     pub async fn start_sandbox(&self, name: &str) -> Result<(), DriverError> {
+        let sup_name = mapping::supervisor_instance_name(name);
         let lifecycle_lock = self.instance_lifecycle_lock(name).await;
         let sandbox_id = {
             let _guard = lifecycle_lock.lock().await;
@@ -696,15 +787,17 @@ impl LxdComputeDriver {
             }
 
             let tls_files = self.read_guest_tls_files().await?;
-            self.push_guest_files(name, &tls_files).await?;
+            if !tls_files.is_empty() {
+                let _ = self.push_guest_files(&sup_name, &tls_files).await;
+            }
 
             let had_stop_intent = instance.config.contains_key(mapping::KEY_STOP_INTENT);
             if had_stop_intent {
-                let mut config = HashMap::new();
-                config.insert(mapping::KEY_STOP_INTENT.to_string(), None);
-                self.lxd.patch_instance_config(name, config).await?;
+                self.clear_stop_intent(name).await;
+                self.clear_stop_intent(&sup_name).await;
             }
 
+            // Start workload instance first
             let op = match self.lxd.start_instance(name).await {
                 Ok(op) => op,
                 Err(e) => {
@@ -723,6 +816,20 @@ impl LxdComputeDriver {
                     }
                 }
                 return Err(e);
+            }
+
+            // Start companion supervisor instance second
+            let sup = self.lxd.get_instance(&sup_name).await?;
+            match sup.status.as_str() {
+                "Stopped" => {
+                    let sup_op = self.lxd.start_instance(&sup_name).await?;
+                    self.wait_operation(&sup_op.id).await?;
+                }
+                other => {
+                    return Err(DriverError::FailedPrecondition(format!(
+                        "companion supervisor instance is {other}, not stopped; it can be started once it has stopped"
+                    )));
+                }
             }
 
             sandbox_id
@@ -935,6 +1042,7 @@ impl LxdComputeDriver {
     }
 
     pub async fn stop_sandbox(&self, name: &str) -> Result<(), DriverError> {
+        let sup_name = mapping::supervisor_instance_name(name);
         let lifecycle_lock = self.instance_lifecycle_lock(name).await;
         let _guard = lifecycle_lock.lock().await;
 
@@ -943,20 +1051,17 @@ impl LxdComputeDriver {
             return Ok(());
         }
 
-        // Record that this stop was asked for, before issuing it. LXD reports
-        // the same `Stopped` status however an instance went down, so without
-        // this marker a requested stop is indistinguishable from the init
-        // dying and would be reported as `ContainerExited` — surfacing to the
-        // user as `Error` instead of `Stopped`.
         self.set_stop_intent(name).await;
+        self.set_stop_intent(&sup_name).await;
 
-        // Ask politely first, but with a deadline. The sandbox's init is the
-        // supervisor, which does not act on LXD's shutdown signal, so an
-        // unbounded graceful stop never completes: the LXD operation stays
-        // RUNNING, the instance stays up, and StopSandbox only fails once the
-        // driver's own operation timeout fires. Bounding it here means the
-        // graceful attempt fails fast and the forced stop below is what
-        // actually stops the sandbox.
+        // Stop companion supervisor container before workload container (INV-4)
+        let _ = self.stop_instance_with_deadline(&sup_name).await;
+
+        // Stop workload container
+        self.stop_instance_with_deadline(name).await
+    }
+
+    async fn stop_instance_with_deadline(&self, name: &str) -> Result<(), DriverError> {
         let graceful = async {
             let op = self
                 .lxd
@@ -1001,6 +1106,7 @@ impl LxdComputeDriver {
     /// Deleted event) if the sandbox was deleted, or `None` if it was not
     /// found — the caller may retry safely.
     pub async fn delete_sandbox(&self, name: &str) -> Result<Option<String>, DriverError> {
+        let sup_name = mapping::supervisor_instance_name(name);
         let lifecycle_lock = self.instance_lifecycle_lock(name).await;
         let _guard = lifecycle_lock.lock().await;
 
@@ -1016,6 +1122,14 @@ impl LxdComputeDriver {
             // arbitrary LXD instance the caller happened to name correctly.
             return Ok(None);
         };
+
+        // Stop and delete companion supervisor instance first (INV-3)
+        if let Ok(op) = self.lxd.stop_instance(&sup_name, true).await {
+            let _ = self.wait_operation(&op.id).await;
+        }
+        if let Ok(op) = self.lxd.delete_instance(&sup_name).await {
+            let _ = self.wait_operation(&op.id).await;
+        }
 
         // Force-stop before deleting; LXD rejects deletion of running instances.
         match self.lxd.stop_instance(name, true).await {

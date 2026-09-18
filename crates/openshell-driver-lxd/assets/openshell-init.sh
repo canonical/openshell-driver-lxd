@@ -240,10 +240,35 @@ fi
 # ---------------------------------------------------------------------------
 # 10. Exec-replace this wrapper with the supervisor.
 # ---------------------------------------------------------------------------
-SUPERVISOR="/opt/openshell/bin/openshell-sandbox"
+SUPERVISOR=""
+EXTRA_ARGS=""
 
-if [ ! -x "$SUPERVISOR" ]; then
-    ts "FATAL: supervisor not found at ${SUPERVISOR}"
+if [ "${OPENSHELL_ROLE:-}" = "supervisor" ]; then
+    if [ -x /openshell-supervisor ]; then
+        SUPERVISOR="/openshell-supervisor"
+    elif [ -x /opt/openshell/bin/openshell-supervisor ]; then
+        SUPERVISOR="/opt/openshell/bin/openshell-supervisor"
+    elif [ -x /opt/openshell/bin/openshell-sandbox ]; then
+        SUPERVISOR="/opt/openshell/bin/openshell-sandbox"
+    fi
+    if [ -f /etc/openshell/runtime/backend-descriptor.json ]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --backend-descriptor-file /etc/openshell/runtime/backend-descriptor.json"
+    fi
+    if [ -f /etc/openshell/runtime/auth-bundle.json ]; then
+        EXTRA_ARGS="${EXTRA_ARGS} --auth-bundle-file /etc/openshell/runtime/auth-bundle.json"
+    fi
+else
+    if [ -x /opt/openshell/bin/openshell-sandbox ]; then
+        SUPERVISOR="/opt/openshell/bin/openshell-sandbox"
+    elif [ -x /openshell-supervisor ]; then
+        SUPERVISOR="/openshell-supervisor"
+    elif [ -x /opt/openshell/bin/openshell-supervisor ]; then
+        SUPERVISOR="/opt/openshell/bin/openshell-supervisor"
+    fi
+fi
+
+if [ -z "$SUPERVISOR" ] || [ ! -x "$SUPERVISOR" ]; then
+    ts "FATAL: supervisor not found"
     exit 1
 fi
 
@@ -266,11 +291,13 @@ LIB_PATH="${LIB_PATH}:/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu"
 LIB_PATH="${LIB_PATH}:/lib/aarch64-linux-gnu:/usr/lib/aarch64-linux-gnu"
 
 if [ -n "$LOADER" ]; then
-    ts "exec: ${LOADER} --library-path ${LIB_PATH} ${SUPERVISOR} --workdir /sandbox $*"
+    ts "exec: ${LOADER} --library-path ${LIB_PATH} ${SUPERVISOR} --workdir /sandbox ${EXTRA_ARGS} $*"
+    # shellcheck disable=SC2086
     exec "$LOADER" --library-path "$LIB_PATH" "$SUPERVISOR" \
-        --workdir /sandbox "$@"
+        --workdir /sandbox ${EXTRA_ARGS} "$@"
 else
     ts "WARN: no explicit loader found; falling back to direct exec"
-    exec "$SUPERVISOR" --workdir /sandbox "$@"
+    # shellcheck disable=SC2086
+    exec "$SUPERVISOR" --workdir /sandbox ${EXTRA_ARGS} "$@"
 fi
 

@@ -54,11 +54,44 @@ async fn create_get_list_stop_delete_lifecycle() {
         assert_eq!(dev.get("readonly").map(String::as_str), Some("true"));
     }
 
+    // The supervisor companion container must exist with correct role and workload metadata (INV-2).
+    let sup_name = format!("{name}-supervisor");
+    let sup_instance = lxd()
+        .get_instance(&sup_name)
+        .await
+        .expect("raw get_instance companion");
+    assert_eq!(
+        sup_instance
+            .config
+            .get("user.openshell.role")
+            .map(String::as_str),
+        Some("supervisor")
+    );
+    assert_eq!(
+        sup_instance
+            .config
+            .get("user.openshell.workload_instance")
+            .map(String::as_str),
+        Some(name.as_str())
+    );
+
     let listed = driver.list().await;
     assert!(
         listed.iter().any(|s| s.id == id && s.name == name),
         "expected {name} in {listed:?}"
     );
+    // Companion container is hidden from ListSandboxes (INV-1)
+    assert!(
+        !listed.iter().any(|s| s.name == sup_name),
+        "companion {sup_name} must not be listed"
+    );
+
+    // Companion container is hidden from GetSandbox (INV-1)
+    let sup_get = driver
+        .get(&sup_name)
+        .await
+        .expect_err("companion should not be accessible via get");
+    assert_eq!(sup_get.code(), Code::NotFound);
 
     driver
         .stop(&name)
@@ -89,6 +122,19 @@ async fn create_get_list_stop_delete_lifecycle() {
         .expect_err("deleted sandbox is gone");
     assert_eq!(status.code(), Code::NotFound);
     assert!(!driver.list().await.iter().any(|s| s.id == id));
+
+    // Companion container must also be deleted (INV-3)
+    let sup_status = lxd().get_instance(&sup_name).await;
+    assert!(
+        matches!(
+            sup_status,
+            Err(lxd_client::LxdError::Api {
+                status_code: 404,
+                ..
+            })
+        ),
+        "companion instance should be deleted: {sup_status:?}"
+    );
 
     let deleted_again = driver
         .delete(&name)
@@ -175,10 +221,6 @@ async fn created_instance_carries_the_request() {
         ("environment.OPENSHELL_SANDBOX_ID", id.as_str()),
         ("environment.OPENSHELL_SANDBOX", name.as_str()),
         ("environment.OPENSHELL_ENDPOINT", expected_endpoint.as_str()),
-        (
-            "environment.OPENSHELL_SANDBOX_TOKEN_FILE",
-            "/etc/openshell/auth/sandbox.jwt",
-        ),
         ("environment.FROM_SPEC", "spec"),
         ("environment.SHARED", "template"),
         ("limits.cpu", "1"),
@@ -188,14 +230,35 @@ async fn created_instance_carries_the_request() {
         assert_eq!(config.get(key).map(String::as_str), Some(value), "{key}");
     }
     assert!(
+        !config.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"),
+        "gateway token file env var must not be injected into workload instance"
+    );
+    assert!(
         config.values().all(|v| !v.contains(&token)),
-        "the sandbox token must not be written into instance config"
+        "the sandbox token must not be written into workload instance config"
+    );
+
+    let sup_name = format!("{name}-supervisor");
+    let sup_config = lxd()
+        .get_instance(&sup_name)
+        .await
+        .expect("raw get_instance companion")
+        .config;
+    assert_eq!(
+        sup_config
+            .get("environment.OPENSHELL_SANDBOX_TOKEN_FILE")
+            .map(String::as_str),
+        Some("/etc/openshell/auth/sandbox.jwt")
+    );
+    assert!(
+        sup_config.values().all(|v| !v.contains(&token)),
+        "the sandbox token must not be written into companion instance config"
     );
 
     let (content, mode) = lxd()
-        .get_file_from_instance(&name, "/etc/openshell/auth/sandbox.jwt")
+        .get_file_from_instance(&sup_name, "/etc/openshell/auth/sandbox.jwt")
         .await
-        .expect("token file should exist in the sandbox");
+        .expect("token file should exist in the supervisor companion");
     assert_eq!(content.as_ref(), token.as_bytes());
     assert_eq!(mode, 0o400);
 

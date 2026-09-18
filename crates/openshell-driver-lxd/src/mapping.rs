@@ -15,6 +15,56 @@ use prost_types::Struct;
 use crate::error::DriverError;
 
 pub(crate) const KEY_SANDBOX_ID: &str = "user.openshell.sandbox_id";
+pub(crate) const KEY_ROLE: &str = "user.openshell.role";
+pub(crate) const ROLE_WORKLOAD: &str = "workload";
+pub(crate) const ROLE_SUPERVISOR: &str = "supervisor";
+pub(crate) const KEY_WORKLOAD_INSTANCE: &str = "user.openshell.workload_instance";
+
+/// Returns the constant metadata role for primary workload instances.
+#[allow(dead_code)]
+pub fn role_workload() -> &'static str {
+    ROLE_WORKLOAD
+}
+
+/// Naming convention for companion supervisor LXD instance: `<name>-supervisor`.
+pub fn supervisor_instance_name(sandbox_name: &str) -> String {
+    format!("{sandbox_name}-supervisor")
+}
+
+/// Paths for RFC 0012 runtime artifacts inside the supervisor companion container.
+pub(crate) const GUEST_DESCRIPTOR_PATH: &str = "/etc/openshell/runtime/backend-descriptor.json";
+pub(crate) const GUEST_AUTH_BUNDLE_PATH: &str = "/etc/openshell/runtime/auth-bundle.json";
+
+/// Generates RFC 0012 backend descriptor payload targeting the workload container DNS endpoint.
+pub fn build_backend_descriptor(sandbox_name: &str, spec: &DriverSandboxSpec) -> serde_json::Value {
+    serde_json::json!({
+        "backend_name": "openshell-sandbox",
+        "endpoint": format!("http://{sandbox_name}:50051"),
+        "boundary_id": sandbox_name,
+        "transport": {
+            "kind": "tcp",
+            "endpoint": format!("http://{sandbox_name}:50051"),
+        },
+        "spec": {
+            "log_level": spec.log_level,
+        }
+    })
+}
+
+/// Generates RFC 0012 supervisor authentication bundle.
+pub fn build_auth_bundle(sandbox: &DriverSandbox, spec: &DriverSandboxSpec) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": sandbox.id,
+        "runtime_generation": "1",
+        "session_rotation": 1,
+        "auth_epoch": 1,
+        "gateway_token": spec.sandbox_token,
+        "gateway_expires_at": 0,
+        "sandbox_token": spec.sandbox_token,
+        "sandbox_expires_at": 0,
+    })
+}
+
 const KEY_NAMESPACE: &str = "user.openshell.namespace";
 const KEY_WORKSPACE: &str = "user.openshell.workspace";
 const LABEL_PREFIX: &str = "user.openshell.label.";
@@ -210,6 +260,37 @@ pub(crate) const CONDITION_STOPPED: &str = "ContainerStopped";
 /// In the gateway's transient set, so it maps to `Provisioning`, not `Error`.
 pub(crate) const CONDITION_CREATED: &str = "ContainerCreated";
 
+/// Aggregates companion supervisor container state into the parent sandbox's `DriverSandboxStatus`.
+pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option<&Instance>) {
+    let Some(companion) = companion else {
+        return;
+    };
+    if let Some(status) = sandbox.status.as_mut() {
+        if companion.status.eq_ignore_ascii_case("Error") {
+            status.conditions = vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "ContainerError".to_string(),
+                message: format!(
+                    "supervisor companion instance is in error state: {}",
+                    companion.status
+                ),
+                transition_time: None,
+            }];
+        } else if companion.status.eq_ignore_ascii_case("Stopped")
+            && status.conditions.iter().any(|c| c.status == "True")
+        {
+            status.conditions = vec![DriverCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: CONDITION_EXITED.to_string(),
+                message: "supervisor companion container stopped unexpectedly".to_string(),
+                transition_time: None,
+            }];
+        }
+    }
+}
+
 /// Ready-condition reason while a sandbox is starting. Also transient.
 pub(crate) const CONDITION_STARTING: &str = "ContainerStarting";
 
@@ -339,17 +420,11 @@ fn lxc_target(instance: &Instance) -> String {
 /// `gateway_endpoint` is the resolved `OPENSHELL_ENDPOINT` value
 /// (`http://<host-ip>:<gateway-grpc-port>`). When empty the env var is not
 /// set — the gateway is expected to supply it via `spec.environment` instead.
-///
-/// `has_token` indicates whether a sandbox JWT token will be pushed into the
-/// container (via `POST /1.0/instances/<name>/files`). When `true`, the
-/// `OPENSHELL_SANDBOX_TOKEN_FILE` env var is injected so the supervisor reads
-/// the file the driver pushes at `GUEST_SANDBOX_TOKEN_PATH` before start.
 pub fn build_create_config(
     sandbox: &DriverSandbox,
     spec: &DriverSandboxSpec,
     template: &DriverSandboxTemplate,
     gateway_endpoint: &str,
-    has_token: bool,
     default_max_processes: u32,
 ) -> Result<HashMap<String, String>, DriverError> {
     let mut config = HashMap::new();
@@ -357,6 +432,7 @@ pub fn build_create_config(
     config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
     config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
     config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
+    config.insert(KEY_ROLE.to_string(), role_workload().to_string());
     // template.environment takes precedence over spec.environment on key
     // collision, plus the two driver-injected vars the supervisor needs to
     // reach the gateway.
@@ -388,12 +464,6 @@ pub fn build_create_config(
         config.insert(
             format!("{ENV_PREFIX}OPENSHELL_ENDPOINT"),
             gateway_endpoint.to_string(),
-        );
-    }
-    if has_token {
-        config.insert(
-            format!("{ENV_PREFIX}OPENSHELL_SANDBOX_TOKEN_FILE"),
-            GUEST_SANDBOX_TOKEN_PATH.to_string(),
         );
     }
 
@@ -523,6 +593,90 @@ pub fn build_create_devices(
     }
 
     devices
+}
+
+/// Builds the LXD `devices` map for companion supervisor instance `<name>-supervisor`.
+pub fn build_supervisor_devices(
+    placement: Placement<'_>,
+    egress_acl: Option<&str>,
+    supervisor_pool: &str,
+    supervisor_volume: &str,
+    dhcp_client_pool: &str,
+    dhcp_client_volume: &str,
+) -> HashMap<String, HashMap<String, String>> {
+    let mut devices = HashMap::new();
+
+    let mut root = HashMap::new();
+    root.insert("type".to_string(), "disk".to_string());
+    root.insert("pool".to_string(), placement.storage_pool.to_string());
+    root.insert("path".to_string(), "/".to_string());
+    devices.insert("root".to_string(), root);
+
+    let mut eth0 = HashMap::new();
+    eth0.insert("type".to_string(), "nic".to_string());
+    eth0.insert("network".to_string(), placement.network.to_string());
+    if let Some(acl) = egress_acl {
+        eth0.insert("security.acls".to_string(), acl.to_string());
+        eth0.insert(
+            "security.acls.default.egress.action".to_string(),
+            "reject".to_string(),
+        );
+        eth0.insert(
+            "security.acls.default.ingress.action".to_string(),
+            "reject".to_string(),
+        );
+    }
+    devices.insert("eth0".to_string(), eth0);
+
+    let mut supervisor = HashMap::new();
+    supervisor.insert("type".to_string(), "disk".to_string());
+    supervisor.insert("pool".to_string(), supervisor_pool.to_string());
+    supervisor.insert("source".to_string(), supervisor_volume.to_string());
+    supervisor.insert("path".to_string(), GUEST_SUPERVISOR_BIN_DIR.to_string());
+    supervisor.insert("readonly".to_string(), "true".to_string());
+    devices.insert("supervisor".to_string(), supervisor);
+
+    let mut dhcp_client = HashMap::new();
+    dhcp_client.insert("type".to_string(), "disk".to_string());
+    dhcp_client.insert("pool".to_string(), dhcp_client_pool.to_string());
+    dhcp_client.insert("source".to_string(), dhcp_client_volume.to_string());
+    dhcp_client.insert("path".to_string(), GUEST_DHCP_CLIENT_DIR.to_string());
+    dhcp_client.insert("readonly".to_string(), "true".to_string());
+    devices.insert("dhcp-client".to_string(), dhcp_client);
+
+    devices
+}
+
+/// Builds instance config map for companion supervisor instance `<name>-supervisor`.
+pub fn build_supervisor_config(
+    sandbox: &DriverSandbox,
+    gateway_endpoint: &str,
+) -> HashMap<String, String> {
+    let mut config = HashMap::new();
+    config.insert(KEY_SANDBOX_ID.to_string(), sandbox.id.clone());
+    config.insert(KEY_NAMESPACE.to_string(), sandbox.namespace.clone());
+    config.insert(KEY_WORKSPACE.to_string(), sandbox.workspace.clone());
+    config.insert(KEY_ROLE.to_string(), ROLE_SUPERVISOR.to_string());
+    config.insert(KEY_WORKLOAD_INSTANCE.to_string(), sandbox.name.clone());
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_ROLE"),
+        ROLE_SUPERVISOR.to_string(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SANDBOX_ID"),
+        sandbox.id.clone(),
+    );
+    config.insert(
+        format!("{ENV_PREFIX}OPENSHELL_SANDBOX"),
+        sandbox.name.clone(),
+    );
+    if !gateway_endpoint.is_empty() {
+        config.insert(
+            format!("{ENV_PREFIX}OPENSHELL_ENDPOINT"),
+            gateway_endpoint.to_string(),
+        );
+    }
+    config
 }
 
 /// Returns `"default"` plus any operator-configured extra profiles from
@@ -706,7 +860,7 @@ mod tests {
         let spec = DriverSandboxSpec::default();
         let template = DriverSandboxTemplate::default();
 
-        let config = build_create_config(&sandbox, &spec, &template, "", false, 0)
+        let config = build_create_config(&sandbox, &spec, &template, "", 0)
             .expect("build_create_config should succeed");
 
         assert_eq!(
@@ -1116,7 +1270,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             &DriverSandboxTemplate::default(),
             "",
-            false,
             0,
         )
         .expect("build_create_config should succeed");
@@ -1161,7 +1314,7 @@ mod tests {
             ..Default::default()
         };
 
-        let config = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
+        let config = build_create_config(&identified_sandbox(), &spec, &template, "", 0)
             .expect("build_create_config should succeed");
 
         assert_eq!(
@@ -1188,7 +1341,6 @@ mod tests {
             ("OPENSHELL_SANDBOX", "someone-else"),
             ("OPENSHELL_SSH_SOCKET_PATH", "/tmp/evil.sock"),
             ("OPENSHELL_ENDPOINT", "http://attacker:1"),
-            ("OPENSHELL_SANDBOX_TOKEN_FILE", "/tmp/evil.jwt"),
         ]);
         let spec = DriverSandboxSpec {
             environment: hostile.clone(),
@@ -1204,7 +1356,6 @@ mod tests {
             &spec,
             &template,
             "http://10.0.0.1:17670",
-            true,
             0,
         )
         .expect("build_create_config should succeed");
@@ -1214,7 +1365,6 @@ mod tests {
             ("OPENSHELL_SANDBOX", "test-sandbox"),
             ("OPENSHELL_SSH_SOCKET_PATH", GUEST_SSH_SOCKET_PATH),
             ("OPENSHELL_ENDPOINT", "http://10.0.0.1:17670"),
-            ("OPENSHELL_SANDBOX_TOKEN_FILE", GUEST_SANDBOX_TOKEN_PATH),
         ];
         for (key, value) in expected {
             assert_eq!(
@@ -1252,7 +1402,6 @@ mod tests {
             &spec,
             &DriverSandboxTemplate::default(),
             "",
-            false,
             0,
         )
         .unwrap();
@@ -1282,7 +1431,6 @@ mod tests {
             &spec,
             &DriverSandboxTemplate::default(),
             "",
-            false,
             0,
         )
         .unwrap();
@@ -1313,8 +1461,7 @@ mod tests {
             ..Default::default()
         };
 
-        let config =
-            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0).unwrap();
+        let config = build_create_config(&identified_sandbox(), &spec, &template, "", 0).unwrap();
 
         assert_eq!(
             decoded_main_process(&config)["command"],
@@ -1335,7 +1482,6 @@ mod tests {
             &spec,
             &template,
             "http://10.0.0.1:17670",
-            false,
             0,
         )
         .expect("build_create_config should succeed");
@@ -1347,7 +1493,7 @@ mod tests {
         );
 
         // Empty means "not resolved": the gateway-supplied value is kept.
-        let unresolved = build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
+        let unresolved = build_create_config(&identified_sandbox(), &spec, &template, "", 0)
             .expect("build_create_config should succeed");
         assert_eq!(
             unresolved
@@ -1363,29 +1509,19 @@ mod tests {
     #[test]
     fn sandbox_token_is_referenced_by_file_never_embedded() {
         let spec = DriverSandboxSpec {
-            sandbox_token: "eyJhbGciOiJFZERTQSJ9.secret-token".to_string(),
+            sandbox_token: "******".to_string(),
             ..Default::default()
         };
         let template = DriverSandboxTemplate::default();
 
-        let with_token = build_create_config(&identified_sandbox(), &spec, &template, "", true, 0)
+        let config = build_create_config(&identified_sandbox(), &spec, &template, "", 0)
             .expect("build_create_config should succeed");
-        assert_eq!(
-            with_token
-                .get("environment.OPENSHELL_SANDBOX_TOKEN_FILE")
-                .map(String::as_str),
-            Some(GUEST_SANDBOX_TOKEN_PATH)
-        );
         assert!(
-            with_token.values().all(|v| !v.contains("secret-token")),
-            "token leaked into instance config: {with_token:?}"
+            config.values().all(|v| !v.contains("secret-token")),
+            "token leaked into instance config: {config:?}"
         );
-        assert!(!with_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN"));
-
-        let without_token =
-            build_create_config(&identified_sandbox(), &spec, &template, "", false, 0)
-                .expect("build_create_config should succeed");
-        assert!(!without_token.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"));
+        assert!(!config.contains_key("environment.OPENSHELL_SANDBOX_TOKEN"));
+        assert!(!config.contains_key("environment.OPENSHELL_SANDBOX_TOKEN_FILE"));
     }
 
     #[test]
@@ -1399,7 +1535,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             &template,
             "",
-            false,
             0,
         )
         .expect("build_create_config should succeed");
@@ -1423,7 +1558,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             &invalid,
             "",
-            false,
             0,
         )
         .expect_err("invalid label key should be rejected");
@@ -1465,7 +1599,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             template,
             "",
-            false,
             0,
         )
     }
@@ -1540,7 +1673,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             &zero,
             "",
-            false,
             4096,
         )
         .unwrap();
@@ -1567,7 +1699,6 @@ mod tests {
                 &DriverSandboxSpec::default(),
                 &template,
                 "",
-                false,
                 4096,
             )
             .unwrap();
@@ -1764,12 +1895,12 @@ mod tests {
         let spec = DriverSandboxSpec::default();
         let template = DriverSandboxTemplate::default();
 
-        let config = build_create_config(&sandbox, &spec, &template, "", false, 4096)
+        let config = build_create_config(&sandbox, &spec, &template, "", 4096)
             .expect("build_create_config should succeed");
         assert_eq!(config.get("limits.processes"), Some(&"4096".to_string()));
 
         // 0 means "leave pids.max alone".
-        let unlimited = build_create_config(&sandbox, &spec, &template, "", false, 0)
+        let unlimited = build_create_config(&sandbox, &spec, &template, "", 0)
             .expect("build_create_config should succeed");
         assert!(!unlimited.contains_key("limits.processes"));
     }
@@ -1793,7 +1924,6 @@ mod tests {
             &DriverSandboxSpec::default(),
             &template,
             "",
-            false,
             4096,
         )
         .expect("build_create_config should succeed");
@@ -1885,5 +2015,66 @@ mod tests {
 
         // Empty template yields None
         assert_eq!(max_processes(&DriverSandboxTemplate::default()), None);
+    }
+
+    #[test]
+    fn test_role_workload() {
+        assert_eq!(role_workload(), "workload");
+    }
+
+    #[test]
+    fn test_supervisor_instance_name() {
+        assert_eq!(supervisor_instance_name("sb-test"), "sb-test-supervisor");
+        assert_eq!(ROLE_WORKLOAD, "workload");
+        assert_eq!(ROLE_SUPERVISOR, "supervisor");
+    }
+
+    #[test]
+    fn test_backend_descriptor() {
+        let spec = DriverSandboxSpec {
+            log_level: "debug".to_string(),
+            ..Default::default()
+        };
+        let desc = build_backend_descriptor("sb-test", &spec);
+        assert_eq!(desc["backend_name"], "openshell-sandbox");
+        assert_eq!(desc["endpoint"], "http://sb-test:50051");
+        assert_eq!(desc["boundary_id"], "sb-test");
+        assert_eq!(desc["transport"]["endpoint"], "http://sb-test:50051");
+        assert_eq!(desc["spec"]["log_level"], "debug");
+
+        let sandbox = DriverSandbox {
+            id: "test-sb-id".to_string(),
+            name: "sb-test".to_string(),
+            ..Default::default()
+        };
+        let auth = build_auth_bundle(&sandbox, &spec);
+        assert_eq!(auth["session_id"], "test-sb-id");
+        assert_eq!(auth["session_rotation"], 1);
+    }
+
+    #[test]
+    fn test_supervisor_devices() {
+        let placement = Placement {
+            network: "lxdbr0",
+            storage_pool: "default",
+        };
+        let devices = build_supervisor_devices(
+            placement,
+            Some("acl-1"),
+            "default",
+            "sup-vol",
+            "default",
+            "dhcp-vol",
+        );
+        assert!(devices.contains_key("root"));
+        assert_eq!(devices["root"]["pool"], "default");
+        assert_eq!(devices["root"]["path"], "/");
+        assert!(devices.contains_key("eth0"));
+        assert_eq!(devices["eth0"]["network"], "lxdbr0");
+        assert_eq!(devices["eth0"]["security.acls"], "acl-1");
+        assert!(devices.contains_key("supervisor"));
+        assert_eq!(devices["supervisor"]["source"], "sup-vol");
+        assert!(devices.contains_key("dhcp-client"));
+        assert_eq!(devices["dhcp-client"]["source"], "dhcp-vol");
     }
 }

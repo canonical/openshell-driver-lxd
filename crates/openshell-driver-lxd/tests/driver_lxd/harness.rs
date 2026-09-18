@@ -227,9 +227,14 @@ pub struct Cleanup {
 
 impl Cleanup {
     pub fn new(project: &str, names: &[&str]) -> Self {
+        let mut all_names = Vec::new();
+        for name in names {
+            all_names.push((*name).to_string());
+            all_names.push(format!("{name}-supervisor"));
+        }
         Self {
             project: project.to_string(),
-            names: names.iter().map(|n| (*n).to_string()).collect(),
+            names: all_names,
         }
     }
 }
@@ -380,6 +385,7 @@ impl Driver {
         match &options.supervisor_image {
             None => {
                 cmd.arg("--supervisor-bin").arg(standin_supervisor());
+                cmd.args(["--supervisor-image", &options.default_image]);
             }
             Some(image) => {
                 cmd.args(["--supervisor-image", image]);

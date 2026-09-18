@@ -86,12 +86,14 @@ gateway so you can create a sandbox end-to-end.
    digest. Pass `--default-image <oci-ref>` to boot from a different image.
 
    The supervisor binary comes from a *separate* image
-   (`--supervisor-image`, the upstream
-   `ghcr.io/nvidia/openshell/supervisor:latest`) and is mounted into every
-   sandbox from a storage volume. The two are deliberately distinct: the
-   supervisor image ships the binary on a minimal BusyBox rootfs and cannot
-   serve as a sandbox rootfs, because BusyBox's `ip` has no `netns`
-   subcommand and the supervisor's proxy mode needs it to isolate the
+   (`--supervisor-image`, by default
+   `ghcr.io/nvidia/openshell/supervisor:0.1.0-pre.3`) and runs as an
+   out-of-workload companion container (`<name>-supervisor`). The in-workload
+   sandbox boundary (`openshell-sandbox`) is extracted from `--sandbox-binary-image`
+   and mounted into every sandbox workload container from a storage volume. The two
+   are deliberately distinct: the supervisor image ships the supervisor binary
+   and cannot serve as a sandbox workload rootfs, because BusyBox's `ip` has no
+   `netns` subcommand and the supervisor's proxy mode needs it to isolate the
    sandbox.
 
    Importing an image needs scratch space for the OCI copy plus the unpacked
@@ -140,10 +142,12 @@ gateway so you can create a sandbox end-to-end.
    a client certificate on every connection, from the CLI and from sandboxes
    alike.
 
-   Run the supervisor released with the gateway: pass
-   `--supervisor-image ghcr.io/nvidia/openshell/supervisor:<gateway version>`
-   to the driver. A supervisor from a different release than the gateway can
-   fail to sync policy and exit.
+   OpenShell v0.1.0-pre.3 split the supervisor into an out-of-workload
+   companion container (`<name>-supervisor`) and an in-workload boundary
+   (`openshell-sandbox`, RFC 0012). The driver coordinates the lifecycle of both
+   containers while presenting a single sandbox boundary to the gateway.
+   Gateway credentials and tokens are injected exclusively into the companion
+   container, never the workload container.
 
 5. **Register the gateway with the CLI and create a sandbox.** The CLI
    imports the client certificate from `OPENSHELL_LOCAL_TLS_DIR`:
@@ -331,10 +335,12 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   `--default-image` (default: the upstream community `ghcr.io/nvidia/openshell-community/sandboxes/base:latest`),
   which is resolved and imported through the same on-demand path.
 - **Configuration flags:**
-  - `--supervisor-image`: OCI image reference to extract the OpenShell supervisor binary from (default: `ghcr.io/nvidia/openshell/supervisor:latest`).
+  - `--supervisor-image`: OCI image reference for the OpenShell supervisor companion container (default: `ghcr.io/nvidia/openshell/supervisor:0.1.0-pre.3@sha256:065ee08e6cbbfeee3778f3074d440aece30e43d1efc61ebecb4ecb39d1b6cf71`).
   - `--supervisor-bin`: optional path to a pre-extracted supervisor binary on the host (bypasses extraction).
   - `--supervisor-cache-dir`: host directory for caching extracted supervisor binaries by content digest (default: `/var/cache/openshell/lxd-supervisor`).
   - `--supervisor-storage-pool`: LXD storage pool for the supervisor and DHCP-client volumes. When unset, each sandbox's own pool (`driver_config.storage_pool`, itself defaulting to `default`) is used, so the auxiliary volumes always land beside the rootfs they attach to. Set it to pin every auxiliary volume to one pool.
+  - `--sandbox-binary-image`: OCI image reference to extract the in-workload `openshell-sandbox` binary from (defaults to `--supervisor-image`).
+  - `--sandbox-bin`: optional path to a pre-extracted `openshell-sandbox` binary on the host (bypasses extraction).
   - `--dhcp-client-bin`: optional path to a DHCP client binary on the host (defaults to searching PATH and standard locations for `udhcpc` or `busybox`).
   - `--image-work-dir`: host scratch directory for image conversion (default: `/var/cache/openshell/lxd-image-work`). Must not be a small tmpfs such as `/tmp`.
   - `--default-max-processes`: `limits.processes` applied to every sandbox, bounding its PID count (default: 4096; `0` leaves it unlimited). Overridable per sandbox via `driver_config.max_processes`.

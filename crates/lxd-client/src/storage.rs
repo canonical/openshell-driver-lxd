@@ -231,8 +231,15 @@ impl LxdClient {
         #[cfg(not(unix))]
         let binary_bytes = tokio::fs::read(binary).await?;
 
-        self.ensure_single_file_volume(pool, name, &[("openshell-sandbox", &binary_bytes, 0o755)])
-            .await
+        self.ensure_single_file_volume(
+            pool,
+            name,
+            &[
+                ("openshell-sandbox", &binary_bytes, 0o755),
+                ("openshell-supervisor", &binary_bytes, 0o755),
+            ],
+        )
+        .await
     }
 
     /// Ensures a digest-keyed DHCP client storage volume exists on `pool`.

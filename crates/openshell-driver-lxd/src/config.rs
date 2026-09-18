@@ -36,8 +36,11 @@ pub const DEFAULT_STORAGE_POOL: &str = "default";
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
 
-/// Default supervisor OCI image to extract the supervisor binary from.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Default supervisor OCI image to run the companion container from.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:0.1.0-pre.3";
+
+/// Default sandbox binary OCI image to extract the openshell-sandbox binary from.
+pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = "ghcr.io/nvidia/openshell/sandbox:0.1.0-pre.3";
 
 /// Default host cache directory for extracted supervisor binaries.
 pub const DEFAULT_SUPERVISOR_CACHE_DIR: &str = "/var/cache/openshell/lxd-supervisor";
@@ -120,14 +123,23 @@ pub struct Config {
     #[arg(long, default_value = DEFAULT_STORAGE_POOL)]
     pub default_storage_pool: String,
 
-    /// OCI image reference to extract the OpenShell supervisor binary from.
+    /// OCI image reference to run the OpenShell supervisor companion container from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
     pub supervisor_image: String,
 
+    /// OCI image reference to extract the OpenShell sandbox binary from.
+    #[arg(long, default_value = DEFAULT_SANDBOX_BINARY_IMAGE)]
+    pub sandbox_binary_image: String,
+
     /// Optional path to a pre-extracted OpenShell supervisor binary on the host.
-    /// When set, skips extracting the binary from the supervisor OCI image.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
     #[arg(long)]
     pub supervisor_bin: Option<PathBuf>,
+
+    /// Optional path to a pre-extracted OpenShell sandbox binary on the host.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
+    #[arg(long)]
+    pub sandbox_bin: Option<PathBuf>,
 
     /// Optional path to a DHCP client binary on the host (e.g. `udhcpc` or `busybox`).
     /// When unset, the driver searches PATH and standard system locations.
@@ -457,7 +469,9 @@ mod tests {
         assert_eq!(config.default_storage_pool, DEFAULT_STORAGE_POOL);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
+        assert_eq!(config.sandbox_binary_image, DEFAULT_SANDBOX_BINARY_IMAGE);
         assert!(config.supervisor_bin.is_none());
+        assert!(config.sandbox_bin.is_none());
         assert!(config.lxd_url.is_none());
         assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
         assert!(config.gateway_endpoint.is_none());
