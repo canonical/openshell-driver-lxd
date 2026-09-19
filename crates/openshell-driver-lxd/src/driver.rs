@@ -664,11 +664,11 @@ impl LxdComputeDriver {
         let post_create = async {
             self.push_guest_files(&sup_name, &sup_guest_files).await?;
 
-            let op = self.lxd.start_instance(&sandbox.name).await?;
-            self.wait_operation(&op.id).await?;
-
             let sup_start = self.lxd.start_instance(&sup_name).await?;
             self.wait_operation(&sup_start.id).await?;
+
+            let op = self.lxd.start_instance(&sandbox.name).await?;
+            self.wait_operation(&op.id).await?;
 
             self.settle_after_start(&sandbox.name, &sandbox.id).await?;
 
@@ -797,7 +797,21 @@ impl LxdComputeDriver {
                 self.clear_stop_intent(&sup_name).await;
             }
 
-            // Start workload instance first
+            // Start companion supervisor instance first
+            let sup = self.lxd.get_instance(&sup_name).await?;
+            match sup.status.as_str() {
+                "Stopped" => {
+                    let sup_op = self.lxd.start_instance(&sup_name).await?;
+                    self.wait_operation(&sup_op.id).await?;
+                }
+                other => {
+                    return Err(DriverError::FailedPrecondition(format!(
+                        "companion supervisor instance is {other}, not stopped; it can be started once it has stopped"
+                    )));
+                }
+            }
+
+            // Start workload instance second
             let op = match self.lxd.start_instance(name).await {
                 Ok(op) => op,
                 Err(e) => {
@@ -816,20 +830,6 @@ impl LxdComputeDriver {
                     }
                 }
                 return Err(e);
-            }
-
-            // Start companion supervisor instance second
-            let sup = self.lxd.get_instance(&sup_name).await?;
-            match sup.status.as_str() {
-                "Stopped" => {
-                    let sup_op = self.lxd.start_instance(&sup_name).await?;
-                    self.wait_operation(&sup_op.id).await?;
-                }
-                other => {
-                    return Err(DriverError::FailedPrecondition(format!(
-                        "companion supervisor instance is {other}, not stopped; it can be started once it has stopped"
-                    )));
-                }
             }
 
             sandbox_id
@@ -1550,6 +1550,9 @@ mod tests {
             .resolve_alias(&template.image)
             .await
             .unwrap();
-        assert_eq!(resolved, format!("openshell-oci-r3-{digest_hex}"));
+        assert_eq!(
+            resolved,
+            format!("openshell-oci-r{}-{digest_hex}", image::CONVERSION_REVISION)
+        );
     }
 }

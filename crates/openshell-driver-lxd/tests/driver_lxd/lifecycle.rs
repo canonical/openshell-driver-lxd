@@ -276,7 +276,6 @@ async fn created_instance_carries_the_request() {
     for line in [
         format!("odl-standin: env OPENSHELL_SANDBOX_ID={id}"),
         format!("odl-standin: env OPENSHELL_ENDPOINT={expected_endpoint}"),
-        "odl-standin: env OPENSHELL_SANDBOX_TOKEN_FILE=/etc/openshell/auth/sandbox.jwt".to_string(),
         "odl-standin: env OPENSHELL_SSH_SOCKET_PATH=/run/openshell/ssh.sock".to_string(),
     ] {
         assert!(
@@ -287,6 +286,23 @@ async fn created_instance_carries_the_request() {
     assert!(
         console.contains(r#""/opt/openshell/bin/openshell-sandbox", "--workdir", "/sandbox""#),
         "supervisor should be exec'd with --workdir /sandbox:\n{console}"
+    );
+
+    let sup_console = eventually(
+        Duration::from_secs(15),
+        "the supervisor stand-in to report",
+        || async {
+            let log = driver.console_log(&sup_name);
+            log.contains("odl-standin: env OPENSHELL_SANDBOX=")
+                .then_some(log)
+        },
+    )
+    .await;
+    assert!(
+        sup_console.contains(
+            "odl-standin: env OPENSHELL_SANDBOX_TOKEN_FILE=/etc/openshell/auth/sandbox.jwt"
+        ),
+        "missing token file in supervisor console:\n{sup_console}"
     );
 }
 
@@ -635,24 +651,39 @@ async fn guest_tls_materials_reach_the_instance() {
             .map(String::as_str),
         Some(expected_endpoint.as_str())
     );
+
+    let sup_name = format!("{name}-supervisor");
+    let sup_config = lxd()
+        .get_instance(&sup_name)
+        .await
+        .expect("raw get_instance supervisor companion")
+        .config;
     assert_eq!(
-        config
+        sup_config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some(expected_endpoint.as_str())
+    );
+    assert_eq!(
+        sup_config
             .get("environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME")
             .map(String::as_str),
         Some("gateway.openshell.internal")
     );
     for (file, _, env, guest_path) in files {
         assert_eq!(
-            config
+            sup_config
                 .get(&format!("environment.{env}"))
                 .map(String::as_str),
             Some(guest_path),
             "{env}"
         );
         let (content, mode) = lxd()
-            .get_file_from_instance(&name, guest_path)
+            .get_file_from_instance(&sup_name, guest_path)
             .await
-            .unwrap_or_else(|e| panic!("{guest_path} should exist in the sandbox: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("{guest_path} should exist in the supervisor companion: {e}")
+            });
         assert_eq!(content.as_ref(), format!("test {file}").as_bytes());
         assert_eq!(mode, 0o400, "{guest_path}");
     }

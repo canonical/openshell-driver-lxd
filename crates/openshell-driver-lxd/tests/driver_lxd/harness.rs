@@ -382,15 +382,9 @@ impl Driver {
             .arg(self.dir().join("supervisor-cache"))
             .args(["--stop-timeout-secs", &STOP_TIMEOUT_SECS.to_string()])
             .args(["--start-retries", &options.start_retries.to_string()]);
-        match &options.supervisor_image {
-            None => {
-                cmd.arg("--supervisor-bin").arg(standin_supervisor());
-                cmd.args(["--supervisor-image", &options.default_image]);
-            }
-            Some(image) => {
-                cmd.args(["--supervisor-image", image]);
-            }
-        }
+        let supervisor_image = options.supervisor_image.as_deref().unwrap_or(SANDBOX_IMAGE);
+        cmd.args(["--supervisor-image", supervisor_image]);
+        cmd.arg("--supervisor-bin").arg(standin_supervisor());
         if options.allow_plaintext_gateway {
             cmd.arg("--allow-plaintext-gateway");
         }

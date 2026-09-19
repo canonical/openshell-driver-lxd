@@ -81,8 +81,9 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
 /// being reused. Revision 2 keeps the image's file ownership; revision 3 boots
 /// the init script through `/sbin/init`, which also takes the nameserver from
 /// the network, reaches gateways by IPv6 address or host name and probes an
-/// https gateway the way the supervisor connects to it.
-pub const CONVERSION_REVISION: u32 = 3;
+/// https gateway the way the supervisor connects to it; revision 4 injects a
+/// static shell when `/bin/sh` is missing.
+pub const CONVERSION_REVISION: u32 = 4;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -802,8 +803,10 @@ impl OciImporter for SkopeoImporter {
             tracing::debug!(path = %oci_dest.display(), %e, "could not free OCI copy early");
         }
 
-        // Inject the minimal init script before repacking with mksquashfs, and
+        // Inject a static shell if the image lacks /bin/sh (e.g. distroless images),
+        // then inject the minimal init script before repacking with mksquashfs, and
         // make it the container's init.
+        ensure_shell(&rootfs_dest)?;
         inject_init_script(&rootfs_dest)?;
         install_init(&rootfs_dest)?;
 
@@ -1284,6 +1287,53 @@ fn resolve_in_rootfs(rootfs: &Path, guest_path: &str) -> Result<PathBuf, DriverE
     Ok(rootfs.join(resolved).join(file_name))
 }
 
+/// Injects a static busybox binary and applet symlinks into `rootfs_dest` if `/bin/sh` is missing,
+/// allowing minimal or distroless images (such as the supervisor companion) to execute [`GUEST_INIT_SCRIPT_PATH`].
+fn ensure_shell(rootfs_dest: &Path) -> Result<(), DriverError> {
+    if let Ok(sh_path) = resolve_in_rootfs(rootfs_dest, "/bin/sh") {
+        if std::fs::symlink_metadata(&sh_path).is_ok() {
+            return Ok(());
+        }
+    }
+
+    let busybox_source = crate::dhcp_client::resolve_static_busybox()?;
+
+    let bin_dir = rootfs_dest.join("bin");
+    if std::fs::symlink_metadata(&bin_dir).is_err() {
+        std::fs::create_dir_all(&bin_dir).map_err(|e| {
+            DriverError::ImageImport(format!("failed to create {}: {e}", bin_dir.display()))
+        })?;
+    }
+
+    let busybox_dest = bin_dir.join("busybox");
+    std::fs::copy(&busybox_source, &busybox_dest).map_err(|e| {
+        DriverError::ImageImport(format!(
+            "failed to copy static busybox from {} to {}: {e}",
+            busybox_source.display(),
+            busybox_dest.display()
+        ))
+    })?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&busybox_dest, std::fs::Permissions::from_mode(0o755));
+    }
+
+    let applets = [
+        "sh", "ash", "ip", "mkdir", "chmod", "chown", "id", "rm", "grep", "awk", "sed", "wc",
+        "cat", "sleep", "ps", "kill", "test", "[", "touch",
+    ];
+    for applet in applets {
+        let link = bin_dir.join(applet);
+        if std::fs::symlink_metadata(&link).is_err() {
+            let _ = std::os::unix::fs::symlink("busybox", &link);
+        }
+    }
+
+    Ok(())
+}
+
 /// Makes [`GUEST_INIT_PATH`] a symlink to the injected init script, replacing
 /// whatever init the image shipped: a sandbox's init is always the script,
 /// which hands over to the supervisor.
@@ -1318,8 +1368,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r3-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r3-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r4-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r4-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
@@ -1682,7 +1732,7 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-r3-{digest_hex}");
+        let expected_alias = format!("test-oci-r4-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer

@@ -14,6 +14,9 @@ pub(crate) const DHCP_CLIENT_SCRIPT: &[u8] = include_bytes!("../assets/dhcp-clie
 /// Candidate binary names to look for in `PATH`.
 const CANDIDATE_NAMES: &[&str] = &["busybox-static", "udhcpc", "busybox"];
 
+/// Candidate binary names specifically for busybox.
+const BUSYBOX_CANDIDATE_NAMES: &[&str] = &["busybox-static", "busybox"];
+
 /// Candidate full paths to probe when not found in `PATH`.
 const FALLBACK_PATHS: &[&str] = &[
     "/usr/bin/busybox-static",
@@ -26,6 +29,14 @@ const FALLBACK_PATHS: &[&str] = &[
     "/bin/busybox",
 ];
 
+/// Candidate full paths to probe for busybox when not found in `PATH`.
+const BUSYBOX_FALLBACK_PATHS: &[&str] = &[
+    "/usr/bin/busybox-static",
+    "/bin/busybox-static",
+    "/usr/bin/busybox",
+    "/bin/busybox",
+];
+
 /// Relative paths within `$SNAP` to probe when running inside a snap.
 const SNAP_RELATIVE_PATHS: &[&str] = &[
     "usr/bin/busybox-static",
@@ -34,6 +45,14 @@ const SNAP_RELATIVE_PATHS: &[&str] = &[
     "usr/bin/udhcpc",
     "bin/udhcpc",
     "sbin/udhcpc",
+    "usr/bin/busybox",
+    "bin/busybox",
+];
+
+/// Relative paths within `$SNAP` to probe for busybox when running inside a snap.
+const BUSYBOX_SNAP_RELATIVE_PATHS: &[&str] = &[
+    "usr/bin/busybox-static",
+    "bin/busybox-static",
     "usr/bin/busybox",
     "bin/busybox",
 ];
@@ -233,6 +252,36 @@ pub fn resolve_dhcp_client_binary(override_path: Option<&Path>) -> Result<PathBu
 
     Err(DriverError::DhcpClient(
         "no DHCP client binary found in environment; install udhcpc or busybox-static, or pass --dhcp-client-bin".into(),
+    ))
+}
+
+/// Resolves a static busybox binary from the host environment to provide a shell and coreutils.
+pub fn resolve_static_busybox() -> Result<PathBuf, DriverError> {
+    for name in BUSYBOX_CANDIDATE_NAMES {
+        if let Some(p) = find_in_path(name) {
+            return Ok(p);
+        }
+    }
+
+    if let Ok(snap) = std::env::var("SNAP") {
+        let snap_dir = Path::new(&snap);
+        for sub in BUSYBOX_SNAP_RELATIVE_PATHS {
+            let candidate = snap_dir.join(sub);
+            if is_candidate(&candidate) {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    for path_str in BUSYBOX_FALLBACK_PATHS {
+        let p = Path::new(path_str);
+        if is_candidate(p) {
+            return Ok(p.to_path_buf());
+        }
+    }
+
+    Err(DriverError::ImageImport(
+        "no static busybox binary found on host; install busybox-static or busybox".into(),
     ))
 }
 

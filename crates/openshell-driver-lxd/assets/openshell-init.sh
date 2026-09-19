@@ -55,10 +55,18 @@ has_ipv4() {
     ip -4 addr show dev eth0 2>/dev/null | grep -q "inet "
 }
 
+UDHCPC_SCRIPT=""
+if [ -f /opt/openshell/net/udhcpc.script ]; then
+    UDHCPC_SCRIPT="-s /opt/openshell/net/udhcpc.script"
+elif [ -f /usr/share/udhcpc/default.script ]; then
+    UDHCPC_SCRIPT="-s /usr/share/udhcpc/default.script"
+fi
+
 if command -v udhcpc >/dev/null 2>&1; then
     # udhcpc: -i eth0, -f (foreground), -q (quit after lease), -n (exit on lease fail),
     # -t 10 -T 3 (10 attempts every 3 seconds = 30s bounded timeout)
-    udhcpc -i eth0 -f -q -n -t 10 -T 3 || true
+    # shellcheck disable=SC2086
+    udhcpc -i eth0 -f -q -n -t 10 -T 3 ${UDHCPC_SCRIPT} || true
 elif command -v dhclient >/dev/null 2>&1; then
     if command -v timeout >/dev/null 2>&1; then
         timeout 30 dhclient -1 eth0 2>/dev/null || true
@@ -68,7 +76,8 @@ elif command -v dhclient >/dev/null 2>&1; then
 elif command -v dhcpcd >/dev/null 2>&1; then
     dhcpcd -1 -t 30 eth0 2>/dev/null || true
 elif [ -x /opt/openshell/net/udhcpc ]; then
-    /opt/openshell/net/udhcpc -i eth0 -f -q -n -t 10 -T 3 -s /opt/openshell/net/udhcpc.script || true
+    # shellcheck disable=SC2086
+    /opt/openshell/net/udhcpc -i eth0 -f -q -n -t 10 -T 3 ${UDHCPC_SCRIPT} || true
 else
     echo "openshell-init: no supported DHCP client found (udhcpc, dhclient, dhcpcd)" >&2
     exit 1

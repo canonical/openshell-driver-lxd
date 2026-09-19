@@ -59,9 +59,9 @@ pub fn build_auth_bundle(sandbox: &DriverSandbox, spec: &DriverSandboxSpec) -> s
         "session_rotation": 1,
         "auth_epoch": 1,
         "gateway_token": spec.sandbox_token,
-        "gateway_expires_at": 0,
+        "gateway_expires_at": i64::MAX,
         "sandbox_token": spec.sandbox_token,
-        "sandbox_expires_at": 0,
+        "sandbox_expires_at": i64::MAX,
     })
 }
 
@@ -277,16 +277,52 @@ pub fn aggregate_companion_status(sandbox: &mut DriverSandbox, companion: Option
                 ),
                 transition_time: None,
             }];
-        } else if companion.status.eq_ignore_ascii_case("Stopped")
-            && status.conditions.iter().any(|c| c.status == "True")
+        } else if companion.status.eq_ignore_ascii_case("Stopped") {
+            if !companion.config.contains_key(KEY_LAST_POWER) {
+                if status.conditions.iter().any(|c| c.status == "True") {
+                    status.conditions = vec![DriverCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: CONDITION_STARTING.to_string(),
+                        message: "supervisor companion container has not started yet".to_string(),
+                        transition_time: None,
+                    }];
+                }
+            } else if companion.config.contains_key(KEY_STOP_INTENT) {
+                if status.conditions.iter().any(|c| c.status == "True") {
+                    status.conditions = vec![DriverCondition {
+                        r#type: "Ready".to_string(),
+                        status: "False".to_string(),
+                        reason: CONDITION_STOPPED.to_string(),
+                        message: "supervisor companion was stopped through the compute driver API"
+                            .to_string(),
+                        transition_time: None,
+                    }];
+                }
+            } else {
+                status.conditions = vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: CONDITION_EXITED.to_string(),
+                    message: "supervisor companion container stopped unexpectedly".to_string(),
+                    transition_time: None,
+                }];
+            }
+        } else if !companion.status.eq_ignore_ascii_case("Running")
+            && !companion.status.eq_ignore_ascii_case("Ready")
         {
-            status.conditions = vec![DriverCondition {
-                r#type: "Ready".to_string(),
-                status: "False".to_string(),
-                reason: CONDITION_EXITED.to_string(),
-                message: "supervisor companion container stopped unexpectedly".to_string(),
-                transition_time: None,
-            }];
+            if status.conditions.iter().any(|c| c.status == "True") {
+                status.conditions = vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "False".to_string(),
+                    reason: CONDITION_STARTING.to_string(),
+                    message: format!(
+                        "supervisor companion container is not ready: {}",
+                        companion.status
+                    ),
+                    transition_time: None,
+                }];
+            }
         }
     }
 }
@@ -2050,6 +2086,8 @@ mod tests {
         let auth = build_auth_bundle(&sandbox, &spec);
         assert_eq!(auth["session_id"], "test-sb-id");
         assert_eq!(auth["session_rotation"], 1);
+        assert_eq!(auth["gateway_expires_at"], i64::MAX);
+        assert_eq!(auth["sandbox_expires_at"], i64::MAX);
     }
 
     #[test]
@@ -2076,5 +2114,67 @@ mod tests {
         assert_eq!(devices["supervisor"]["source"], "sup-vol");
         assert!(devices.contains_key("dhcp-client"));
         assert_eq!(devices["dhcp-client"]["source"], "dhcp-vol");
+    }
+
+    #[test]
+    fn test_aggregate_companion_status() {
+        let mut sandbox = DriverSandbox {
+            id: "sb-1".to_string(),
+            name: "test-sb".to_string(),
+            status: Some(DriverSandboxStatus {
+                conditions: vec![DriverCondition {
+                    r#type: "Ready".to_string(),
+                    status: "True".to_string(),
+                    reason: String::new(),
+                    message: String::new(),
+                    transition_time: None,
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // None companion does nothing
+        aggregate_companion_status(&mut sandbox, None);
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].status, "True");
+
+        // Error companion sets ContainerError
+        let error_comp = instance_with("Error", &[]);
+        aggregate_companion_status(&mut sandbox, Some(&error_comp));
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].status, "False");
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].reason, "ContainerError");
+
+        // Reset to Ready
+        sandbox.status.as_mut().unwrap().conditions[0].status = "True".to_string();
+
+        // Stopped companion that never started (!KEY_LAST_POWER) -> CONDITION_STARTING
+        let created_comp = instance_with("Stopped", &[]);
+        aggregate_companion_status(&mut sandbox, Some(&created_comp));
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].status, "False");
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].reason, CONDITION_STARTING);
+
+        // Reset to Ready
+        sandbox.status.as_mut().unwrap().conditions[0].status = "True".to_string();
+
+        // Stopped companion with stop intent -> CONDITION_STOPPED
+        let stopped_intent_comp = instance_with(
+            "Stopped",
+            &[
+                (KEY_LAST_POWER, "RUNNING"),
+                (KEY_STOP_INTENT, CONDITION_STOPPED),
+            ],
+        );
+        aggregate_companion_status(&mut sandbox, Some(&stopped_intent_comp));
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].status, "False");
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].reason, CONDITION_STOPPED);
+
+        // Reset to Ready
+        sandbox.status.as_mut().unwrap().conditions[0].status = "True".to_string();
+
+        // Stopped companion that crashed (ran before, no stop intent) -> CONDITION_EXITED
+        let crashed_comp = instance_with("Stopped", &[(KEY_LAST_POWER, "RUNNING")]);
+        aggregate_companion_status(&mut sandbox, Some(&crashed_comp));
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].status, "False");
+        assert_eq!(sandbox.status.as_ref().unwrap().conditions[0].reason, CONDITION_EXITED);
     }
 }

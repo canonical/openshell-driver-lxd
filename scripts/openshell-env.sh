@@ -43,7 +43,7 @@ OPENSHELL_SOURCE_REV="7e7a8d5610f336f5f7f9f60da0951adbf295475d"
 # OpenShell v0.1.0-pre.3 split the supervisor into an out-of-workload
 # supervisor companion and an in-workload boundary (RFC 0012).
 SUPERVISOR_VERSION="0.1.0-pre.3"
-SUPERVISOR_DIGEST="sha256:065ee08e6cbbfeee3778f3074d440aece30e43d1efc61ebecb4ecb39d1b6cf71"
+SUPERVISOR_DIGEST="sha256:ba4ef0c9d7c244f85e5d8ef1741d25b53a0575dff5395d7c51b3392875920363"
 SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${SUPERVISOR_VERSION}@${SUPERVISOR_DIGEST}"
 
 # --- Layout ------------------------------------------------------------------
