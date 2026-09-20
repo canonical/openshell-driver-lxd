@@ -54,7 +54,13 @@ parts:
       - libssl3t64
       - libz3-4
       - busybox-static
+      # openshell-driver-lxd shells out to all four of these while converting
+      # an OCI image into an LXD one: skopeo copies it, umoci unpacks it,
+      # mksquashfs builds the rootfs and tar -cJf builds metadata.tar.xz,
+      # which needs the xz binary. A missing one fails on first create_sandbox
+      # and nowhere earlier.
       - squashfs-tools
+      - xz-utils
       - umoci
       - skopeo
 
