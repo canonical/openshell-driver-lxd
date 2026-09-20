@@ -27,6 +27,10 @@
 #   OPENSHELL_TEST_WORK_DIR   state, logs and artifacts (default: target/openshell-test)
 #   OPENSHELL_TEST_CACHE_DIR  downloads and builds (default: target/openshell-test-cache)
 #   OPENSHELL_TEST_PROJECT    LXD project to run in (default: openshell-test)
+#   OPENSHELL_TEST_NETWORK    network sandboxes attach to (default: lxdbr0)
+#   OPENSHELL_TEST_POOL       pool for sandbox root disks (default: default)
+#   OPENSHELL_TEST_GATEWAY_IP host address the gateway binds and sandboxes
+#                             reach it at (default: derived from the network)
 
 set -euo pipefail
 
@@ -64,6 +68,11 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WORK_DIR="${OPENSHELL_TEST_WORK_DIR:-${REPO_ROOT}/target/openshell-test}"
 CACHE_DIR="${OPENSHELL_TEST_CACHE_DIR:-${REPO_ROOT}/target/openshell-test-cache}"
 PROJECT="${OPENSHELL_TEST_PROJECT:-openshell-test}"
+# Where sandboxes land. Both go on the test project's own default profile,
+# which is where the driver reads them from: it is given nothing but
+# --project, the way an operator points it at a prepared project.
+NETWORK="${OPENSHELL_TEST_NETWORK:-lxdbr0}"
+STORAGE_POOL="${OPENSHELL_TEST_POOL:-default}"
 
 GATEWAY_PORT=17670
 HEALTH_PORT=17671
@@ -158,11 +167,36 @@ fetch_git_rev() {
 
 # --- Environment -------------------------------------------------------------
 
-bridge_ipv4() {
-    local cidr
-    cidr="$(lxc network get lxdbr0 ipv4.address </dev/null)"
+network_type() {
+    lxc query "/1.0/networks/${NETWORK}" </dev/null | jq -r .type
+}
+
+# The host address the gateway binds to and sandboxes reach it at.
+#
+# On a bridge that is the bridge's own address, which is also what the driver
+# derives when it is not told otherwise. An OVN network has no such address —
+# its ipv4.address belongs to its virtual router, which nothing on the host
+# can listen on — so sandboxes leave through the router's uplink address and
+# see the host as whatever address routes there.
+gateway_ipv4() {
+    if [ -n "${OPENSHELL_TEST_GATEWAY_IP:-}" ]; then
+        echo "$OPENSHELL_TEST_GATEWAY_IP"
+        return
+    fi
+    local type cidr uplink
+    type="$(network_type)"
+    if [ "$type" = "ovn" ]; then
+        uplink="$(lxc query "/1.0/networks/${NETWORK}" </dev/null |
+            jq -r '.config["volatile.network.ipv4.address"] // empty')"
+        [ -n "$uplink" ] ||
+            die "OVN network ${NETWORK} has no uplink address yet; set OPENSHELL_TEST_GATEWAY_IP"
+        ip -4 route get "$uplink" 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1 |
+            grep . || die "no host address routes to the uplink ${uplink} of ${NETWORK}"
+        return
+    fi
+    cidr="$(lxc network get "$NETWORK" ipv4.address </dev/null)"
     if [ -z "$cidr" ] || [ "$cidr" = "none" ]; then
-        die "lxdbr0 has no IPv4 address"
+        die "network ${NETWORK} has no IPv4 address"
     fi
     echo "${cidr%/*}"
 }
@@ -171,8 +205,16 @@ create_project() {
     if lxc project show "$PROJECT" </dev/null >/dev/null 2>&1; then
         die "LXD project ${PROJECT} already exists; run '${ENV_SCRIPT} down' first"
     fi
-    log "creating LXD project ${PROJECT}"
-    lxc project create "$PROJECT" -c features.images=false -c features.profiles=false </dev/null >/dev/null
+    log "creating LXD project ${PROJECT} (network ${NETWORK}, pool ${STORAGE_POOL})"
+    lxc project create "$PROJECT" -c features.images=false -c features.profiles=true </dev/null >/dev/null
+    # The project's own default profile is the only place the driver is told
+    # where sandboxes go, so this is also what exercises reading it from
+    # there. features.profiles=true above is what gives the project a profile
+    # of its own to put this on.
+    lxc profile device add default root disk path=/ pool="$STORAGE_POOL" \
+        --project "$PROJECT" </dev/null >/dev/null
+    lxc profile device add default eth0 nic network="$NETWORK" name=eth0 \
+        --project "$PROJECT" </dev/null >/dev/null
 }
 
 delete_project() {
@@ -182,8 +224,8 @@ delete_project() {
     for name in $(lxc list --project "$PROJECT" --format csv -c n </dev/null); do
         lxc delete --force "$name" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
     done
-    for volume in $(lxc storage volume list default --project "$PROJECT" --format csv -c tn </dev/null | awk -F, '$1 == "custom" { print $2 }'); do
-        lxc storage volume delete default "$volume" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
+    for volume in $(lxc storage volume list "$STORAGE_POOL" --project "$PROJECT" --format csv -c tn </dev/null | awk -F, '$1 == "custom" { print $2 }'); do
+        lxc storage volume delete "$STORAGE_POOL" "$volume" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
     done
     lxc project delete "$PROJECT" </dev/null >/dev/null
 }
@@ -233,11 +275,19 @@ stop_process() {
 
 start_driver() {
     rm -f "$DRIVER_SOCKET"
+    # On a bridge the driver derives the gateway endpoint from the network
+    # itself, and deriving it is worth exercising. It cannot on OVN, where
+    # the network's address is its virtual router's, so there it is told.
+    local endpoint=()
+    if [ "$(network_type)" = "ovn" ]; then
+        endpoint=(--gateway-endpoint "$(gateway_endpoint)")
+    fi
     # The gateway here is plaintext, as upstream's own suites run it; the
     # driver refuses one unless told this is a test environment.
     "$DRIVER_BIN" \
         --socket "$DRIVER_SOCKET" \
         --allow-plaintext-gateway \
+        "${endpoint[@]}" \
         --project "$PROJECT" \
         --log-level "info,openshell_driver_lxd=debug" \
         --default-image "$SANDBOX_IMAGE" \
@@ -259,7 +309,7 @@ start_driver() {
 
 start_gateway() {
     local ip
-    ip="$(cat "${WORK_DIR}/bridge-ip")"
+    ip="$(cat "${WORK_DIR}/gateway-ip")"
     "$GATEWAY_BIN" \
         --config "${WORK_DIR}/gateway.toml" \
         --disable-tls \
@@ -292,6 +342,7 @@ write_host_action() {
     cat >"$path" <<EOF
 #!/bin/sh
 OPENSHELL_TEST_WORK_DIR='${WORK_DIR}' OPENSHELL_TEST_CACHE_DIR='${CACHE_DIR}' OPENSHELL_TEST_PROJECT='${PROJECT}' \\
+OPENSHELL_TEST_NETWORK='${NETWORK}' OPENSHELL_TEST_POOL='${STORAGE_POOL}' \\
     exec '${ENV_SCRIPT}' ${action}
 EOF
     chmod +x "$path"
@@ -299,7 +350,7 @@ EOF
 }
 
 gateway_endpoint() {
-    echo "http://$(cat "${WORK_DIR}/bridge-ip"):${GATEWAY_PORT}"
+    echo "http://$(cat "${WORK_DIR}/gateway-ip"):${GATEWAY_PORT}"
 }
 
 # Runs a command with the CLI pointed at the gateway and its config and
@@ -337,7 +388,7 @@ env_up() {
     touch "${WORK_DIR}/${WORK_DIR_MARKER}"
     find "$WORK_DIR" -mindepth 1 -maxdepth 1 ! -name "$WORK_DIR_MARKER" -exec rm -rf {} +
     mkdir -p "$ARTIFACTS_DIR"
-    bridge_ipv4 >"${WORK_DIR}/bridge-ip"
+    gateway_ipv4 >"${WORK_DIR}/gateway-ip"
     create_project
     write_gateway_config
 
@@ -349,7 +400,7 @@ env_up() {
 
     log "starting driver (project ${PROJECT}, supervisor ${OPENSHELL_VERSION})"
     start_driver
-    log "starting OpenShell ${OPENSHELL_VERSION} gateway on $(cat "${WORK_DIR}/bridge-ip"):${GATEWAY_PORT}"
+    log "starting OpenShell ${OPENSHELL_VERSION} gateway on $(cat "${WORK_DIR}/gateway-ip"):${GATEWAY_PORT}"
     start_gateway
     log "up; logs in ${WORK_DIR}"
 }
