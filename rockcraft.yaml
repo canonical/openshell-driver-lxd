@@ -54,6 +54,7 @@ parts:
       - libssl3t64
       - libz3-4
       - busybox-static
+      - squashfs-tools
       - umoci
       - skopeo
 
