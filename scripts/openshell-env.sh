@@ -299,8 +299,8 @@ start_driver() {
     echo $! >"${WORK_DIR}/driver.pid"
 
     for _ in $(seq 1 100); do
-        [ -S "$DRIVER_SOCKET" ] && return 0
         pid_alive "${WORK_DIR}/driver.pid" || break
+        [ -S "$DRIVER_SOCKET" ] && return 0
         sleep 0.1
     done
     tail -n 50 "${WORK_DIR}/driver.log" >&2 || true
@@ -323,9 +323,12 @@ start_gateway() {
         </dev/null >>"${WORK_DIR}/gateway.log" 2>&1 &
     echo $! >"${WORK_DIR}/gateway.pid"
 
+    # Our own process first: a gateway left over from an earlier run answers
+    # this health check just as well, and the tests would then run against
+    # it — against its driver, its project and its state.
     for _ in $(seq 1 600); do
-        curl -fs "http://${ip}:${HEALTH_PORT}/healthz" >/dev/null 2>&1 && return 0
         pid_alive "${WORK_DIR}/gateway.pid" || break
+        curl -fs "http://${ip}:${HEALTH_PORT}/healthz" >/dev/null 2>&1 && return 0
         sleep 0.1
     done
     tail -n 50 "${WORK_DIR}/gateway.log" >&2 || true
@@ -370,6 +373,17 @@ ensure_not_running() {
     if pid_alive "${WORK_DIR}/gateway.pid" || pid_alive "${WORK_DIR}/driver.pid"; then
         die "already running; run '${ENV_SCRIPT} down' first"
     fi
+    # A gateway whose pid file is gone — a run killed part-way, or one from
+    # another work dir -- still holds the ports and still answers the health
+    # check the new gateway is waited on with. Refuse rather than let the
+    # suites run against it.
+    local port
+    for port in "$GATEWAY_PORT" "$HEALTH_PORT"; do
+        if ss -ltn "sport = :${port}" 2>/dev/null | grep -q LISTEN; then
+            die "something is already listening on port ${port}; stop it first" \
+                "(ss -ltnp \"sport = :${port}\")"
+        fi
+    done
 }
 
 env_up() {
