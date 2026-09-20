@@ -130,6 +130,23 @@ build_driver() {
     cargo build --quiet --manifest-path "${REPO_ROOT}/Cargo.toml" -p openshell-driver-lxd
 }
 
+# Fetches `rev` from `repo` into `dir`, checked out, leaving the `.git` in
+# place for the caller to remove.
+#
+# Git runs with the user's and the system's configuration ignored. A
+# `url.git@github.com:.insteadOf https://github.com/` rewrite is a common
+# thing to have on a machine that pushes over SSH, and it would turn this
+# anonymous HTTPS fetch into an SSH one, which then fails wherever that
+# machine has no key for the remote — as the test hosts do not.
+fetch_git_rev() {
+    local dir=$1 repo=$2 rev=$3
+    mkdir -p "$dir"
+    local git=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null git -C "$dir")
+    "${git[@]}" init --quiet
+    "${git[@]}" fetch --quiet --depth 1 "$repo" "$rev"
+    "${git[@]}" checkout --quiet FETCH_HEAD
+}
+
 # --- Environment -------------------------------------------------------------
 
 bridge_ipv4() {

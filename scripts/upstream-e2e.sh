@@ -103,10 +103,7 @@ fetch_source() {
     [ -f "${SOURCE_DIR}/e2e/rust/Cargo.toml" ] && return
     log "fetching OpenShell source at v${OPENSHELL_VERSION} (${OPENSHELL_SOURCE_REV})"
     rm -rf "$SOURCE_DIR"
-    mkdir -p "$SOURCE_DIR"
-    git -C "$SOURCE_DIR" init --quiet
-    git -C "$SOURCE_DIR" fetch --quiet --depth 1 "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
-    git -C "$SOURCE_DIR" checkout --quiet FETCH_HEAD
+    fetch_git_rev "$SOURCE_DIR" "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
     rm -rf "${SOURCE_DIR}/.git"
 }
 
