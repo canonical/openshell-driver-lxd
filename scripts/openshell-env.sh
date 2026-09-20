@@ -233,6 +233,10 @@ delete_project() {
         lxc storage volume delete "$STORAGE_POOL" "$volume" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
     done
     lxc project delete "$PROJECT" </dev/null >/dev/null
+    # --restrict-sandbox-egress leaves an ACL behind. It belongs to the
+    # project the network is in, not the one just deleted, so nothing else
+    # here takes it with them.
+    lxc network acl delete "openshell-egress-${NETWORK}" </dev/null >/dev/null 2>&1 || true
 }
 
 write_gateway_config() {
