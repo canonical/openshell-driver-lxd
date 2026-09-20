@@ -450,12 +450,23 @@ local LXD, the way upstream validates its in-tree drivers:
 
 Both this and `make test-upstream-e2e` below run in the environment
 `scripts/openshell-env.sh` provides. It pins the OpenShell side to one
-release — gateway, CLI and supervisor image from v0.0.116, verified by
+release — gateway, CLI, supervisor image and sandbox image, verified by
 checksum and digest — because mixing components from different releases
 fails in ways that are not the driver's, and runs everything in a throwaway
 LXD project (`openshell-test`) that shares the default project's image cache.
 The conformance runner is built from the newest upstream revision the pinned
 CLI can drive.
+
+Sandboxes go on `lxdbr0` and the `default` pool, set on the test project's
+own default profile, which is the only place the driver is told where to put
+them. `OPENSHELL_TEST_NETWORK` and `OPENSHELL_TEST_POOL` change that — on
+MicroCloud, `OPENSHELL_TEST_NETWORK=default OPENSHELL_TEST_POOL=local` runs
+the suites on OVN and ZFS. `OPENSHELL_TEST_DRIVER_ARGS` passes the driver
+options the suites do not set themselves, such as
+`--restrict-sandbox-egress`, which needs an OVN network. Conformance passes
+under that option; the upstream e2e suite cannot run under it, because its
+fixture server listens on a private address and the option's whole point is
+to deny sandboxes the private networks around them.
 
 On failure, the driver and gateway logs and LXD's lifecycle events are left
 in `target/openshell-test/artifacts`, with each suite's reports in a
@@ -471,8 +482,11 @@ that silently enforces nothing still passes smoke. The tests come from the
 v0.0.116 source tree (the Rust tests of `e2e/rust` and the Python tests of
 `e2e/python`, run through the release's Python SDK); upstream tests specific
 to the Docker or Podman drivers are left out. It additionally needs rootless
-podman (with `uidmap` and `passt`) for a test fixture server, and
-`python3` 3.11 or newer. Logs and a JUnit report land in
+podman (with `uidmap` and `passt`) for a test fixture server. Its own Python
+is downloaded rather than taken from the host, because the SDK's
+`exec_python` ships a test's function into the sandbox as bytecode and
+bytecode does not cross Python versions: the test environment is built with
+the version the pinned sandbox image runs. Logs and a JUnit report land in
 `target/openshell-test/artifacts/upstream-e2e`.
 
 ## Known limitations

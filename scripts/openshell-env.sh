@@ -31,6 +31,8 @@
 #   OPENSHELL_TEST_POOL       pool for sandbox root disks (default: default)
 #   OPENSHELL_TEST_GATEWAY_IP host address the gateway binds and sandboxes
 #                             reach it at (default: derived from the network)
+#   OPENSHELL_TEST_DRIVER_ARGS  extra driver arguments, e.g.
+#                             --restrict-sandbox-egress (default: none)
 
 set -euo pipefail
 
@@ -73,6 +75,9 @@ PROJECT="${OPENSHELL_TEST_PROJECT:-openshell-test}"
 # --project, the way an operator points it at a prepared project.
 NETWORK="${OPENSHELL_TEST_NETWORK:-lxdbr0}"
 STORAGE_POOL="${OPENSHELL_TEST_POOL:-default}"
+# Driver options the suites do not set themselves, for exercising one of its
+# modes against a whole suite without a second script.
+read -r -a EXTRA_DRIVER_ARGS <<<"${OPENSHELL_TEST_DRIVER_ARGS:-}"
 
 GATEWAY_PORT=17670
 HEALTH_PORT=17671
@@ -295,6 +300,7 @@ start_driver() {
         --supervisor-cache-dir "${WORK_DIR}/supervisor-cache" \
         --image-work-dir "${WORK_DIR}/image-work" \
         --gateway-grpc-port "$GATEWAY_PORT" \
+        "${EXTRA_DRIVER_ARGS[@]}" \
         </dev/null >>"${WORK_DIR}/driver.log" 2>&1 &
     echo $! >"${WORK_DIR}/driver.pid"
 
@@ -346,6 +352,7 @@ write_host_action() {
 #!/bin/sh
 OPENSHELL_TEST_WORK_DIR='${WORK_DIR}' OPENSHELL_TEST_CACHE_DIR='${CACHE_DIR}' OPENSHELL_TEST_PROJECT='${PROJECT}' \\
 OPENSHELL_TEST_NETWORK='${NETWORK}' OPENSHELL_TEST_POOL='${STORAGE_POOL}' \\
+OPENSHELL_TEST_DRIVER_ARGS='${OPENSHELL_TEST_DRIVER_ARGS:-}' \\
     exec '${ENV_SCRIPT}' ${action}
 EOF
     chmod +x "$path"
