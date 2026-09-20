@@ -40,6 +40,15 @@ set -euo pipefail
 SDK_WHEEL="openshell-${OPENSHELL_VERSION}-py3-none-any.whl"
 SDK_WHEEL_SHA256="5a31eb4e38d7b5d746956404145b7335557f9060ac7a987c65ea5af4d708b3fc"
 
+# Python the test environment is built with. cloudpickle, which the SDK's
+# exec_python uses to ship a test's function into the sandbox, serializes the
+# function's bytecode, and bytecode does not survive a Python version change:
+# the sandbox loads the function and then dies on the first call, with no
+# output for a test to report. So this tracks the Python in SANDBOX_IMAGE —
+# `skopeo inspect` it, or run `python -V` in a sandbox, when bumping that pin.
+# uv downloads the interpreter, so the host need not have this version.
+SANDBOX_PYTHON_VERSION="3.14"
+
 # A standalone uv, so no system Python packaging tools are needed.
 UV_VERSION="0.12.13"
 UV_SHA256_X86_64="745765a3b6e360ad76743599ae5c42e9278c7edf8bbff9fc76d05bf2623a04dd"
@@ -82,7 +91,7 @@ PYTHON_TESTS="${UPSTREAM_E2E_PYTHON_TESTS:-$DEFAULT_PYTHON_TESTS}"
 SOURCE_DIR="${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
 E2E_TARGET_DIR="${CACHE_DIR}/upstream-e2e-target"
 UV_DIR="${CACHE_DIR}/uv-${UV_VERSION}"
-VENV_DIR="${CACHE_DIR}/upstream-e2e-venv-${OPENSHELL_VERSION}"
+VENV_DIR="${CACHE_DIR}/upstream-e2e-venv-${OPENSHELL_VERSION}-py${SANDBOX_PYTHON_VERSION}"
 SUITE_ARTIFACTS_DIR="${ARTIFACTS_DIR}/upstream-e2e"
 SDK_GATEWAY_NAME="upstream-e2e"
 
@@ -144,7 +153,8 @@ setup_python() {
 
     log "creating Python test environment"
     rm -rf "$VENV_DIR"
-    UV_CACHE_DIR="${CACHE_DIR}/uv-cache" "${UV_DIR}/uv" venv --quiet --python python3 "$VENV_DIR"
+    UV_CACHE_DIR="${CACHE_DIR}/uv-cache" "${UV_DIR}/uv" venv --quiet \
+        --python "$SANDBOX_PYTHON_VERSION" "$VENV_DIR"
     UV_CACHE_DIR="${CACHE_DIR}/uv-cache" VIRTUAL_ENV="$VENV_DIR" \
         "${UV_DIR}/uv" pip install --quiet "$wheel" "${PYTHON_TEST_REQUIREMENTS[@]}"
 }

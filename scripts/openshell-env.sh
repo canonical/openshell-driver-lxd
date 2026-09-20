@@ -48,6 +48,15 @@ CLI_SHA256_AARCH64="7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb
 # The supervisor released with the gateway, pinned by index digest.
 SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@sha256:c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42"
 
+# The sandbox rootfs, pinned by index digest. Upstream publishes it only as
+# `latest` and per-commit tags, so nothing ties a build of it to an OpenShell
+# release and it moves without warning — which is how it came to ship a
+# Python two minor versions ahead of what the suites were built against, and
+# `exec_python` started dying on bytecode the sandbox could not run. Bumping
+# this means checking SANDBOX_PYTHON_VERSION in upstream-e2e.sh with it.
+# shellcheck disable=SC2034  # used by the suites that source this file
+SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
+
 # --- Layout ------------------------------------------------------------------
 
 ENV_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/openshell-env.sh"
@@ -231,6 +240,7 @@ start_driver() {
         --allow-plaintext-gateway \
         --project "$PROJECT" \
         --log-level "info,openshell_driver_lxd=debug" \
+        --default-image "$SANDBOX_IMAGE" \
         --supervisor-image "$SUPERVISOR_IMAGE" \
         --supervisor-cache-dir "${WORK_DIR}/supervisor-cache" \
         --image-work-dir "${WORK_DIR}/image-work" \
