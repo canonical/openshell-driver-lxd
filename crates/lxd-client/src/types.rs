@@ -316,6 +316,22 @@ pub struct Network {
     pub config: HashMap<String, String>,
 }
 
+/// A profile as returned by `GET /1.0/profiles/<name>`.
+///
+/// Only the parts the driver reads are modelled: a profile's devices are what
+/// a project uses to say where its instances land without every client having
+/// to know the layout.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Profile {
+    /// Profile name (e.g. `"default"`).
+    pub name: String,
+    /// Devices the profile contributes to every instance using it, keyed by
+    /// device name. Each device's own keys are LXD's device properties, e.g.
+    /// `type`, `network`, `pool`.
+    #[serde(default)]
+    pub devices: HashMap<String, HashMap<String, String>>,
+}
+
 /// An image as listed by `GET /1.0/images?recursion=1`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Image {

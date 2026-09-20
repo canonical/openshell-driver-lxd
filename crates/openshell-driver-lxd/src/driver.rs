@@ -11,7 +11,7 @@ use computev1::pb::{
     GetCapabilitiesResponse,
 };
 use lxd_client::{LxdClient, LxdError, NetworkType};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock};
 
 use crate::config::Config;
 use crate::dhcp_client;
@@ -72,6 +72,9 @@ pub struct LxdComputeDriver {
     /// instance uses them, and exclusively by clean-up, which would otherwise
     /// see those volumes unused and remove them.
     volume_use: Arc<RwLock<()>>,
+    /// Where sandboxes land absent a per-request choice, resolved once from
+    /// the project's `default` profile. See [`Self::placement_defaults`].
+    placement_defaults: Arc<OnceCell<mapping::PlacementDefaults>>,
 }
 
 impl LxdComputeDriver {
@@ -103,7 +106,37 @@ impl LxdComputeDriver {
             dhcp_client_volume_locks: Arc::new(Mutex::new(HashMap::new())),
             lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             volume_use: Arc::new(RwLock::new(())),
+            placement_defaults: Arc::new(OnceCell::new()),
         }
+    }
+
+    /// Where sandboxes land when their request names neither a network nor a
+    /// storage pool: the operator's `--default-network`/`--default-storage-pool`
+    /// when given, otherwise the project's `default` profile.
+    ///
+    /// Resolved on first use and then cached, so a driver given nothing but
+    /// `--project` reads the project's layout once rather than on every
+    /// create. A project is not re-laid-out under a running driver; restart it
+    /// if the profile changes.
+    pub async fn placement_defaults(&self) -> Result<&mapping::PlacementDefaults, DriverError> {
+        self.placement_defaults
+            .get_or_try_init(|| async {
+                let profile = self.lxd.get_profile(mapping::DEFAULT_PROFILE).await?;
+                let defaults = mapping::PlacementDefaults::resolve(
+                    &self.config.project,
+                    &profile,
+                    self.config.default_network.as_deref(),
+                    self.config.default_storage_pool.as_deref(),
+                )?;
+                tracing::info!(
+                    project = %self.config.project,
+                    network = %defaults.network,
+                    storage_pool = %defaults.storage_pool,
+                    "resolved default sandbox placement"
+                );
+                Ok(defaults)
+            })
+            .await
     }
 
     /// Best-effort pre-warm of the default sandbox image so the first
@@ -408,11 +441,9 @@ impl LxdComputeDriver {
             DriverError::InvalidArgument("sandbox.spec.template is required".into())
         })?;
 
-        let placement = mapping::Placement::resolve(
-            template,
-            &self.config.default_network,
-            &self.config.default_storage_pool,
-        );
+        let defaults = self.placement_defaults().await?;
+        let placement =
+            mapping::Placement::resolve(template, &defaults.network, &defaults.storage_pool);
         let network = self.check_placement(placement).await?;
 
         let has_token = !spec.sandbox_token.is_empty();
@@ -827,8 +858,9 @@ impl LxdComputeDriver {
                 status_code: 404, ..
             }) => {
                 return Err(DriverError::FailedPrecondition(format!(
-                    "LXD network {:?} does not exist in project {project:?}; set the sandbox's \
-                     driver_config.network or the driver's --default-network to an existing one",
+                    "LXD network {:?} does not exist in project {project:?}; point the sandbox's \
+                     driver_config.network, the driver's --default-network, or the NIC device of \
+                     the project's default profile at an existing one",
                     placement.network
                 )));
             }
@@ -836,8 +868,9 @@ impl LxdComputeDriver {
         };
         if !self.lxd.storage_pool_exists(placement.storage_pool).await? {
             return Err(DriverError::FailedPrecondition(format!(
-                "LXD storage pool {:?} does not exist; set the sandbox's \
-                 driver_config.storage_pool or the driver's --default-storage-pool to an existing one",
+                "LXD storage pool {:?} does not exist; point the sandbox's \
+                 driver_config.storage_pool, the driver's --default-storage-pool, or the root \
+                 disk device of the project's default profile at an existing one",
                 placement.storage_pool
             )));
         }

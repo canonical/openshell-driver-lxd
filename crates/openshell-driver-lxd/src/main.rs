@@ -134,6 +134,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cleanup_interval = std::time::Duration::from_secs(config.cleanup_interval_secs);
     let driver = LxdComputeDriver::new(config, lxd);
 
+    // Resolve where sandboxes land before accepting requests. Unless the
+    // operator pinned both, this reads the project's `default` profile, so a
+    // project that does not say where its instances go is a misconfiguration
+    // every create would hit — better surfaced here, once, than per request.
+    if let Err(e) = driver.placement_defaults().await {
+        error!(%e, "could not resolve default sandbox placement");
+        std::process::exit(1);
+    }
+
     // Best-effort pre-warm of the default sandbox image. The driver pulls the
     // image from the registry on demand, so a missing local image is not an
     // error; pre-warming just makes the first create fast and surfaces an

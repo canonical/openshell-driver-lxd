@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — taken from the project's `default` profile unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -213,20 +213,45 @@ gateway so you can create a sandbox end-to-end.
 ## Networks and Storage Pools
 
 Every sandbox gets a NIC on one LXD network and its root disk on one storage
-pool. The operator sets where sandboxes go by default, so users creating
-sandboxes need not know how the LXD behind the gateway is laid out:
+pool, so users creating sandboxes need not know how the LXD behind the
+gateway is laid out.
 
-- `--default-network` (default `lxdbr0`): the network sandboxes attach to.
-  On MicroCloud this is usually the OVN network `default`.
-- `--default-storage-pool` (default `default`): the pool for root disks. On
-  MicroCloud this is usually `local` or `remote`.
+By default the driver reads both off the `default` profile of its
+`--project`: the network from the profile's NIC device (preferring the one
+named `eth0`) and the pool from its root disk device. An LXD project already
+says where its instances go, so pointing the driver at a project laid out for
+it is all the placement configuration it needs:
+
+```
+lxc project create openshell -c features.images=false -c features.profiles=true
+lxc profile device add default root disk path=/ pool=local --project openshell
+lxc profile device add default eth0 nic network=default name=eth0 --project openshell
+openshell-driver-lxd --project openshell ...
+```
+
+The resolved placement is logged at start-up. The profile is read once, so
+restart the driver if you change it.
+
+Either can be pinned instead, which skips reading it from the profile:
+
+- `--default-network`: the network sandboxes attach to. On MicroCloud this is
+  usually the OVN network `default`.
+- `--default-storage-pool`: the pool for root disks. On MicroCloud this is
+  usually `local` or `remote`.
+
+The driver still names both devices explicitly on each instance rather than
+letting the profile supply them, because it attaches the egress ACL to the
+NIC and places the supervisor and DHCP-client volumes on the same pool as the
+rootfs. Resolving the defaults from the profile is what keeps those explicit
+devices agreeing with the project.
 
 A request can still choose per sandbox with `driver_config.network` and
 `driver_config.storage_pool` (for example
 `openshell sandbox create --driver-config-json '{"lxd":{"storage_pool":"remote"}}'`).
 A create naming a network or pool that does not exist in the driver's
 project fails straight away with `FailedPrecondition`, before any image is
-imported.
+imported. A project whose `default` profile names neither, with neither flag
+set, fails at start-up rather than on the first create.
 
 ### Reaching a remote LXD
 

@@ -27,12 +27,6 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// supervisor's proxy mode fails to isolate and exits at boot.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 
-/// Default LXD network sandboxes attach to.
-pub const DEFAULT_NETWORK: &str = "lxdbr0";
-
-/// Default LXD storage pool for sandbox root disks.
-pub const DEFAULT_STORAGE_POOL: &str = "default";
-
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
 
@@ -109,16 +103,23 @@ pub struct Config {
     pub project: String,
 
     /// LXD network sandboxes attach to unless a request sets
-    /// `driver_config.network`. On MicroCloud this is typically the OVN
-    /// network `default`.
-    #[arg(long, default_value = DEFAULT_NETWORK)]
-    pub default_network: String,
+    /// `driver_config.network`.
+    ///
+    /// Left unset, the driver reads it from the `eth0` NIC device of the
+    /// project's `default` profile, so a project already laid out for its
+    /// instances needs no second description here. On MicroCloud that NIC is
+    /// typically on the OVN network `default`.
+    #[arg(long)]
+    pub default_network: Option<String>,
 
     /// LXD storage pool for sandbox root disks unless a request sets
-    /// `driver_config.storage_pool`. On MicroCloud this is typically `local`
-    /// or `remote`.
-    #[arg(long, default_value = DEFAULT_STORAGE_POOL)]
-    pub default_storage_pool: String,
+    /// `driver_config.storage_pool`.
+    ///
+    /// Left unset, the driver reads it from the `root` disk device of the
+    /// project's `default` profile. On MicroCloud that pool is typically
+    /// `local` or `remote`.
+    #[arg(long)]
+    pub default_storage_pool: Option<String>,
 
     /// OCI image reference to extract the OpenShell supervisor binary from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
@@ -453,8 +454,8 @@ mod tests {
 
         assert_eq!(config.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(config.project, DEFAULT_PROJECT);
-        assert_eq!(config.default_network, DEFAULT_NETWORK);
-        assert_eq!(config.default_storage_pool, DEFAULT_STORAGE_POOL);
+        assert_eq!(config.default_network, None);
+        assert_eq!(config.default_storage_pool, None);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
         assert!(config.supervisor_bin.is_none());

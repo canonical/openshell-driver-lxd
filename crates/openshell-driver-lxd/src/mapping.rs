@@ -548,10 +548,111 @@ pub struct Placement<'a> {
     pub storage_pool: &'a str,
 }
 
+/// Where sandboxes land when their request names neither a network nor a
+/// storage pool.
+///
+/// The operator can pin either with `--default-network` and
+/// `--default-storage-pool`. What they do not pin is read off the project's
+/// `default` profile, which is how an LXD project already says where its
+/// instances go: point the driver at a project laid out for it and the
+/// project's own answer is the one it uses.
+///
+/// The driver still names both devices explicitly on every instance it
+/// creates rather than leaning on the profile to supply them, because it has
+/// to attach the egress ACL to the NIC and place the supervisor and
+/// DHCP-client volumes on the same pool as the rootfs. Resolving the defaults
+/// from the profile keeps those explicit devices agreeing with the project
+/// instead of overriding it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlacementDefaults {
+    pub network: String,
+    pub storage_pool: String,
+}
+
+/// Name of the profile a project's placement defaults are read from.
+pub const DEFAULT_PROFILE: &str = "default";
+
+impl PlacementDefaults {
+    /// Resolves the defaults from the operator's overrides and `profile`,
+    /// LXD's `default` profile for the driver's project.
+    ///
+    /// Fails, rather than guessing a name, when neither source gives a value:
+    /// a wrong guess creates sandboxes on the wrong network, which is the one
+    /// mistake here that is not immediately visible.
+    pub fn resolve(
+        project: &str,
+        profile: &lxd_client::Profile,
+        network_override: Option<&str>,
+        storage_pool_override: Option<&str>,
+    ) -> Result<Self, DriverError> {
+        let network = match network_override {
+            Some(network) => network.to_string(),
+            None => profile_device_value(profile, "nic", "network").ok_or_else(|| {
+                DriverError::FailedPrecondition(format!(
+                    "profile {:?} of project {project:?} has no NIC device naming a network;                      add one (lxc profile device add {} eth0 nic network=<network>                      --project {project}) or set the driver's --default-network",
+                    profile.name, profile.name
+                ))
+            })?,
+        };
+        let storage_pool = match storage_pool_override {
+            Some(pool) => pool.to_string(),
+            None => profile_root_pool(profile).ok_or_else(|| {
+                DriverError::FailedPrecondition(format!(
+                    "profile {:?} of project {project:?} has no root disk device naming a                      storage pool; add one (lxc profile device add {} root disk path=/                      pool=<pool> --project {project}) or set the driver's                      --default-storage-pool",
+                    profile.name, profile.name
+                ))
+            })?,
+        };
+        Ok(Self {
+            network,
+            storage_pool,
+        })
+    }
+}
+
+/// The `key` of the profile's device of type `device_type`, preferring the one
+/// named `eth0` so a profile with several NICs resolves to the one LXD's own
+/// conventions put first.
+fn profile_device_value(
+    profile: &lxd_client::Profile,
+    device_type: &str,
+    key: &str,
+) -> Option<String> {
+    let matching = |name: &str| {
+        let device = profile.devices.get(name)?;
+        (device.get("type").map(String::as_str) == Some(device_type))
+            .then(|| device.get(key))
+            .flatten()
+            .filter(|value| !value.is_empty())
+            .cloned()
+    };
+    matching("eth0").or_else(|| {
+        let mut names: Vec<&String> = profile.devices.keys().collect();
+        names.sort();
+        names.into_iter().find_map(|name| matching(name))
+    })
+}
+
+/// The pool of the profile's root disk, the device mounted at `/`.
+fn profile_root_pool(profile: &lxd_client::Profile) -> Option<String> {
+    let mut names: Vec<&String> = profile.devices.keys().collect();
+    names.sort();
+    names.into_iter().find_map(|name| {
+        let device = profile.devices.get(name)?;
+        if device.get("type").map(String::as_str) != Some("disk")
+            || device.get("path").map(String::as_str) != Some("/")
+        {
+            return None;
+        }
+        device.get("pool").filter(|pool| !pool.is_empty()).cloned()
+    })
+}
+
 impl<'a> Placement<'a> {
     /// The request's `driver_config.network` and `driver_config.storage_pool`,
-    /// each falling back to the driver's configured default when unset, so
-    /// users need not know how the LXD behind the gateway is laid out.
+    /// each falling back to the corresponding [`PlacementDefaults`] when
+    /// unset, so users need not know how the LXD behind the gateway is laid
+    /// out.
     pub fn resolve(
         template: &'a DriverSandboxTemplate,
         default_network: &'a str,
@@ -1596,6 +1697,137 @@ mod tests {
         ] {
             assert_eq!(config.get(key).map(String::as_str), Some(value), "{key}");
         }
+    }
+
+    fn profile(devices: &[(&str, &[(&str, &str)])]) -> lxd_client::Profile {
+        let json = serde_json::json!({
+            "name": "default",
+            "devices": devices
+                .iter()
+                .map(|(name, props)| {
+                    let props: HashMap<&str, &str> = props.iter().copied().collect();
+                    ((*name).to_string(), props)
+                })
+                .collect::<HashMap<_, _>>(),
+        });
+        serde_json::from_value(json).expect("profile")
+    }
+
+    /// The MicroCloud layout: an OVN NIC and a root disk in the project's
+    /// default profile, and nothing on the driver's command line.
+    #[test]
+    fn placement_defaults_from_profile() {
+        let profile = profile(&[
+            (
+                "eth0",
+                &[("type", "nic"), ("network", "default"), ("name", "eth0")],
+            ),
+            (
+                "root",
+                &[("type", "disk"), ("path", "/"), ("pool", "local")],
+            ),
+        ]);
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &profile, None, None).unwrap(),
+            PlacementDefaults {
+                network: "default".to_string(),
+                storage_pool: "local".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn placement_defaults_prefer_flags_over_profile() {
+        let profile = profile(&[
+            ("eth0", &[("type", "nic"), ("network", "default")]),
+            (
+                "root",
+                &[("type", "disk"), ("path", "/"), ("pool", "local")],
+            ),
+        ]);
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &profile, Some("ovn0"), None).unwrap(),
+            PlacementDefaults {
+                network: "ovn0".to_string(),
+                storage_pool: "local".to_string(),
+            }
+        );
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &profile, None, Some("remote")).unwrap(),
+            PlacementDefaults {
+                network: "default".to_string(),
+                storage_pool: "remote".to_string(),
+            }
+        );
+    }
+
+    /// A NIC not named `eth0` still answers, and `eth0` wins when both exist.
+    #[test]
+    fn placement_defaults_pick_a_nic() {
+        let renamed = profile(&[
+            ("enp5s0", &[("type", "nic"), ("network", "ovn0")]),
+            (
+                "root",
+                &[("type", "disk"), ("path", "/"), ("pool", "local")],
+            ),
+        ]);
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &renamed, None, None)
+                .unwrap()
+                .network,
+            "ovn0"
+        );
+
+        let both = profile(&[
+            ("enp5s0", &[("type", "nic"), ("network", "ovn0")]),
+            ("eth0", &[("type", "nic"), ("network", "default")]),
+            (
+                "root",
+                &[("type", "disk"), ("path", "/"), ("pool", "local")],
+            ),
+        ]);
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &both, None, None)
+                .unwrap()
+                .network,
+            "default"
+        );
+    }
+
+    /// A disk that is not the rootfs does not place the rootfs.
+    #[test]
+    fn placement_defaults_ignore_non_root_disks() {
+        let profile = profile(&[
+            ("eth0", &[("type", "nic"), ("network", "default")]),
+            (
+                "scratch",
+                &[("type", "disk"), ("path", "/scratch"), ("pool", "fast")],
+            ),
+        ]);
+        let err = PlacementDefaults::resolve("osh-mc", &profile, None, None).unwrap_err();
+        assert!(
+            matches!(&err, DriverError::FailedPrecondition(m) if m.contains("root disk")),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn placement_defaults_reject_a_profile_that_places_nothing() {
+        let empty = profile(&[]);
+        let err = PlacementDefaults::resolve("osh-mc", &empty, None, None).unwrap_err();
+        assert!(
+            matches!(&err, DriverError::FailedPrecondition(m) if m.contains("NIC device")),
+            "unexpected error: {err}"
+        );
+
+        // Both pinned: an empty profile is then no obstacle.
+        assert_eq!(
+            PlacementDefaults::resolve("osh-mc", &empty, Some("ovn0"), Some("remote")).unwrap(),
+            PlacementDefaults {
+                network: "ovn0".to_string(),
+                storage_pool: "remote".to_string(),
+            }
+        );
     }
 
     #[test]
