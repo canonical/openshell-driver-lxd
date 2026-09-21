@@ -116,8 +116,10 @@ pub fn check_registry_allowed(reference: &str, allowed: &[String]) -> Result<(),
 /// being reused. Revision 2 keeps the image's file ownership; revision 3 boots
 /// the init script through `/sbin/init`, which also takes the nameserver from
 /// the network, reaches gateways by IPv6 address or host name and probes an
-/// https gateway the way the supervisor connects to it.
-pub const CONVERSION_REVISION: u32 = 3;
+/// https gateway the way the supervisor connects to it; revision 4 drops the
+/// init script's public-resolver fallback, so a sandbox whose network offers
+/// no name server has none rather than a silent one.
+pub const CONVERSION_REVISION: u32 = 4;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -1372,8 +1374,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r3-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r3-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r4-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r4-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
@@ -1771,7 +1773,7 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-r3-{digest_hex}");
+        let expected_alias = format!("test-oci-r4-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer
