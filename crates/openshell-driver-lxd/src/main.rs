@@ -43,6 +43,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("sandboxes reach the gateway over plaintext HTTP (--allow-plaintext-gateway)");
     }
 
+    // The images the operator configured have to satisfy the allowlist the
+    // operator configured. Checking here turns "the allowlist forgot ghcr.io"
+    // into a start-up error naming the image, instead of a failure on the
+    // first create_sandbox.
+    for image in [&config.default_image, &config.supervisor_image] {
+        if let Err(e) =
+            openshell_driver_lxd::image::check_registry_allowed(image, &config.allowed_registries)
+        {
+            error!(%image, %e, "configured image is not covered by --allowed-registries");
+            std::process::exit(2);
+        }
+    }
+
+    // The binary at --supervisor-bin is installed 0755 into every sandbox and
+    // exec'd as its init, so a path that is not already an executable regular
+    // file is a mistake worth catching before any sandbox is created from it.
+    if let Some(path) = &config.supervisor_bin {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {}
+            Ok(_) => {
+                error!(
+                    path = %path.display(),
+                    "--supervisor-bin is not an executable regular file"
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                error!(path = %path.display(), %e, "cannot read --supervisor-bin");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(parent) = config.socket.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;

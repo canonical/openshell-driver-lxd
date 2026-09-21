@@ -87,6 +87,7 @@ impl LxdComputeDriver {
             config.mksquashfs_path.clone(),
             config.image_work_dir.clone(),
             Duration::from_secs(config.image_pull_timeout_secs),
+            Duration::from_secs(config.image_convert_timeout_secs),
         ));
         let image_cache = ImageCache::new(
             lxd.clone(),
@@ -146,9 +147,18 @@ impl LxdComputeDriver {
     /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
     /// otherwise ignored — the same import is retried on first use.
     pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
-        self.image_cache
-            .resolve_alias(&self.config.default_image)
-            .await
+        self.resolve_image(&self.config.default_image).await
+    }
+
+    /// Resolves `reference` to a local LXD image alias, refusing a registry
+    /// the operator has not allowed.
+    ///
+    /// Every image the driver pulls goes through here, the request's own
+    /// `template.image` above all: without a check a sandbox request reaches
+    /// whatever registry the gateway pod's network reaches.
+    async fn resolve_image(&self, reference: &str) -> Result<String, DriverError> {
+        image::check_registry_allowed(reference, &self.config.allowed_registries)?;
+        self.image_cache.resolve_alias(reference).await
     }
 
     /// The supervisor binary on the host and its digest, extracting it from
@@ -156,17 +166,25 @@ impl LxdComputeDriver {
     async fn resolve_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
         match &self.config.supervisor_bin {
             Some(path) => Ok((path.clone(), digest_of_file(path)?)),
-            None => self
-                .image_cache
-                .extract_supervisor_binary(
-                    &self.config.supervisor_image,
-                    &self.config.supervisor_cache_dir,
-                )
-                .await
-                .map_err(|e| {
-                    DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
-                }),
+            None => self.extract_supervisor().await.map_err(|e| {
+                DriverError::ImageImport(format!("supervisor binary extraction failed: {e}"))
+            }),
         }
+    }
+
+    /// Extracts the supervisor binary from the configured image, refusing a
+    /// registry the operator has not allowed.
+    async fn extract_supervisor(&self) -> Result<(std::path::PathBuf, String), DriverError> {
+        image::check_registry_allowed(
+            &self.config.supervisor_image,
+            &self.config.allowed_registries,
+        )?;
+        self.image_cache
+            .extract_supervisor_binary(
+                &self.config.supervisor_image,
+                &self.config.supervisor_cache_dir,
+            )
+            .await
     }
 
     /// Removes images, volumes and host files the driver no longer uses (see
@@ -194,6 +212,21 @@ impl LxdComputeDriver {
                 }
             };
 
+        // The default image is resolved by every create that names no image of
+        // its own, so it is never collected however long it has sat unused.
+        // Without knowing which image that is, nothing is collected by age:
+        // the one image that must survive is exactly the one that cannot be
+        // identified.
+        let keep_aliases: Vec<String> = self.default_image_alias().await.into_iter().collect();
+        let images = crate::gc::ImageRetention {
+            retention: if keep_aliases.is_empty() {
+                Duration::ZERO
+            } else {
+                Duration::from_secs(self.config.image_retention_secs)
+            },
+            keep_aliases: &keep_aliases,
+        };
+
         let volume_use = self.volume_use.write().await;
         let lxd = match (&supervisor_digest, &dhcp_digest) {
             (Some(supervisor), Some(dhcp)) => {
@@ -201,13 +234,22 @@ impl LxdComputeDriver {
                     mapping::supervisor_volume_name(supervisor),
                     mapping::dhcp_client_volume_name(dhcp),
                 ];
-                crate::gc::collect_lxd(&self.lxd, &self.config.image_cache_alias_prefix, &keep)
-                    .await
+                crate::gc::collect_lxd(
+                    &self.lxd,
+                    &self.config.image_cache_alias_prefix,
+                    &keep,
+                    images,
+                )
+                .await
             }
             // Keep every auxiliary volume by treating none as removable.
             _ => {
-                crate::gc::collect_lxd_images_only(&self.lxd, &self.config.image_cache_alias_prefix)
-                    .await
+                crate::gc::collect_lxd_images_only(
+                    &self.lxd,
+                    &self.config.image_cache_alias_prefix,
+                    images,
+                )
+                .await
             }
         };
         drop(volume_use);
@@ -229,6 +271,32 @@ impl LxdComputeDriver {
             host_entries,
             "clean-up finished"
         );
+    }
+
+    /// The cache alias of the configured default image, resolved without
+    /// importing anything.
+    ///
+    /// Only the registry round trip that maps the reference to a digest is
+    /// needed, and a registry that is unreachable at clean-up time simply
+    /// leaves the default image unprotected for this run — the next run, or
+    /// the next create, restores it. That is why this is best-effort rather
+    /// than a failure.
+    async fn default_image_alias(&self) -> Option<String> {
+        match self
+            .image_cache
+            .cache_alias_for(&self.config.default_image)
+            .await
+        {
+            Ok(alias) => Some(alias),
+            Err(e) => {
+                tracing::warn!(
+                    image = %self.config.default_image,
+                    %e,
+                    "could not resolve the default image; not collecting any image this run"
+                );
+                None
+            }
+        }
     }
 
     /// Clone of the LXD client, for the lifecycle watcher.
@@ -518,11 +586,9 @@ impl LxdComputeDriver {
         // Resolved before the volumes are provisioned: an import can take
         // minutes, and clean-up waits while volumes are provisioned but unused.
         let image_alias = if template.image.is_empty() {
-            self.image_cache
-                .resolve_alias(&self.config.default_image)
-                .await?
+            self.resolve_image(&self.config.default_image).await?
         } else {
-            self.image_cache.resolve_alias(&template.image).await?
+            self.resolve_image(&template.image).await?
         };
 
         let volume_use = self.volume_use.read().await;

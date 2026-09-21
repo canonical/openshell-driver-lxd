@@ -344,6 +344,13 @@ pub struct Image {
     /// Aliases pointing at the image.
     #[serde(default)]
     pub aliases: Vec<ImageAlias>,
+    /// RFC 3339 timestamp of the last instance created from the image. LXD
+    /// reports the zero time (`0001-01-01T00:00:00Z`) for one never used.
+    #[serde(default)]
+    pub last_used_at: Option<String>,
+    /// RFC 3339 timestamp of when the image was uploaded.
+    #[serde(default)]
+    pub uploaded_at: Option<String>,
 }
 
 /// One alias of an [`Image`].

@@ -74,6 +74,19 @@ pub const DEFAULT_IMAGE_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 /// longer uses.
 pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
+/// Default deadline, in seconds, for converting a pulled image into an LXD
+/// one. Separate from [`DEFAULT_IMAGE_PULL_TIMEOUT_SECS`] because the work is
+/// local and unbounded by network speed: unpacking a multi-gigabyte rootfs,
+/// squashing it and uploading it to a remote storage pool routinely outlasts
+/// any sensible registry deadline.
+pub const DEFAULT_IMAGE_CONVERT_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Default retention, in seconds, for a converted image nothing has been
+/// created from. An image is identified by content digest, so one collected
+/// too eagerly is re-imported rather than lost — the cost is minutes, which is
+/// why the window is generous.
+pub const DEFAULT_IMAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -173,9 +186,35 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     pub stop_timeout_secs: i64,
 
-    /// Deadline, in seconds, for pulling and importing OCI images before failing.
+    /// Deadline, in seconds, for each registry call while resolving and
+    /// pulling an OCI image.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
     pub image_pull_timeout_secs: u64,
+
+    /// Deadline, in seconds, for each local step of converting a pulled image
+    /// into an LXD one: unpacking it, building the squashfs, and uploading it.
+    /// None of these is bounded by registry speed, and all of them scale with
+    /// the image's size.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_CONVERT_TIMEOUT_SECS)]
+    pub image_convert_timeout_secs: u64,
+
+    /// Seconds a converted image is kept after the last sandbox created from
+    /// it. Images are keyed by content digest, so a collected one is imported
+    /// again on the next request for it; the default image is never collected.
+    /// `0` keeps every image of the current conversion revision forever.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_RETENTION_SECS)]
+    pub image_retention_secs: u64,
+
+    /// Registry hosts (`host` or `host:port`, comma-separated) sandbox images
+    /// may be pulled from. A reference naming any other host — or, when this
+    /// is set, one naming no host at all, since that resolves to Docker Hub —
+    /// is refused before anything is pulled.
+    ///
+    /// Left unset, any registry the driver can reach is allowed, which lets a
+    /// sandbox request reach whatever the host network reaches. Set it to the
+    /// registries the deployment actually serves images from.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_registries: Vec<String>,
     /// Seconds between clean-ups of what the driver no longer uses: images
     /// from older conversion revisions, unused supervisor and DHCP-client
     /// volumes, cached supervisor binaries for other digests and abandoned
