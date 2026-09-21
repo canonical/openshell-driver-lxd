@@ -43,6 +43,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("sandboxes reach the gateway over plaintext HTTP (--allow-plaintext-gateway)");
     }
 
+    // The images the operator configured have to satisfy the allowlist the
+    // operator configured. Checking here turns "the allowlist forgot ghcr.io"
+    // into a start-up error naming the image, instead of a failure on the
+    // first create_sandbox.
+    for image in [&config.default_image, &config.supervisor_image] {
+        if let Err(e) =
+            openshell_driver_lxd::image::check_registry_allowed(image, &config.allowed_registries)
+        {
+            error!(%image, %e, "configured image is not covered by --allowed-registries");
+            std::process::exit(2);
+        }
+    }
+
+    // The binary at --supervisor-bin is installed 0755 into every sandbox and
+    // exec'd as its init, so a path that is not already an executable regular
+    // file is a mistake worth catching before any sandbox is created from it.
+    if let Some(path) = &config.supervisor_bin {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.is_file() && metadata.permissions().mode() & 0o111 != 0 => {}
+            Ok(_) => {
+                error!(
+                    path = %path.display(),
+                    "--supervisor-bin is not an executable regular file"
+                );
+                std::process::exit(2);
+            }
+            Err(e) => {
+                error!(path = %path.display(), %e, "cannot read --supervisor-bin");
+                std::process::exit(2);
+            }
+        }
+    }
+
     if let Some(parent) = config.socket.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -133,6 +166,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let default_image = config.default_image.clone();
     let cleanup_interval = std::time::Duration::from_secs(config.cleanup_interval_secs);
     let driver = LxdComputeDriver::new(config, lxd);
+
+    // Resolve where sandboxes land before accepting requests. Unless the
+    // operator pinned both, this reads the project's `default` profile, so a
+    // project that does not say where its instances go is a misconfiguration
+    // every create would hit — better surfaced here, once, than per request.
+    if let Err(e) = driver.placement_defaults().await {
+        error!(%e, "could not resolve default sandbox placement");
+        std::process::exit(1);
+    }
 
     // Best-effort pre-warm of the default sandbox image. The driver pulls the
     // image from the registry on demand, so a missing local image is not an

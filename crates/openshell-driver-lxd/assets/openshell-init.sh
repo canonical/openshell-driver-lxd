@@ -94,12 +94,17 @@ fi
 # were written, point resolv.conf at the network's gateway, which serves DNS on
 # an LXD bridge (dnsmasq) though not on OVN. The gateway endpoint is not used:
 # OpenShell's gateway may run anywhere and serves no DNS.
+#
+# There is deliberately no public-resolver fallback. A sandbox that silently
+# resolved through someone else's resolver would leak every name it looks up,
+# and in an air-gapped or egress-restricted deployment it would fail later and
+# less legibly than a warning here.
 if [ ! -s /etc/resolv.conf ]; then
     _gw=$(ip route show default 2>/dev/null | awk '/^default/ { print $3; exit }') || true
     if [ -n "${_gw:-}" ]; then
         printf 'nameserver %s\n' "$_gw" > /etc/resolv.conf
     else
-        printf 'nameserver 8.8.8.8\n' > /etc/resolv.conf
+        ts "WARN: no nameserver from DHCP and no default gateway; DNS is unconfigured"
     fi
 fi
 

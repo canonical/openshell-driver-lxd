@@ -54,6 +54,13 @@ parts:
       - libssl3t64
       - libz3-4
       - busybox-static
+      # openshell-driver-lxd shells out to all four of these while converting
+      # an OCI image into an LXD one: skopeo copies it, umoci unpacks it,
+      # mksquashfs builds the rootfs and tar -cJf builds metadata.tar.xz,
+      # which needs the xz binary. A missing one fails on first create_sandbox
+      # and nowhere earlier.
+      - squashfs-tools
+      - xz-utils
       - umoci
       - skopeo
 
@@ -66,6 +73,21 @@ parts:
     override-build: |
       craftctl default
       install -d -m 0755 "${CRAFT_PART_INSTALL}/var/run/openshell"
+      # ca-certificates ships the public roots and a prebuilt bundle, but its
+      # postinst — which writes /etc/ca-certificates.conf — never runs in a
+      # rock. Without that file, anything that calls update-ca-certificates
+      # (a charm adding its own CA, for example) rebuilds the bundle from an
+      # empty list and silently drops every public root, so the driver can no
+      # longer pull a sandbox or supervisor image from any registry.
+      # The roots come from the runtime-deps part, so read them from the
+      # shared stage directory rather than this part's own install dir.
+      roots="${CRAFT_STAGE}/usr/share/ca-certificates"
+      if [ -d "${roots}" ]; then
+        install -d -m 0755 "${CRAFT_PART_INSTALL}/etc"
+        ( cd "${roots}" && find . -name '*.crt' -printf '%P\n' | sort ) \
+          > "${CRAFT_PART_INSTALL}/etc/ca-certificates.conf"
+        chmod 0644 "${CRAFT_PART_INSTALL}/etc/ca-certificates.conf"
+      fi
     permissions:
       - path: var/run/openshell
         owner: 584792

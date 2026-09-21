@@ -11,6 +11,7 @@ mod images;
 mod instances;
 mod networks;
 mod operations;
+mod profiles;
 mod projects;
 pub mod resources;
 pub(crate) mod split_image_body;
@@ -24,5 +25,5 @@ pub use events::EventStream;
 pub use types::{
     Image, ImageAlias, Instance, InstanceState, InstanceStateCpu, InstanceStateDisk,
     InstanceStateMemory, InstanceStateNetwork, InstanceStateNetworkAddress, LxdEvent,
-    LxdServerInfo, Network, NetworkType, Operation, StorageVolume,
+    LxdServerInfo, Network, NetworkType, Operation, Profile, StorageVolume,
 };

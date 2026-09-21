@@ -27,12 +27,6 @@ pub const DEFAULT_LOG_LEVEL: &str = "info";
 /// supervisor's proxy mode fails to isolate and exits at boot.
 pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 
-/// Default LXD network sandboxes attach to.
-pub const DEFAULT_NETWORK: &str = "lxdbr0";
-
-/// Default LXD storage pool for sandbox root disks.
-pub const DEFAULT_STORAGE_POOL: &str = "default";
-
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
 
@@ -80,6 +74,19 @@ pub const DEFAULT_IMAGE_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 /// longer uses.
 pub const DEFAULT_CLEANUP_INTERVAL_SECS: u64 = 6 * 60 * 60;
 
+/// Default deadline, in seconds, for converting a pulled image into an LXD
+/// one. Separate from [`DEFAULT_IMAGE_PULL_TIMEOUT_SECS`] because the work is
+/// local and unbounded by network speed: unpacking a multi-gigabyte rootfs,
+/// squashing it and uploading it to a remote storage pool routinely outlasts
+/// any sensible registry deadline.
+pub const DEFAULT_IMAGE_CONVERT_TIMEOUT_SECS: u64 = 30 * 60;
+
+/// Default retention, in seconds, for a converted image nothing has been
+/// created from. An image is identified by content digest, so one collected
+/// too eagerly is re-imported rather than lost — the cost is minutes, which is
+/// why the window is generous.
+pub const DEFAULT_IMAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -109,16 +116,23 @@ pub struct Config {
     pub project: String,
 
     /// LXD network sandboxes attach to unless a request sets
-    /// `driver_config.network`. On MicroCloud this is typically the OVN
-    /// network `default`.
-    #[arg(long, default_value = DEFAULT_NETWORK)]
-    pub default_network: String,
+    /// `driver_config.network`.
+    ///
+    /// Left unset, the driver reads it from the `eth0` NIC device of the
+    /// project's `default` profile, so a project already laid out for its
+    /// instances needs no second description here. On MicroCloud that NIC is
+    /// typically on the OVN network `default`.
+    #[arg(long)]
+    pub default_network: Option<String>,
 
     /// LXD storage pool for sandbox root disks unless a request sets
-    /// `driver_config.storage_pool`. On MicroCloud this is typically `local`
-    /// or `remote`.
-    #[arg(long, default_value = DEFAULT_STORAGE_POOL)]
-    pub default_storage_pool: String,
+    /// `driver_config.storage_pool`.
+    ///
+    /// Left unset, the driver reads it from the `root` disk device of the
+    /// project's `default` profile. On MicroCloud that pool is typically
+    /// `local` or `remote`.
+    #[arg(long)]
+    pub default_storage_pool: Option<String>,
 
     /// OCI image reference to extract the OpenShell supervisor binary from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
@@ -172,9 +186,35 @@ pub struct Config {
     #[arg(long, default_value_t = DEFAULT_STOP_TIMEOUT_SECS)]
     pub stop_timeout_secs: i64,
 
-    /// Deadline, in seconds, for pulling and importing OCI images before failing.
+    /// Deadline, in seconds, for each registry call while resolving and
+    /// pulling an OCI image.
     #[arg(long, default_value_t = DEFAULT_IMAGE_PULL_TIMEOUT_SECS)]
     pub image_pull_timeout_secs: u64,
+
+    /// Deadline, in seconds, for each local step of converting a pulled image
+    /// into an LXD one: unpacking it, building the squashfs, and uploading it.
+    /// None of these is bounded by registry speed, and all of them scale with
+    /// the image's size.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_CONVERT_TIMEOUT_SECS)]
+    pub image_convert_timeout_secs: u64,
+
+    /// Seconds a converted image is kept after the last sandbox created from
+    /// it. Images are keyed by content digest, so a collected one is imported
+    /// again on the next request for it; the default image is never collected.
+    /// `0` keeps every image of the current conversion revision forever.
+    #[arg(long, default_value_t = DEFAULT_IMAGE_RETENTION_SECS)]
+    pub image_retention_secs: u64,
+
+    /// Registry hosts (`host` or `host:port`, comma-separated) sandbox images
+    /// may be pulled from. A reference naming any other host — or, when this
+    /// is set, one naming no host at all, since that resolves to Docker Hub —
+    /// is refused before anything is pulled.
+    ///
+    /// Left unset, any registry the driver can reach is allowed, which lets a
+    /// sandbox request reach whatever the host network reaches. Set it to the
+    /// registries the deployment actually serves images from.
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_registries: Vec<String>,
     /// Seconds between clean-ups of what the driver no longer uses: images
     /// from older conversion revisions, unused supervisor and DHCP-client
     /// volumes, cached supervisor binaries for other digests and abandoned
@@ -453,8 +493,8 @@ mod tests {
 
         assert_eq!(config.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(config.project, DEFAULT_PROJECT);
-        assert_eq!(config.default_network, DEFAULT_NETWORK);
-        assert_eq!(config.default_storage_pool, DEFAULT_STORAGE_POOL);
+        assert_eq!(config.default_network, None);
+        assert_eq!(config.default_storage_pool, None);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
         assert!(config.supervisor_bin.is_none());

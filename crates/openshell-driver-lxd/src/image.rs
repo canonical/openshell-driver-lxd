@@ -74,6 +74,41 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
     Ok(())
 }
 
+/// The registry host a reference names, or None when it names none.
+///
+/// Follows the Docker rule the grammar in `OCI_REF_REGEX` encodes: the first
+/// path segment is a registry host only when it looks like one — it carries a
+/// dot or a port. Otherwise the reference is a Docker Hub path.
+pub fn registry_host(reference: &str) -> Option<&str> {
+    let bare = strip_docker_scheme(reference);
+    let (first, _) = bare.split_once('/')?;
+    (first.contains('.') || first.contains(':')).then_some(first)
+}
+
+/// Checks `reference` against the configured registry allowlist.
+///
+/// An empty allowlist allows every registry, which is the driver's default and
+/// lets a sandbox request reach whatever the host network reaches. With one
+/// configured, a reference naming no host is refused too: it would resolve to
+/// Docker Hub, which is a registry like any other.
+pub fn check_registry_allowed(reference: &str, allowed: &[String]) -> Result<(), DriverError> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    match registry_host(reference) {
+        Some(host) if allowed.iter().any(|a| a.eq_ignore_ascii_case(host)) => Ok(()),
+        Some(host) => Err(DriverError::InvalidArgument(format!(
+            "image registry {host:?} is not one this driver may pull from ({})",
+            allowed.join(", ")
+        ))),
+        None => Err(DriverError::InvalidArgument(format!(
+            "image reference {reference:?} names no registry, and this driver may pull \
+             only from {}",
+            allowed.join(", ")
+        ))),
+    }
+}
+
 /// Revision of the OCI-to-LXD conversion, part of every cache alias.
 ///
 /// Bump it whenever the conversion produces a different image for the same
@@ -81,8 +116,10 @@ pub fn validate_reference(reference: &str) -> Result<(), DriverError> {
 /// being reused. Revision 2 keeps the image's file ownership; revision 3 boots
 /// the init script through `/sbin/init`, which also takes the nameserver from
 /// the network, reaches gateways by IPv6 address or host name and probes an
-/// https gateway the way the supervisor connects to it.
-pub const CONVERSION_REVISION: u32 = 3;
+/// https gateway the way the supervisor connects to it; revision 4 drops the
+/// init script's public-resolver fallback, so a sandbox whose network offers
+/// no name server has none rather than a silent one.
+pub const CONVERSION_REVISION: u32 = 4;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -503,6 +540,16 @@ impl ImageCache {
         Ok(alias)
     }
 
+    /// The cache alias `reference` resolves to, without importing anything.
+    ///
+    /// Only the registry round trip that maps the reference to a digest runs,
+    /// so this is the cheap way to ask "which local image is this reference".
+    pub async fn cache_alias_for(&self, reference: &str) -> Result<String, DriverError> {
+        validate_reference(reference)?;
+        let digest = self.importer.resolve_digest(reference).await?;
+        Ok(cache_alias_with_prefix(&self.prefix, &digest))
+    }
+
     /// Extracts the supervisor binary from `reference` into `cache_dir`, returning the host binary path and image digest.
     pub async fn extract_supervisor_binary(
         &self,
@@ -619,7 +666,11 @@ pub struct SkopeoImporter {
     umoci_path: PathBuf,
     mksquashfs_path: PathBuf,
     work_dir: PathBuf,
+    /// Deadline for each registry call.
     timeout: Duration,
+    /// Deadline for each local conversion step, which scales with the image's
+    /// size rather than with registry speed.
+    convert_timeout: Duration,
     arch_verified: tokio::sync::OnceCell<()>,
 }
 
@@ -631,6 +682,7 @@ impl SkopeoImporter {
         mksquashfs_path: Option<PathBuf>,
         work_dir: PathBuf,
         timeout: Duration,
+        convert_timeout: Duration,
     ) -> Self {
         Self {
             lxd,
@@ -639,6 +691,7 @@ impl SkopeoImporter {
             mksquashfs_path: mksquashfs_path.unwrap_or_else(|| PathBuf::from("mksquashfs")),
             work_dir,
             timeout,
+            convert_timeout,
             arch_verified: tokio::sync::OnceCell::new(),
         }
     }
@@ -780,7 +833,7 @@ impl OciImporter for SkopeoImporter {
             .kill_on_drop(true)
             .output();
 
-        let output = tokio::time::timeout(self.timeout, cmd)
+        let output = tokio::time::timeout(self.convert_timeout, cmd)
             .await
             .map_err(|_| DriverError::ImageImport(format!("umoci unpack timed out for {alias}")))?
             .map_err(|e| {
@@ -838,7 +891,7 @@ impl OciImporter for SkopeoImporter {
             .kill_on_drop(true)
             .output();
 
-        let output = tokio::time::timeout(self.timeout, cmd)
+        let output = tokio::time::timeout(self.convert_timeout, cmd)
             .await
             .map_err(|_| DriverError::ImageImport(format!("mksquashfs timed out for {alias}")))?
             .map_err(|e| DriverError::ImageImport(format!("failed to execute mksquashfs: {e}")))?;
@@ -864,7 +917,7 @@ impl OciImporter for SkopeoImporter {
 
         // 5. Upload via LxdClient::create_image_from_split + wait_operation
         let op = tokio::time::timeout(
-            self.timeout,
+            self.convert_timeout,
             self.lxd.create_image_from_split(
                 "metadata.tar.xz",
                 &metadata_tar_bytes,
@@ -876,12 +929,15 @@ impl OciImporter for SkopeoImporter {
         .map_err(|_| DriverError::ImageImport("timed out uploading split image to LXD".into()))?
         .map_err(|e| DriverError::ImageImport(format!("LXD split image upload failed: {e}")))?;
 
-        let finished_op = tokio::time::timeout(self.timeout, self.lxd.wait_operation(&op.id))
-            .await
-            .map_err(|_| {
-                DriverError::ImageImport("timed out waiting for image upload operation".into())
-            })?
-            .map_err(|e| DriverError::ImageImport(format!("image upload operation failed: {e}")))?;
+        let finished_op =
+            tokio::time::timeout(self.convert_timeout, self.lxd.wait_operation(&op.id))
+                .await
+                .map_err(|_| {
+                    DriverError::ImageImport("timed out waiting for image upload operation".into())
+                })?
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("image upload operation failed: {e}"))
+                })?;
 
         let fingerprint = finished_op
             .metadata
@@ -994,7 +1050,7 @@ impl OciImporter for SkopeoImporter {
             .kill_on_drop(true)
             .output();
 
-        let output = tokio::time::timeout(self.timeout, cmd)
+        let output = tokio::time::timeout(self.convert_timeout, cmd)
             .await
             .map_err(|_| {
                 DriverError::ImageImport(format!("umoci unpack timed out for {reference}"))
@@ -1318,8 +1374,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r3-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r3-".len() + 64);
+        assert_eq!(alias, format!("openshell-oci-r4-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r4-".len() + 64);
     }
 
     /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
@@ -1426,6 +1482,41 @@ mod tests {
         let d1 = format!("sha256:{}", "01".repeat(32));
         let d2 = format!("sha256:{}", "02".repeat(32));
         assert_ne!(cache_alias(&d1), cache_alias(&d2));
+    }
+
+    #[test]
+    fn registry_host_follows_the_docker_rule() {
+        // A first segment is a registry only when it carries a dot or a port.
+        assert_eq!(registry_host("ghcr.io/nvidia/base:latest"), Some("ghcr.io"));
+        assert_eq!(
+            registry_host("docker://192.168.1.166:5000/supervisor:v1"),
+            Some("192.168.1.166:5000")
+        );
+        assert_eq!(registry_host("localhost:5000/img"), Some("localhost:5000"));
+        // Docker Hub paths name no registry.
+        assert_eq!(registry_host("ubuntu:24.04"), None);
+        assert_eq!(registry_host("library/ubuntu:24.04"), None);
+    }
+
+    #[test]
+    fn an_empty_allowlist_allows_every_registry() {
+        assert!(check_registry_allowed("ghcr.io/nvidia/base:latest", &[]).is_ok());
+        assert!(check_registry_allowed("ubuntu:24.04", &[]).is_ok());
+    }
+
+    #[test]
+    fn a_configured_allowlist_refuses_everything_else() {
+        let allowed = vec!["ghcr.io".to_string(), "192.168.1.166:5000".to_string()];
+
+        assert!(check_registry_allowed("ghcr.io/nvidia/base:latest", &allowed).is_ok());
+        assert!(check_registry_allowed("GHCR.IO/nvidia/base:latest", &allowed).is_ok());
+        assert!(check_registry_allowed("192.168.1.166:5000/supervisor:v1", &allowed).is_ok());
+
+        assert!(check_registry_allowed("evil.example/pwn:latest", &allowed).is_err());
+        // A host-less reference resolves to Docker Hub, which was not allowed.
+        assert!(check_registry_allowed("ubuntu:24.04", &allowed).is_err());
+        // A registry on the same host but another port is another registry.
+        assert!(check_registry_allowed("192.168.1.166:5001/x:v1", &allowed).is_err());
     }
 
     #[test]
@@ -1682,7 +1773,7 @@ mod tests {
 
         // 1. Initial resolution is a miss -> calls importer.import once
         let res_alias = cache.resolve_alias("ubuntu:22.04").await.unwrap();
-        let expected_alias = format!("test-oci-r3-{digest_hex}");
+        let expected_alias = format!("test-oci-r4-{digest_hex}");
         assert_eq!(res_alias, expected_alias);
         assert_eq!(
             importer

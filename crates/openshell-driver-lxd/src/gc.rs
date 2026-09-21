@@ -14,6 +14,9 @@
 //! - images whose every alias is one of the driver's aliases from an older
 //!   conversion revision (a current driver never resolves those; a newer
 //!   driver's images are left alone);
+//! - images of the current revision that nothing has been created from for
+//!   longer than the configured retention, except the default image's, which
+//!   every create without a `template.image` needs;
 //! - supervisor and DHCP-client volumes that no instance uses and that are
 //!   not the current supervisor's or DHCP client's;
 //!
@@ -34,6 +37,9 @@ use crate::mapping;
 
 /// Age after which a scratch directory is abandoned, not in use.
 const STALE_SCRATCH_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// LXD's zero time, which it reports for an image nothing was created from.
+const LXD_NEVER: &str = "0001-01-01T00:00:00Z";
 
 /// Prefixes of the scratch directories the importer creates.
 const SCRATCH_PREFIXES: &[&str] = &["openshell-oci-import-", "openshell-supervisor-extract-"];
@@ -73,6 +79,81 @@ fn is_older_revision_alias(alias: &str, prefix: &str) -> bool {
     is_digest(rest)
 }
 
+/// Whether `alias` is the driver's alias for an image of the current
+/// conversion revision.
+fn is_current_revision_alias(alias: &str, prefix: &str) -> bool {
+    let Some(rest) = alias.strip_prefix(prefix) else {
+        return false;
+    };
+    let Some((revision, digest)) = rest.strip_prefix('r').and_then(|r| r.split_once('-')) else {
+        return false;
+    };
+    revision.parse::<u32>() == Ok(CONVERSION_REVISION)
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Whether `image`, in `project`, is one of the driver's current-revision
+/// images that nothing has been created from for `retention`.
+///
+/// An image is identified by content digest, so re-importing one that is
+/// wanted again is correct, only slow. `keep_aliases` names the images that
+/// slowness would be unacceptable for — the default image above all, which
+/// every create without a `template.image` of its own resolves.
+///
+/// `last_used_at` is what LXD stamps when an instance is created from the
+/// image, so an image last used before the cut-off has no sandbox younger than
+/// it; sandboxes created earlier hold their own copy of the rootfs and do not
+/// need the image. An image nothing has ever been created from is judged by
+/// when it was uploaded instead, and one whose timestamps LXD does not report
+/// is left alone.
+fn is_evictable_image(
+    image: &Image,
+    project: &str,
+    prefix: &str,
+    keep_aliases: &[String],
+    now: SystemTime,
+    retention: Duration,
+) -> bool {
+    if retention.is_zero() || image.project != project || image.aliases.is_empty() {
+        return false;
+    }
+    if !image
+        .aliases
+        .iter()
+        .all(|alias| is_current_revision_alias(&alias.name, prefix))
+    {
+        return false;
+    }
+    if image
+        .aliases
+        .iter()
+        .any(|alias| keep_aliases.contains(&alias.name))
+    {
+        return false;
+    }
+
+    let used = image
+        .last_used_at
+        .as_deref()
+        .filter(|stamp| *stamp != LXD_NEVER)
+        .or(image.uploaded_at.as_deref());
+    let Some(used) = used.and_then(parse_rfc3339) else {
+        return false;
+    };
+    now.duration_since(used).is_ok_and(|age| age > retention)
+}
+
+/// Parses the RFC 3339 timestamps LXD reports into a [`SystemTime`].
+///
+/// Anything that does not parse returns None, which the caller reads as
+/// "leave this image alone".
+fn parse_rfc3339(value: &str) -> Option<SystemTime> {
+    Some(SystemTime::from(
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()?,
+    ))
+}
+
 /// Whether `volume`, in `project`, is an unused auxiliary volume other than
 /// those in `keep`.
 fn is_unused_aux_volume(volume: &StorageVolume, project: &str, keep: &[String]) -> bool {
@@ -94,34 +175,58 @@ pub(crate) async fn collect_lxd(
     lxd: &LxdClient,
     alias_prefix: &str,
     keep_volumes: &[String],
+    images: ImageRetention<'_>,
 ) -> Collected {
-    collect(lxd, alias_prefix, Some(keep_volumes)).await
+    collect(lxd, alias_prefix, Some(keep_volumes), images).await
+}
+
+/// How long an unused current-revision image is kept, and which aliases are
+/// never collected whatever their age.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ImageRetention<'a> {
+    /// Zero keeps every current-revision image, whatever its age.
+    pub retention: Duration,
+    pub keep_aliases: &'a [String],
 }
 
 async fn collect(
     lxd: &LxdClient,
     alias_prefix: &str,
     keep_volumes: Option<&[String]>,
+    images: ImageRetention<'_>,
 ) -> Collected {
     let mut collected = Collected::default();
+    let now = SystemTime::now();
 
     match lxd.list_images().await {
-        Ok(images) => {
-            for image in images
-                .iter()
-                .filter(|i| is_stale_image(i, lxd.project(), alias_prefix))
-            {
+        Ok(listed) => {
+            for (image, why) in listed.iter().filter_map(|i| {
+                if is_stale_image(i, lxd.project(), alias_prefix) {
+                    Some((i, "an older conversion revision"))
+                } else if is_evictable_image(
+                    i,
+                    lxd.project(),
+                    alias_prefix,
+                    images.keep_aliases,
+                    now,
+                    images.retention,
+                ) {
+                    Some((i, "no use within the retention window"))
+                } else {
+                    None
+                }
+            }) {
                 let removed = async {
                     let op = lxd.delete_image(&image.fingerprint).await?;
                     lxd.wait_operation(&op.id).await
                 };
                 match removed.await {
                     Ok(_) => {
-                        tracing::info!(fingerprint = %image.fingerprint, "removed image from an older conversion revision");
+                        tracing::info!(fingerprint = %image.fingerprint, reason = why, "removed image");
                         collected.images += 1;
                     }
                     Err(e) => {
-                        tracing::warn!(fingerprint = %image.fingerprint, %e, "could not remove stale image");
+                        tracing::warn!(fingerprint = %image.fingerprint, %e, "could not remove image");
                     }
                 }
             }
@@ -170,9 +275,13 @@ async fn collect(
     collected
 }
 
-/// Removes stale images only, leaving every volume alone.
-pub(crate) async fn collect_lxd_images_only(lxd: &LxdClient, alias_prefix: &str) -> Collected {
-    collect(lxd, alias_prefix, None).await
+/// Removes collectable images only, leaving every volume alone.
+pub(crate) async fn collect_lxd_images_only(
+    lxd: &LxdClient,
+    alias_prefix: &str,
+    images: ImageRetention<'_>,
+) -> Collected {
+    collect(lxd, alias_prefix, None, images).await
 }
 
 /// Removes host-side leftovers: cached supervisor binaries for digests other
@@ -241,6 +350,8 @@ fn remove(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::UNIX_EPOCH;
+
     use lxd_client::ImageAlias;
 
     use super::*;
@@ -255,6 +366,8 @@ mod tests {
                     name: (*name).to_string(),
                 })
                 .collect(),
+            last_used_at: None,
+            uploaded_at: None,
         }
     }
 
@@ -284,6 +397,99 @@ mod tests {
             "other",
             "openshell-oci-"
         ));
+    }
+
+    fn aged_image(alias: &str, last_used: Option<&str>, uploaded: Option<&str>) -> Image {
+        let mut image = image(&[alias]);
+        image.last_used_at = last_used.map(str::to_string);
+        image.uploaded_at = uploaded.map(str::to_string);
+        image
+    }
+
+    fn at(stamp: &str) -> SystemTime {
+        parse_rfc3339(stamp).expect("test timestamp parses")
+    }
+
+    #[test]
+    fn rfc3339_timestamps_parse_to_the_right_instant() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z"), Some(UNIX_EPOCH));
+        assert_eq!(
+            parse_rfc3339("1970-01-02T00:00:01Z"),
+            Some(UNIX_EPOCH + Duration::from_secs(86_401))
+        );
+        // LXD stamps a fractional part and sometimes a numeric offset.
+        assert_eq!(
+            parse_rfc3339("2026-09-21T05:36:00.123456789Z"),
+            Some(UNIX_EPOCH + Duration::new(1_789_968_960, 123_456_789))
+        );
+        assert_eq!(
+            parse_rfc3339("2026-09-21T07:36:00+02:00"),
+            parse_rfc3339("2026-09-21T05:36:00Z")
+        );
+        assert_eq!(
+            parse_rfc3339("2026-09-21T03:36:00-02:00"),
+            parse_rfc3339("2026-09-21T05:36:00Z")
+        );
+        // A leap year's end, to catch the civil-date arithmetic.
+        assert_eq!(
+            parse_rfc3339("2024-12-31T23:59:59Z").map(|t| t + Duration::from_secs(1)),
+            parse_rfc3339("2025-01-01T00:00:00Z")
+        );
+
+        for bad in [
+            "",
+            "not a date",
+            "2026-09-21",
+            "2026-13-01T00:00:00Z",
+            "2026-09-21T25:00:00Z",
+            "2026-09-21T05:36:00+0200",
+        ] {
+            assert!(parse_rfc3339(bad).is_none(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn current_revision_images_go_only_once_unused_for_the_retention() {
+        let digest = "ab".repeat(32);
+        let alias = format!("openshell-oci-r{CONVERSION_REVISION}-{digest}");
+        let week = Duration::from_secs(7 * 24 * 60 * 60);
+        let now = at("2026-09-21T00:00:00Z");
+        let evictable = |image: &Image, keep: &[String], retention: Duration| {
+            is_evictable_image(image, "sandboxes", "openshell-oci-", keep, now, retention)
+        };
+
+        let stale = aged_image(&alias, Some("2026-09-01T00:00:00Z"), None);
+        let fresh = aged_image(&alias, Some("2026-09-20T00:00:00Z"), None);
+        assert!(evictable(&stale, &[], week));
+        assert!(!evictable(&fresh, &[], week));
+
+        // Retention 0 keeps everything, which is how an unresolvable default
+        // image disables collection by age entirely.
+        assert!(!evictable(&stale, &[], Duration::ZERO));
+
+        // The default image is kept however long it has sat unused.
+        assert!(!evictable(&stale, std::slice::from_ref(&alias), week));
+
+        // Never used: judged by when it was uploaded instead.
+        let never_used = aged_image(&alias, Some(LXD_NEVER), Some("2026-09-01T00:00:00Z"));
+        assert!(evictable(&never_used, &[], week));
+        let just_uploaded = aged_image(&alias, Some(LXD_NEVER), Some("2026-09-20T00:00:00Z"));
+        assert!(!evictable(&just_uploaded, &[], week));
+
+        // No timestamps at all, or ones that do not parse: left alone.
+        assert!(!evictable(&aged_image(&alias, None, None), &[], week));
+        assert!(!evictable(
+            &aged_image(&alias, Some("soon"), None),
+            &[],
+            week
+        ));
+
+        // Not ours, or shared from the `default` project: left alone.
+        let foreign = aged_image("ubuntu-26.04", Some("2026-09-01T00:00:00Z"), None);
+        assert!(!evictable(&foreign, &[], week));
+        let mut shared = aged_image(&alias, Some("2026-09-01T00:00:00Z"), None);
+        shared.project = "other".to_string();
+        assert!(!evictable(&shared, &[], week));
     }
 
     fn volume(name: &str, used_by: &[&str]) -> StorageVolume {

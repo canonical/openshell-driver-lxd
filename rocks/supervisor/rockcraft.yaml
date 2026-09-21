@@ -1,0 +1,100 @@
+name: openshell-supervisor
+base: bare
+build-base: ubuntu@26.04
+version: git
+summary: OpenShell sandbox boundary binary for the LXD compute driver
+description: |
+  OCI rock shipping the OpenShell sandbox boundary binary for use with
+  openshell-driver-lxd, built from the same upstream revision as the
+  openshell-gateway rock so the two ship in lock step. The driver's README
+  warns that a supervisor from a different release than the gateway can fail
+  to sync policy and exit, and building both from one pinned revision is what
+  makes that impossible rather than merely unlikely.
+
+  Note the naming: the driver calls this the *supervisor* image
+  (`--supervisor-image`), but what it extracts from it is `/openshell-sandbox`,
+  the in-workload boundary binary. The flag name and the binary name disagree
+  upstream; this rock follows the flag, and ships the binary the driver
+  actually looks for.
+
+  openshell-driver-lxd never runs this image. It extracts `/openshell-sandbox`
+  into a digest-keyed LXD storage volume and mounts that into the workload
+  container, whose rootfs is the user's own image. The rock is therefore
+  `bare`: everything except the binary would be dead weight. The binary is
+  statically linked against musl because the libc of the image it lands in is
+  unknown, and the driver requires a regular file at the image root — it
+  rejects a symlink there.
+license: Apache-2.0
+
+platforms:
+  amd64:
+  arm64:
+
+parts:
+  sandbox:
+    plugin: nil
+    source: https://github.com/NVIDIA/OpenShell.git
+    # Must match the `gateway` part of ../../rockcraft.yaml.
+    source-commit: a72711697ddd0c81878f45922d5708bdbff8bb25
+    build-packages:
+      - build-essential
+      - ca-certificates
+      - clang
+      - cmake
+      - file
+      - libclang-dev
+      - libprotobuf-dev
+      - musl-dev
+      - musl-tools
+      - pkg-config
+      - protobuf-compiler
+    # The rust plugin has no way to select a target and this binary has to be
+    # built for musl, so the toolchain is driven by hand. It comes from the
+    # store-signed snap rather than from piping sh.rustup.rs into a shell: this
+    # binary is what enforces the sandbox boundary inside every sandbox, so
+    # "built from one pinned revision" has to cover the thing doing the
+    # building too. craft-parts reads the snap's confinement from the store and
+    # installs a classic one with --classic.
+    build-snaps:
+      - rustup/latest/stable
+    override-build: |
+      set -eu
+
+      case "${CRAFT_ARCH_BUILD_FOR}" in
+        amd64) target=x86_64-unknown-linux-musl ;;
+        arm64) target=aarch64-unknown-linux-musl ;;
+        *) echo "unsupported architecture ${CRAFT_ARCH_BUILD_FOR}" >&2; exit 1 ;;
+      esac
+
+      # Keep rustup's state inside the part so nothing leaks between builds.
+      export RUSTUP_HOME="${CRAFT_PART_BUILD}/rustup"
+      export CARGO_HOME="${CRAFT_PART_BUILD}/cargo"
+
+      # Upstream ships a rust-toolchain.toml, so the toolchain in use here is
+      # the one that file pins, and the musl target has to be added to *that*
+      # toolchain. `rustup.cargo` is rustup's own shim, so it resolves the same
+      # toolchain as this command does.
+      rustup target add "${target}"
+
+      rustup.cargo build --release --locked --target "${target}" \
+        -p openshell-sandbox --bin openshell-sandbox
+
+      binary="target/${target}/release/openshell-sandbox"
+
+      # A dynamically linked binary here fails at run time, inside someone
+      # else's image, with a missing-loader error that says nothing about this
+      # build. Fail here instead, where the cause is obvious.
+      #
+      # Rust's musl target produces a static-PIE, which `file` reports as
+      # "static-pie linked" rather than "statically linked"; both are static,
+      # and what actually matters is that it is not dynamic.
+      description="$(file "${binary}")"
+      case "${description}" in
+        *"dynamically linked"*|*"interpreter"*)
+          echo "openshell-sandbox is not statically linked:" >&2
+          echo "${description}" >&2
+          exit 1
+          ;;
+      esac
+
+      install -D -m 0555 "${binary}" "${CRAFT_PART_INSTALL}/openshell-sandbox"

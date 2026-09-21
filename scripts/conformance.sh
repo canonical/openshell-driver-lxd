@@ -37,10 +37,7 @@ build_conformance() {
     local src="${CACHE_DIR}/conformance-src"
     log "building openshell-conformance at ${CONFORMANCE_REV}"
     rm -rf "$src"
-    mkdir -p "$src"
-    git -C "$src" init --quiet
-    git -C "$src" fetch --quiet --depth 1 "$OPENSHELL_REPO" "$CONFORMANCE_REV"
-    git -C "$src" checkout --quiet FETCH_HEAD
+    fetch_git_rev "$src" "$OPENSHELL_REPO" "$CONFORMANCE_REV"
     # Upstream pins its own toolchain; the runner builds with ours, so a
     # rustup-managed cargo does not download a second toolchain for it.
     RUSTUP_TOOLCHAIN="${RUSTUP_TOOLCHAIN:-stable}" cargo install --quiet --locked \

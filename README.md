@@ -33,7 +33,7 @@ the `openshell` CLI driving them below.
 
 - Rust (stable, see `rust-toolchain.toml`)
 - `protoc` (`apt install protobuf-compiler libprotobuf-dev`) for `computev1`'s proto codegen
-- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — `default` and `lxdbr0` unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
+- [LXD](https://github.com/canonical/lxd) with a storage pool and a managed network for sandboxes — taken from the project's `default` profile unless set with `--default-storage-pool` and `--default-network` (see [Networks and Storage Pools](#networks-and-storage-pools)); an OVN network for `--restrict-sandbox-egress`
 - `skopeo`, `umoci`, and `mksquashfs` (`apt install skopeo umoci squashfs-tools`) — the driver uses these to pull and import sandbox OCI images into LXD on demand
 - `busybox-static` or `udhcpc` (`apt install busybox-static`) — provides the fallback DHCP client for guest containers
 
@@ -213,20 +213,45 @@ gateway so you can create a sandbox end-to-end.
 ## Networks and Storage Pools
 
 Every sandbox gets a NIC on one LXD network and its root disk on one storage
-pool. The operator sets where sandboxes go by default, so users creating
-sandboxes need not know how the LXD behind the gateway is laid out:
+pool, so users creating sandboxes need not know how the LXD behind the
+gateway is laid out.
 
-- `--default-network` (default `lxdbr0`): the network sandboxes attach to.
-  On MicroCloud this is usually the OVN network `default`.
-- `--default-storage-pool` (default `default`): the pool for root disks. On
-  MicroCloud this is usually `local` or `remote`.
+By default the driver reads both off the `default` profile of its
+`--project`: the network from the profile's NIC device (preferring the one
+named `eth0`) and the pool from its root disk device. An LXD project already
+says where its instances go, so pointing the driver at a project laid out for
+it is all the placement configuration it needs:
+
+```
+lxc project create openshell -c features.images=false -c features.profiles=true
+lxc profile device add default root disk path=/ pool=local --project openshell
+lxc profile device add default eth0 nic network=default name=eth0 --project openshell
+openshell-driver-lxd --project openshell ...
+```
+
+The resolved placement is logged at start-up. The profile is read once, so
+restart the driver if you change it.
+
+Either can be pinned instead, which skips reading it from the profile:
+
+- `--default-network`: the network sandboxes attach to. On MicroCloud this is
+  usually the OVN network `default`.
+- `--default-storage-pool`: the pool for root disks. On MicroCloud this is
+  usually `local` or `remote`.
+
+The driver still names both devices explicitly on each instance rather than
+letting the profile supply them, because it attaches the egress ACL to the
+NIC and places the supervisor and DHCP-client volumes on the same pool as the
+rootfs. Resolving the defaults from the profile is what keeps those explicit
+devices agreeing with the project.
 
 A request can still choose per sandbox with `driver_config.network` and
 `driver_config.storage_pool` (for example
 `openshell sandbox create --driver-config-json '{"lxd":{"storage_pool":"remote"}}'`).
 A create naming a network or pool that does not exist in the driver's
 project fails straight away with `FailedPrecondition`, before any image is
-imported.
+imported. A project whose `default` profile names neither, with neither flag
+set, fails at start-up rather than on the first create.
 
 ### Reaching a remote LXD
 
@@ -341,9 +366,12 @@ gateway request (e.g. `docker://registry.example.com/org/sandbox:latest` or
   - `--image-work-dir`: host scratch directory for image conversion (default: `/var/cache/openshell/lxd-image-work`). Must not be a small tmpfs such as `/tmp`.
   - `--default-max-processes`: `limits.processes` applied to every sandbox, bounding its PID count (default: 4096; `0` leaves it unlimited). Overridable per sandbox via `driver_config.max_processes`.
   - `--start-retries`: how many times to restart a sandbox whose init exits immediately after the first start (default: 1; `0` disables).
-  - `--image-pull-timeout-secs`: timeout for image inspection and pulling (default: 300s).
+  - `--allowed-registries`: comma-separated registry hosts (`host` or `host:port`) sandbox images may be pulled from. Unset, any registry the driver can reach is allowed, so a sandbox request reaches whatever the host network reaches — including registries on the LAN. With it set, a reference naming another host is refused before anything is pulled, and so is one naming no host at all, since that resolves to Docker Hub. The list has to cover `--default-image` and `--supervisor-image`; the driver refuses to start otherwise.
+  - `--image-pull-timeout-secs`: timeout for each registry call while resolving and pulling an image (default: 300s).
+  - `--image-convert-timeout-secs`: timeout for each local step of turning a pulled image into an LXD one — unpacking it, building the squashfs, uploading it (default: 1800s). Separate from the pull timeout because none of this is bounded by registry speed and all of it scales with the image's size.
+  - `--image-retention-secs`: how long a converted image is kept after the last sandbox created from it (default: 604800, a week; `0` keeps every image of the current conversion revision forever). Images are keyed by content digest, so a collected one is imported again on the next request for it — the cost of collecting too eagerly is minutes, not data. The `--default-image` is never collected.
   - `--image-cache-alias-prefix`: prefix for cached LXD aliases (default: `openshell-oci-`).
-  - `--cleanup-interval-secs`: how often the driver removes what it no longer uses (default: 21600, and once at start-up; `0` disables). It removes images converted by an older conversion revision, supervisor and DHCP-client volumes that no instance uses and that are not the current ones, cached supervisor binaries for other digests, and scratch directories abandoned for over a day. In LXD it only touches its own project's images and volumes, never the `default` project's that a project without its own images or volumes shares. Disable it when several drivers share one LXD project.
+  - `--cleanup-interval-secs`: how often the driver removes what it no longer uses (default: 21600, and once at start-up; `0` disables). It removes images converted by an older conversion revision, images of the current revision unused for `--image-retention-secs` other than the default image's, supervisor and DHCP-client volumes that no instance uses and that are not the current ones, cached supervisor binaries for other digests, and scratch directories abandoned for over a day. In LXD it only touches its own project's images and volumes, never the `default` project's that a project without its own images or volumes shares. Disable it when several drivers share one LXD project.
   - `--skopeo-path`, `--umoci-path`, `--mksquashfs-path`: optional binary path overrides.
 
 ### Supervisor Binary Delivery via Custom Storage Volume
@@ -425,12 +453,23 @@ local LXD, the way upstream validates its in-tree drivers:
 
 Both this and `make test-upstream-e2e` below run in the environment
 `scripts/openshell-env.sh` provides. It pins the OpenShell side to one
-release — gateway, CLI and supervisor image from v0.0.116, verified by
+release — gateway, CLI, supervisor image and sandbox image, verified by
 checksum and digest — because mixing components from different releases
 fails in ways that are not the driver's, and runs everything in a throwaway
 LXD project (`openshell-test`) that shares the default project's image cache.
 The conformance runner is built from the newest upstream revision the pinned
 CLI can drive.
+
+Sandboxes go on `lxdbr0` and the `default` pool, set on the test project's
+own default profile, which is the only place the driver is told where to put
+them. `OPENSHELL_TEST_NETWORK` and `OPENSHELL_TEST_POOL` change that — on
+MicroCloud, `OPENSHELL_TEST_NETWORK=default OPENSHELL_TEST_POOL=local` runs
+the suites on OVN and ZFS. `OPENSHELL_TEST_DRIVER_ARGS` passes the driver
+options the suites do not set themselves, such as
+`--restrict-sandbox-egress`, which needs an OVN network. Conformance passes
+under that option; the upstream e2e suite cannot run under it, because its
+fixture server listens on a private address and the option's whole point is
+to deny sandboxes the private networks around them.
 
 On failure, the driver and gateway logs and LXD's lifecycle events are left
 in `target/openshell-test/artifacts`, with each suite's reports in a
@@ -446,8 +485,11 @@ that silently enforces nothing still passes smoke. The tests come from the
 v0.0.116 source tree (the Rust tests of `e2e/rust` and the Python tests of
 `e2e/python`, run through the release's Python SDK); upstream tests specific
 to the Docker or Podman drivers are left out. It additionally needs rootless
-podman (with `uidmap` and `passt`) for a test fixture server, and
-`python3` 3.11 or newer. Logs and a JUnit report land in
+podman (with `uidmap` and `passt`) for a test fixture server. Its own Python
+is downloaded rather than taken from the host, because the SDK's
+`exec_python` ships a test's function into the sandbox as bytecode and
+bytecode does not cross Python versions: the test environment is built with
+the version the pinned sandbox image runs. Logs and a JUnit report land in
 `target/openshell-test/artifacts/upstream-e2e`.
 
 ## Known limitations
