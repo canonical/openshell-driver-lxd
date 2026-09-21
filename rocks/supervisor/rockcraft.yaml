@@ -41,7 +41,6 @@ parts:
       - ca-certificates
       - clang
       - cmake
-      - curl
       - file
       - libclang-dev
       - libprotobuf-dev
@@ -49,6 +48,15 @@ parts:
       - musl-tools
       - pkg-config
       - protobuf-compiler
+    # The rust plugin has no way to select a target and this binary has to be
+    # built for musl, so the toolchain is driven by hand. It comes from the
+    # store-signed snap rather than from piping sh.rustup.rs into a shell: this
+    # binary is what enforces the sandbox boundary inside every sandbox, so
+    # "built from one pinned revision" has to cover the thing doing the
+    # building too. craft-parts reads the snap's confinement from the store and
+    # installs a classic one with --classic.
+    build-snaps:
+      - rustup/latest/stable
     override-build: |
       set -eu
 
@@ -58,21 +66,17 @@ parts:
         *) echo "unsupported architecture ${CRAFT_ARCH_BUILD_FOR}" >&2; exit 1 ;;
       esac
 
-      # The rust plugin has no way to select a target, and this binary has to
-      # be built for musl, so the toolchain is installed here instead.
+      # Keep rustup's state inside the part so nothing leaks between builds.
       export RUSTUP_HOME="${CRAFT_PART_BUILD}/rustup"
       export CARGO_HOME="${CRAFT_PART_BUILD}/cargo"
-      curl -sSf https://sh.rustup.rs \
-        | sh -s -- -y --no-modify-path --profile minimal
-      export PATH="${CARGO_HOME}/bin:${PATH}"
 
-      # Added after the installer, not through its --target: upstream ships a
-      # rust-toolchain.toml, so the toolchain rustup actually uses here is the
-      # one that file pins, and the target has to be added to that toolchain
-      # rather than to the installer's default.
+      # Upstream ships a rust-toolchain.toml, so the toolchain in use here is
+      # the one that file pins, and the musl target has to be added to *that*
+      # toolchain. `rustup.cargo` is rustup's own shim, so it resolves the same
+      # toolchain as this command does.
       rustup target add "${target}"
 
-      cargo build --release --locked --target "${target}" \
+      rustup.cargo build --release --locked --target "${target}" \
         -p openshell-sandbox --bin openshell-sandbox
 
       binary="target/${target}/release/openshell-sandbox"
