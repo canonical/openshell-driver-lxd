@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - rockcraft.yaml
+      - rocks/supervisor/**
       - tests/rock/**
       - crates/**
       - proto/**
@@ -14,6 +15,7 @@ on:
   pull_request:
     paths:
       - rockcraft.yaml
+      - rocks/supervisor/**
       - tests/rock/**
       - crates/**
       - proto/**
@@ -27,7 +29,7 @@ concurrency:
 
 jobs:
   build:
-    name: Pack (${{ matrix.arch }})
+    name: Pack ${{ matrix.rock }} (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -35,24 +37,53 @@ jobs:
         include:
           - arch: amd64
             runner: ubuntu-26.04
+            rock: gateway
           - arch: arm64
             runner: ubuntu-26.04-arm
+            rock: gateway
+          - arch: amd64
+            runner: ubuntu-26.04
+            rock: supervisor
+          - arch: arm64
+            runner: ubuntu-26.04-arm
+            rock: supervisor
 
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Pack rock
+      - name: Pack gateway rock
+        if: matrix.rock == 'gateway'
         uses: canonical/craft-actions/rockcraft-pack@adff67a3dc8de1b95de1d25728bf83506ab701b2
 
-      - name: Run smoke tests
+      - name: Pack supervisor rock
+        if: matrix.rock == 'supervisor'
+        uses: canonical/craft-actions/rockcraft-pack@adff67a3dc8de1b95de1d25728bf83506ab701b2
+        with:
+          path: rocks/supervisor
+
+      - name: Run gateway smoke tests
+        if: matrix.rock == 'gateway'
         run: tests/rock/smoke.sh
 
-      - name: Upload rock artifact
+      - name: Run supervisor smoke tests
+        if: matrix.rock == 'supervisor'
+        run: ROCK_DIR=rocks/supervisor tests/rock/smoke-supervisor.sh
+
+      - name: Upload gateway rock artifact
+        if: matrix.rock == 'gateway'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: rock-${{ matrix.arch }}
+          name: rock-gateway-${{ matrix.arch }}
           path: "*.rock"
+          if-no-files-found: error
+
+      - name: Upload supervisor rock artifact
+        if: matrix.rock == 'supervisor'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: supervisor-rock-${{ matrix.arch }}
+          path: rocks/supervisor/*.rock
           if-no-files-found: error
 
   manifest:
@@ -69,17 +100,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
-      - name: Download amd64 rock
+      - name: Download amd64 gateway rock
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: rock-amd64
-          path: dist/amd64
+          name: rock-gateway-amd64
+          path: dist/gateway/amd64
 
-      - name: Download arm64 rock
+      - name: Download arm64 gateway rock
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
-          name: rock-arm64
-          path: dist/arm64
+          name: rock-gateway-arm64
+          path: dist/gateway/arm64
+
+      - name: Download amd64 supervisor rock
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: supervisor-rock-amd64
+          path: dist/supervisor/amd64
+
+      - name: Download arm64 supervisor rock
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: supervisor-rock-arm64
+          path: dist/supervisor/arm64
 
       - name: Install skopeo
         run: |
@@ -91,38 +134,53 @@ jobs:
           echo "${{ secrets.GITHUB_TOKEN }}" \
             | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Push arch-specific images and assemble manifest
+      - name: Push arch-specific images and assemble manifests
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
+          OWNER="${{ github.repository_owner }}"
           SHA="${{ github.sha }}"
 
-          for ARCH in amd64 arm64; do
-            ROCK=$(find dist/${ARCH} -maxdepth 1 -name "*.rock" | head -1)
+          # Rocks and where their artifacts were downloaded to.
+          declare -A DIRS=(
+            [openshell-gateway]="dist/gateway"
+            [openshell-supervisor]="dist/supervisor"
+          )
+
+          for NAME in openshell-gateway openshell-supervisor; do
+            DIR="${DIRS[${NAME}]}"
+            IMAGE="ghcr.io/${OWNER}/${NAME}"
+
+            for ARCH in amd64 arm64; do
+              ROCK=$(find "${DIR}/${ARCH}" -maxdepth 1 -name "*.rock" | head -1)
+              skopeo copy \
+                "oci-archive:${ROCK}" \
+                "docker://${IMAGE}:${SHA}-${ARCH}"
+              skopeo copy \
+                "docker://${IMAGE}:${SHA}-${ARCH}" \
+                "docker://${IMAGE}:latest-${ARCH}"
+            done
+
             skopeo copy \
-              "oci-archive:${ROCK}" \
-              "docker://${IMAGE}:${SHA}-${ARCH}"
-            skopeo copy \
-              "docker://${IMAGE}:${SHA}-${ARCH}" \
-              "docker://${IMAGE}:latest-${ARCH}"
+              "docker://${IMAGE}:latest-amd64" \
+              "docker://${IMAGE}:latest"
+
+            docker manifest create "${IMAGE}:${SHA}" \
+              "${IMAGE}:${SHA}-amd64" \
+              "${IMAGE}:${SHA}-arm64"
+
+            docker manifest push "${IMAGE}:${SHA}"
           done
 
-          skopeo copy \
-            "docker://${IMAGE}:latest-amd64" \
-            "docker://${IMAGE}:latest"
-
-          docker manifest create "${IMAGE}:${SHA}" \
-            "${IMAGE}:${SHA}-amd64" \
-            "${IMAGE}:${SHA}-arm64"
-
-          docker manifest push "${IMAGE}:${SHA}"
-
-      - name: Verify multi-arch manifest
+      - name: Verify multi-arch manifests
         run: |
-          IMAGE="ghcr.io/${{ github.repository_owner }}/openshell-gateway"
+          OWNER="${{ github.repository_owner }}"
           SHA="${{ github.sha }}"
-          MANIFEST=$(docker manifest inspect "${IMAGE}:${SHA}")
-          echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"amd64"' \
-            || (echo "ERROR: amd64 missing from manifest" && exit 1)
-          echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"arm64"' \
-            || (echo "ERROR: arm64 missing from manifest" && exit 1)
-          echo "Multi-arch manifest OK: both linux/amd64 and linux/arm64 present."
+
+          for NAME in openshell-gateway openshell-supervisor; do
+            IMAGE="ghcr.io/${OWNER}/${NAME}"
+            MANIFEST=$(docker manifest inspect "${IMAGE}:${SHA}")
+            echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"amd64"' \
+              || (echo "ERROR: amd64 missing from ${NAME} manifest" && exit 1)
+            echo "$MANIFEST" | grep -qE '"architecture"[[:space:]]*:[[:space:]]*"arm64"' \
+              || (echo "ERROR: arm64 missing from ${NAME} manifest" && exit 1)
+            echo "Multi-arch manifest OK for ${NAME}: both linux/amd64 and linux/arm64 present."
+          done

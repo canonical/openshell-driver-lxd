@@ -54,6 +54,12 @@ When making changes to snap packaging:
 
 The rock definition lives in `rockcraft.yaml` (base `ubuntu@26.04`). It bundles
 `openshell-gateway` (upstream NVIDIA/OpenShell) and `openshell-driver-lxd`
-under Pebble. A GitHub Actions workflow (`.github/workflows/rock.yaml`) builds
-and smoke-tests the rock (`tests/rock/smoke.sh`) on every push/PR to `main`, and
-assembles/pushes multi-arch OCI images and manifests to GHCR on push to `main`.
+under Pebble. A second rock definition lives in `rocks/supervisor/rockcraft.yaml`
+(base `bare`); it ships the statically-linked `openshell-sandbox` boundary
+binary that the driver extracts into every sandbox, built from the same pinned
+upstream revision as the gateway. A GitHub Actions workflow
+(`.github/workflows/rock.yaml`) builds and smoke-tests both rocks
+(`tests/rock/smoke.sh`, `tests/rock/smoke-supervisor.sh`) on every push/PR to
+`main`, and assembles/pushes multi-arch OCI images and manifests to GHCR on
+push to `main` (`ghcr.io/<owner>/openshell-gateway` and
+`ghcr.io/<owner>/openshell-supervisor`).
