@@ -5,6 +5,9 @@ compute driver. It implements OpenShell's `compute_driver.proto` contract
 (OpenShell PR #1703) over gRPC via a Unix domain socket, using
 [LXD](https://github.com/canonical/lxd) as the compute backend.
 
+See [docs/architecture.md](docs/architecture.md) for a detailed description
+of the crate layout, request flow, and sandbox lifecycle.
+
 ## Build and test
 
 Requires `protoc` (`apt install protobuf-compiler`) for `computev1`'s build
