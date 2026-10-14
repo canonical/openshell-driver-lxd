@@ -46,14 +46,14 @@ impl LxdClient {
 
     /// `GET /1.0/instances/<name>`.
     pub async fn get_instance(&self, name: &str) -> Result<Instance, LxdError> {
-        self.get::<Instance>(&format!("/1.0/instances/{name}"))
+        self.get::<Instance>(&format!("/1.0/instances/{}", encode(name)))
             .await?
             .into_metadata()
     }
 
     /// `GET /1.0/instances/<name>/state`.
     pub async fn get_instance_state(&self, name: &str) -> Result<InstanceState, LxdError> {
-        self.get::<InstanceState>(&format!("/1.0/instances/{name}/state"))
+        self.get::<InstanceState>(&format!("/1.0/instances/{}/state", encode(name)))
             .await?
             .into_metadata()
     }
@@ -68,7 +68,7 @@ impl LxdClient {
     /// `PUT /1.0/instances/<name>/state` with `{action: "start"}`.
     pub async fn start_instance(&self, name: &str) -> Result<Operation, LxdError> {
         let body = json!({"action": "start"});
-        self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
+        self.put::<Operation>(&format!("/1.0/instances/{}/state", encode(name)), body)
             .await?
             .into_metadata()
     }
@@ -95,7 +95,7 @@ impl LxdClient {
         timeout_secs: i64,
     ) -> Result<Operation, LxdError> {
         let body = json!({"action": "stop", "force": force, "timeout": timeout_secs});
-        self.put::<Operation>(&format!("/1.0/instances/{name}/state"), body)
+        self.put::<Operation>(&format!("/1.0/instances/{}/state", encode(name)), body)
             .await?
             .into_metadata()
     }
@@ -129,7 +129,7 @@ impl LxdClient {
 
     /// `DELETE /1.0/instances/<name>`.
     pub async fn delete_instance(&self, name: &str) -> Result<Operation, LxdError> {
-        self.delete::<Operation>(&format!("/1.0/instances/{name}"))
+        self.delete::<Operation>(&format!("/1.0/instances/{}", encode(name)))
             .await?
             .into_metadata()
     }
@@ -150,6 +150,24 @@ impl LxdClient {
         guest_path: &str,
         content: &[u8],
     ) -> Result<(), LxdError> {
+        self.push_file_into_instance_as(name, guest_path, content, 0, 0, "0400")
+            .await
+    }
+
+    /// [`Self::push_file_into_instance`], with an explicit owner and mode.
+    ///
+    /// Anything the workload itself must read has to be owned by the workload's
+    /// own uid: it runs unprivileged, so a root-owned `0400` file is invisible
+    /// to it. The ids are the container's, not the host's — LXD maps them.
+    pub async fn push_file_into_instance_as(
+        &self,
+        name: &str,
+        guest_path: &str,
+        content: &[u8],
+        uid: u32,
+        gid: u32,
+        mode: &str,
+    ) -> Result<(), LxdError> {
         // LXD's file-push API does not create missing parent directories, so
         // create each ancestor first. The old purpose-built sandbox image
         // shipped the token directory as a placeholder; with arbitrary base
@@ -159,18 +177,59 @@ impl LxdClient {
 
         let encoded_path = encode(guest_path);
         self.post_raw(
-            &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+            &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
             "application/octet-stream",
             &[
-                ("X-LXD-uid", "0"),
-                ("X-LXD-gid", "0"),
-                ("X-LXD-mode", "0400"),
+                ("X-LXD-uid", uid.to_string().as_str()),
+                ("X-LXD-gid", gid.to_string().as_str()),
+                ("X-LXD-mode", mode),
                 ("X-LXD-type", "file"),
                 ("X-LXD-write", "overwrite"),
             ],
             hyper::body::Bytes::copy_from_slice(content),
         )
         .await
+    }
+
+    /// Creates one directory inside the container with an explicit owner.
+    ///
+    /// The workload boundary deletes its own one-use bootstrap after reading
+    /// it, which needs write access to the containing directory, not just the
+    /// file — so that directory has to belong to the workload, not to root.
+    pub async fn create_dir_in_instance_as(
+        &self,
+        name: &str,
+        guest_path: &str,
+        uid: u32,
+        gid: u32,
+        mode: &str,
+    ) -> Result<(), LxdError> {
+        self.create_parent_dirs_in_instance(name, guest_path)
+            .await?;
+        let encoded_path = encode(guest_path);
+        let result = self
+            .post_raw(
+                &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
+                "application/octet-stream",
+                &[
+                    ("X-LXD-uid", uid.to_string().as_str()),
+                    ("X-LXD-gid", gid.to_string().as_str()),
+                    ("X-LXD-mode", mode),
+                    ("X-LXD-type", "directory"),
+                ],
+                hyper::body::Bytes::new(),
+            )
+            .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if self.path_is_dir_in_instance(name, guest_path).await {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
     }
 
     /// Creates every ancestor directory of `guest_path` inside the container,
@@ -191,7 +250,7 @@ impl LxdClient {
             let encoded_path = encode(&prefix);
             let result = self
                 .post_raw(
-                    &format!("/1.0/instances/{name}/files?path={encoded_path}"),
+                    &format!("/1.0/instances/{}/files?path={encoded_path}", encode(name)),
                     "application/octet-stream",
                     &[
                         ("X-LXD-uid", "0"),
@@ -227,7 +286,7 @@ impl LxdClient {
     /// the caller propagates its original, more informative error.
     async fn path_is_dir_in_instance(&self, name: &str, guest_path: &str) -> bool {
         let encoded_path = encode(guest_path);
-        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let path = format!("/1.0/instances/{}/files?path={encoded_path}", encode(name));
         match self.get_raw_with_headers(&path).await {
             Ok((headers, _)) => {
                 headers
@@ -248,7 +307,7 @@ impl LxdClient {
         guest_path: &str,
     ) -> Result<(hyper::body::Bytes, u32), LxdError> {
         let encoded_path = encode(guest_path);
-        let path = format!("/1.0/instances/{name}/files?path={encoded_path}");
+        let path = format!("/1.0/instances/{}/files?path={encoded_path}", encode(name));
         let (headers, body) = self.get_raw_with_headers(&path).await?;
         let mode_str = headers
             .get("X-LXD-mode")

@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::net::SocketAddr;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
+
+use crate::admission::ResourceAdmissionConfig;
 
 /// Default path for the gRPC Unix domain socket the OpenShell gateway
 /// connects to.
@@ -15,23 +17,65 @@ pub const DEFAULT_LXD_SOCKET: &str = "/var/snap/lxd/common/lxd/unix.socket";
 /// Default tracing log level.
 pub const DEFAULT_LOG_LEVEL: &str = "info";
 
-/// Default sandbox image: the upstream OpenShell community `base` sandbox
-/// image. It is resolved and imported on demand through the OCI import path
-/// (like any `template.image`), so no image needs to be pre-built or
-/// pre-loaded.
+/// Default sandbox image: upstream's own default, a plain NVIDIA Ubuntu base.
+/// It is resolved and imported on demand through the OCI import path (like any
+/// `template.image`), so no image needs to be pre-built or pre-loaded.
 ///
-/// This is deliberately *not* [`DEFAULT_SUPERVISOR_IMAGE`]: the supervisor
-/// image ships the `openshell-sandbox` binary on a minimal BusyBox rootfs and
-/// is only ever used as the *source* of that binary. It cannot serve as a
-/// sandbox rootfs — BusyBox's `ip` has no `netns` subcommand, so the
-/// supervisor's proxy mode fails to isolate and exits at boot.
-pub const DEFAULT_SANDBOX_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
+/// This used to be `openshell-community/sandboxes/base:latest`, which upstream
+/// moved away from — `openshell_core::image::DEFAULT_SANDBOX_BASE_IMAGE` is
+/// now this, "so a fresh installation does not depend on a separately
+/// maintained image catalog". That catalog turned out to be exactly the
+/// problem: its `latest` has not been rebuilt since May 2026 and the
+/// `/etc/openshell/policy.yaml` it ships no longer parses, which the
+/// supervisor reports as "Image policy is invalid" and the sandbox never
+/// leaves Provisioning. A base image with no policy is the supported case:
+/// the supervisor falls back to the restrictive default and syncs it to the
+/// gateway as the baseline.
+///
+/// Three images are involved in one sandbox, and they are all different:
+///
+/// - this one is the workload's rootfs, and is the user's to choose;
+/// - [`DEFAULT_SUPERVISOR_IMAGE`] is the rootfs of the companion container;
+/// - [`DEFAULT_SANDBOX_BINARY_IMAGE`] is never run, only mined for the
+///   `openshell-sandbox` binary the driver mounts into the workload.
+pub const DEFAULT_SANDBOX_IMAGE: &str = "nvcr.io/nvidia/base/ubuntu:24.04";
 
 /// Default LXD project. Re-exported from `lxd_client`.
 pub use lxd_client::DEFAULT_PROJECT;
 
-/// Default supervisor OCI image to extract the supervisor binary from.
-pub const DEFAULT_SUPERVISOR_IMAGE: &str = "ghcr.io/nvidia/openshell/supervisor:latest";
+/// Default OCI image the supervisor companion container runs from.
+///
+/// Pinned by digest, and to the *commit* tag rather than a release one:
+/// upstream publishes these images per commit and stopped tagging them with a
+/// version after `0.1.0-pre.8`, while `latest` moves without warning. A
+/// digest is also the only reliable freshness signal here — the version
+/// strings these images report have been observed to be identical across
+/// builds that behave differently.
+///
+/// The commit is v0.1.2, the same revision `rockcraft.yaml` and both
+/// rocks under `rocks/` build from: the gateway, the supervisor companion and
+/// the workload boundary have to come from one revision or a sandbox does not
+/// attach.
+///
+/// Upstream's image is distroless, so the driver injects a static busybox
+/// during conversion to run its init script. This repository's
+/// `openshell-supervisor` rock is Ubuntu-based and needs no such help; prefer
+/// it where it is available.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = concat!(
+    "ghcr.io/nvidia/openshell/supervisor:6648bd0c290efbc41ba131ee9831ee45cd431f94",
+    "@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
+);
+
+/// Default OCI image the `openshell-sandbox` binary is extracted from.
+///
+/// Never run as a rootfs: the driver copies `/openshell-sandbox` out of it
+/// into a digest-keyed volume and mounts that into the workload container,
+/// whose own image supplies the rootfs. Pinned like
+/// [`DEFAULT_SUPERVISOR_IMAGE`], and to the same revision.
+pub const DEFAULT_SANDBOX_BINARY_IMAGE: &str = concat!(
+    "ghcr.io/nvidia/openshell/sandbox:6648bd0c290efbc41ba131ee9831ee45cd431f94",
+    "@sha256:bf4797b6c511f2d8ba02955dbba4bf76c1f0dd6d83531420c5408d5f1fb9d72f"
+);
 
 /// Default host cache directory for extracted supervisor binaries.
 pub const DEFAULT_SUPERVISOR_CACHE_DIR: &str = "/var/cache/openshell/lxd-supervisor";
@@ -134,14 +178,23 @@ pub struct Config {
     #[arg(long)]
     pub default_storage_pool: Option<String>,
 
-    /// OCI image reference to extract the OpenShell supervisor binary from.
+    /// OCI image reference to run the OpenShell supervisor companion container from.
     #[arg(long, default_value = DEFAULT_SUPERVISOR_IMAGE)]
     pub supervisor_image: String,
 
+    /// OCI image reference to extract the OpenShell sandbox binary from.
+    #[arg(long, default_value = DEFAULT_SANDBOX_BINARY_IMAGE)]
+    pub sandbox_binary_image: String,
+
     /// Optional path to a pre-extracted OpenShell supervisor binary on the host.
-    /// When set, skips extracting the binary from the supervisor OCI image.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
     #[arg(long)]
     pub supervisor_bin: Option<PathBuf>,
+
+    /// Optional path to a pre-extracted OpenShell sandbox binary on the host.
+    /// When set, skips extracting the binary from the sandbox binary OCI image.
+    #[arg(long)]
+    pub sandbox_bin: Option<PathBuf>,
 
     /// Optional path to a DHCP client binary on the host (e.g. `udhcpc` or `busybox`).
     /// When unset, the driver searches PATH and standard system locations.
@@ -285,18 +338,33 @@ pub struct Config {
     #[arg(long, value_parser = parse_gateway_endpoint)]
     pub gateway_endpoint: Option<String>,
 
-    /// Address the gateway should additionally listen on for sandbox
-    /// callbacks, e.g. `169.254.17.1:17670`. The driver hands it to the
-    /// gateway as a listener requirement, and the gateway binds it accepting
-    /// only the methods a sandbox may call. It filters by method, not by
-    /// caller: a client certificate the gateway trusts is still a user there
-    /// for the methods users may call too (OpenShell v0.0.116:
-    /// `GetSandboxConfig`, `UpdateConfig`, `GetDraftPolicy`). The port must be
-    /// the gateway's own port and the address one its main listener does not
-    /// already cover. Point --gateway-endpoint at it, directly or through
-    /// forwarding.
-    #[arg(long, value_parser = parse_callback_listener)]
-    pub gateway_callback_listener: Option<SocketAddr>,
+    /// Accept caller-supplied `template.driver_config` (`network`,
+    /// `storage_pool`, `max_processes`, `profiles`).
+    ///
+    /// Off by default, matching the gateway's own default. Both sides must
+    /// agree: the gateway compares its configured admission policy with the
+    /// one this driver reports, and refuses to provision through it at all
+    /// when they differ. Set `allow_driver_config = true` under
+    /// `[openshell.drivers.<name>]` in the gateway's configuration and pass
+    /// this flag here.
+    #[arg(long)]
+    pub allow_driver_config: bool,
+
+    /// A label an external resource must carry before a sandbox may attach
+    /// it, as `key=value`. Repeatable; any use of this option replaces the
+    /// default label set rather than adding to it. `${value}` of
+    /// `${workspace}` matches the sandbox's workspace.
+    ///
+    /// LXD sandboxes attach no such resources today — a root disk and a NIC
+    /// come from the project's profile — so this exists to match a gateway
+    /// configured with a non-default policy, not to gate anything here.
+    #[arg(long = "resource-admission-label", value_name = "KEY=VALUE", value_parser = parse_label)]
+    pub resource_admission_labels: Vec<(String, String)>,
+
+    /// Acknowledge a gateway configured with `resource_admission.enabled =
+    /// false`. Without a matching gateway this only makes the policies differ.
+    #[arg(long, conflicts_with = "resource_admission_labels")]
+    pub no_resource_admission: bool,
 
     /// Set `security.nesting` on sandboxes, for workloads that run containers
     /// themselves. The supervisor does not need it: its network namespace,
@@ -305,17 +373,6 @@ pub struct Config {
     /// unless `restricted.containers.nesting=allow`.
     #[arg(long)]
     pub sandbox_nesting: bool,
-
-    /// Confine sandbox networking with an LXD network ACL: a sandbox may
-    /// reach the gateway endpoint and public internet addresses (plus the DNS
-    /// servers its network hands out, which LXD always allows), and nothing
-    /// else — no private or otherwise non-public address, so not a LAN, LXD
-    /// host or other sandbox on such addresses — and nothing may connect to
-    /// it. The driver manages one ACL per network, `openshell-egress-<network>`,
-    /// in its project. Needs sandboxes on an OVN network, where LXD applies
-    /// ACLs to individual NICs.
-    #[arg(long)]
-    pub restrict_sandbox_egress: bool,
 
     /// PEM CA certificate sandboxes verify the gateway's certificate against.
     /// Copied into every sandbox, with --guest-tls-cert and --guest-tls-key,
@@ -381,11 +438,32 @@ impl Config {
         }
     }
 
+    /// The external-resource admission policy half of what this driver
+    /// acknowledges to the gateway.
+    #[must_use]
+    pub fn resource_admission(&self) -> ResourceAdmissionConfig {
+        if self.no_resource_admission {
+            return ResourceAdmissionConfig {
+                enabled: false,
+                required_labels: BTreeMap::new(),
+            };
+        }
+        if self.resource_admission_labels.is_empty() {
+            return ResourceAdmissionConfig::default();
+        }
+        ResourceAdmissionConfig {
+            enabled: true,
+            required_labels: self.resource_admission_labels.iter().cloned().collect(),
+        }
+    }
+
     /// Checks that sandboxes will reach the gateway over TLS, or that
     /// plaintext was explicitly allowed, and that `--gateway-endpoint`
-    /// agrees. clap enforces the rest (all three TLS files or none, and not
-    /// alongside `--allow-plaintext-gateway`).
+    /// agrees; and that the admission policy is one a gateway would accept.
+    /// clap enforces the rest (all three TLS files or none, and not alongside
+    /// `--allow-plaintext-gateway`).
     pub fn validate(&self) -> Result<(), String> {
+        self.resource_admission().validate()?;
         let tls = self.guest_tls().is_some();
         if !tls && !self.allow_plaintext_gateway {
             return Err(
@@ -416,6 +494,17 @@ impl Config {
     }
 }
 
+/// Validates `--resource-admission-label`: a non-empty `key=value` pair.
+fn parse_label(value: &str) -> Result<(String, String), String> {
+    let (key, label_value) = value
+        .split_once('=')
+        .ok_or_else(|| "not a key=value pair".to_string())?;
+    if key.is_empty() || label_value.is_empty() {
+        return Err("neither the key nor the value may be empty".to_string());
+    }
+    Ok((key.to_string(), label_value.to_string()))
+}
+
 /// Validates `--gateway-tls-server-name`: an IP address or a DNS name.
 fn parse_tls_server_name(value: &str) -> Result<String, String> {
     if value.parse::<std::net::IpAddr>().is_ok() {
@@ -435,21 +524,6 @@ fn parse_tls_server_name(value: &str) -> Result<String, String> {
     } else {
         Err(format!("{value:?} is not a DNS name or an IP address"))
     }
-}
-
-/// Validates `--gateway-callback-listener`: a concrete address and port, which
-/// is all the gateway accepts for a driver-requested listener.
-fn parse_callback_listener(value: &str) -> Result<SocketAddr, String> {
-    let address: SocketAddr = value
-        .parse()
-        .map_err(|e| format!("not an IP:port address: {e}"))?;
-    if address.ip().is_unspecified() || address.ip().is_multicast() {
-        return Err(format!("{} is not a single unicast address", address.ip()));
-    }
-    if address.port() == 0 {
-        return Err("the port must not be 0".to_string());
-    }
-    Ok(address)
 }
 
 /// Validates `--gateway-endpoint`: an `http` or `https` URL naming a host and
@@ -497,7 +571,9 @@ mod tests {
         assert_eq!(config.default_storage_pool, None);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
+        assert_eq!(config.sandbox_binary_image, DEFAULT_SANDBOX_BINARY_IMAGE);
         assert!(config.supervisor_bin.is_none());
+        assert!(config.sandbox_bin.is_none());
         assert!(config.lxd_url.is_none());
         assert_eq!(config.gateway_grpc_port, DEFAULT_GATEWAY_GRPC_PORT);
         assert!(config.gateway_endpoint.is_none());
@@ -690,26 +766,6 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(plaintext_http.validate(), Ok(()));
-    }
-
-    #[test]
-    fn callback_listener_is_a_concrete_address() {
-        let config = parse(&["--gateway-callback-listener", "169.254.17.1:17670"]).unwrap();
-        assert_eq!(
-            config.gateway_callback_listener,
-            Some("169.254.17.1:17670".parse().unwrap())
-        );
-        for value in [
-            "0.0.0.0:17670",
-            "169.254.17.1",
-            "169.254.17.1:0",
-            "[ff02::1]:17670",
-        ] {
-            assert!(
-                parse(&["--gateway-callback-listener", value]).is_err(),
-                "{value} should be rejected"
-            );
-        }
     }
 
     #[test]

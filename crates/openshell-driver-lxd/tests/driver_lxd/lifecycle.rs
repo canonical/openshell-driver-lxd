@@ -54,11 +54,44 @@ async fn create_get_list_stop_delete_lifecycle() {
         assert_eq!(dev.get("readonly").map(String::as_str), Some("true"));
     }
 
+    // The supervisor companion container must exist with correct role and workload metadata (INV-2).
+    let sup_name = format!("{name}-supervisor");
+    let sup_instance = lxd()
+        .get_instance(&sup_name)
+        .await
+        .expect("raw get_instance companion");
+    assert_eq!(
+        sup_instance
+            .config
+            .get("user.openshell.role")
+            .map(String::as_str),
+        Some("supervisor")
+    );
+    assert_eq!(
+        sup_instance
+            .config
+            .get("user.openshell.workload_instance")
+            .map(String::as_str),
+        Some(name.as_str())
+    );
+
     let listed = driver.list().await;
     assert!(
         listed.iter().any(|s| s.id == id && s.name == name),
         "expected {name} in {listed:?}"
     );
+    // Companion container is hidden from ListSandboxes (INV-1)
+    assert!(
+        !listed.iter().any(|s| s.name == sup_name),
+        "companion {sup_name} must not be listed"
+    );
+
+    // Companion container is hidden from GetSandbox (INV-1)
+    let sup_get = driver
+        .get(&sup_name)
+        .await
+        .expect_err("companion should not be accessible via get");
+    assert_eq!(sup_get.code(), Code::NotFound);
 
     driver
         .stop(&name)
@@ -89,6 +122,19 @@ async fn create_get_list_stop_delete_lifecycle() {
         .expect_err("deleted sandbox is gone");
     assert_eq!(status.code(), Code::NotFound);
     assert!(!driver.list().await.iter().any(|s| s.id == id));
+
+    // Companion container must also be deleted (INV-3)
+    let sup_status = lxd().get_instance(&sup_name).await;
+    assert!(
+        matches!(
+            sup_status,
+            Err(lxd_client::LxdError::Api {
+                status_code: 404,
+                ..
+            })
+        ),
+        "companion instance should be deleted: {sup_status:?}"
+    );
 
     let deleted_again = driver
         .delete(&name)
@@ -133,7 +179,14 @@ async fn create_sandbox_fallback_dhcp_without_builtin_client() {
 /// supervisor process, and the token must reach only its file.
 #[tokio::test]
 async fn created_instance_carries_the_request() {
-    let driver = Driver::start().await;
+    // `driver_config` is caller configuration, which the gateway's default
+    // admission policy forbids; this test uses it, so it opts in on both
+    // sides — here, and in the acknowledgement the driver reports.
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec!["--allow-driver-config".into()],
+        ..Default::default()
+    })
+    .await;
     let name = unique_name("req");
     let id = sandbox_id(&name);
     let _cleanup = driver.cleanup(&[&name]);
@@ -168,63 +221,189 @@ async fn created_instance_carries_the_request() {
         .await
         .expect("raw get_instance")
         .config;
-    let expected_endpoint = format!("http://{}:17670", bridge_ipv4("lxdbr0").await);
     for (key, value) in [
         ("user.openshell.sandbox_id", id.as_str()),
+        ("user.openshell.role", "workload"),
         ("user.openshell.label.team", "infra"),
         ("environment.OPENSHELL_SANDBOX_ID", id.as_str()),
-        ("environment.OPENSHELL_SANDBOX", name.as_str()),
-        ("environment.OPENSHELL_ENDPOINT", expected_endpoint.as_str()),
-        (
-            "environment.OPENSHELL_SANDBOX_TOKEN_FILE",
-            "/etc/openshell/auth/sandbox.jwt",
-        ),
-        ("environment.FROM_SPEC", "spec"),
-        ("environment.SHARED", "template"),
         ("limits.cpu", "1"),
         ("limits.memory", "512MiB"),
         ("limits.processes", "512"),
     ] {
         assert_eq!(config.get(key).map(String::as_str), Some(value), "{key}");
     }
+    // The declared environment reaches the workload's *processes*, through the
+    // boundary's bootstrap, and not the container it runs in — where it would
+    // also be the boundary's own environment.
+    for absent in [
+        "environment.FROM_SPEC",
+        "environment.SHARED",
+        "environment.OPENSHELL_ENDPOINT",
+        "environment.OPENSHELL_SANDBOX",
+        "environment.OPENSHELL_SANDBOX_TOKEN_FILE",
+    ] {
+        assert!(
+            !config.contains_key(absent),
+            "{absent} must not be set on the workload instance"
+        );
+    }
+    let child_env: serde_json::Value = serde_json::from_str(
+        config
+            .get("user.openshell.child_env")
+            .expect("the declared environment is recorded for the boundary"),
+    )
+    .expect("child_env is JSON");
+    assert_eq!(child_env["FROM_SPEC"], "spec");
+    assert_eq!(
+        child_env["SHARED"], "template",
+        "template wins on collision"
+    );
     assert!(
         config.values().all(|v| !v.contains(&token)),
-        "the sandbox token must not be written into instance config"
+        "the sandbox token must not be written into workload instance config"
     );
 
-    let (content, mode) = lxd()
-        .get_file_from_instance(&name, "/etc/openshell/auth/sandbox.jwt")
+    let sup_name = format!("{name}-supervisor");
+    let sup_config = lxd()
+        .get_instance(&sup_name)
         .await
-        .expect("token file should exist in the sandbox");
-    assert_eq!(content.as_ref(), token.as_bytes());
-    assert_eq!(mode, 0o400);
+        .expect("raw get_instance companion")
+        .config;
+    // The legacy token file is deliberately gone: `spec.sandbox_token` is the
+    // gateway bearer, and a supervisor pointed at it offers it as its gateway
+    // credential, which the gateway rejects. Under RFC 0012 both tokens reach
+    // the companion through the launch authentication bundle instead.
+    assert_eq!(
+        sup_config.get("environment.OPENSHELL_SANDBOX_TOKEN_FILE"),
+        None
+    );
+    assert!(
+        sup_config.contains_key("environment.OPENSHELL_ADMITTED_ISOLATION_BACKEND"),
+        "companion is told which isolation backend it may attach"
+    );
+    assert!(
+        sup_config.contains_key("environment.OPENSHELL_SSH_SOCKET_PATH"),
+        "companion serves the access plane, so it needs the SSH socket path"
+    );
+    // The gateway is the companion's to reach, so the endpoint is here.
+    assert_eq!(
+        sup_config
+            .get("environment.OPENSHELL_ENDPOINT")
+            .map(String::as_str),
+        Some("http://127.0.0.1:17670"),
+    );
+    assert_eq!(
+        sup_config
+            .get("environment.OPENSHELL_SANDBOX")
+            .map(String::as_str),
+        Some(name.as_str()),
+    );
+    assert!(
+        sup_config.values().all(|v| !v.contains(&token)),
+        "the sandbox token must not be written into companion instance config"
+    );
 
-    // The supervisor itself is started with that environment.
+    // ...and it is not staged as a file either: the launch authentication
+    // bundle is the only path credentials reach the companion by.
+    assert!(
+        lxd()
+            .get_file_from_instance(&sup_name, "/etc/openshell/auth/sandbox.jwt")
+            .await
+            .is_err(),
+        "the legacy token file must not be staged in the companion"
+    );
+
+    let (bundle, bundle_mode) = lxd()
+        .get_file_from_instance(&sup_name, "/etc/openshell/runtime/auth-bundle.json")
+        .await
+        .expect("the companion is given the gateway's launch authentication bundle");
+    let bundle: serde_json::Value =
+        serde_json::from_slice(bundle.as_ref()).expect("bundle is JSON");
+    // Forwarded verbatim: the driver must not mint or rewrite any of it.
+    assert_eq!(bundle["gateway_token"], "test.gateway.token");
+    assert_eq!(bundle["sandbox_token"], "test.sandbox.token");
+    assert!(bundle["session_id"].is_string());
+    assert_eq!(bundle_mode, 0o400);
+
+    // The boundary is started with the declared environment for the workload's
+    // processes, and with nothing that belongs to the trusted half.
     let console = eventually(
         Duration::from_secs(15),
         "the stand-in to report",
         || async {
             let log = driver.console_log(&name);
+            log.contains("odl-standin: started args=").then_some(log)
+        },
+    )
+    .await;
+    for line in [
+        "odl-standin: child_env FROM_SPEC=spec",
+        "odl-standin: child_env SHARED=template",
+    ] {
+        assert!(
+            console.contains(line),
+            "missing {line:?} in console:\n{console}"
+        );
+    }
+    assert!(
+        !console.contains("odl-standin: env OPENSHELL_ENDPOINT="),
+        "the workload must not be given the gateway endpoint:\n{console}"
+    );
+    // The boundary is reached through its own privilege drop, from the
+    // driver's volume, and never through a `setpriv` out of the workload's
+    // image. `launch-capability-free` takes the identity, the bootstrap and
+    // the workspace positionally; `--workdir` is the companion's alone.
+    assert!(
+        console.contains(
+            r#""/opt/openshell/bin/openshell-sandbox", "launch-capability-free", "1000", "1000""#
+        ),
+        "boundary should be exec'd through launch-capability-free:\n{console}"
+    );
+    assert!(
+        !console.contains(r#""--workdir""#),
+        "the boundary must not be given --workdir:\n{console}"
+    );
+    assert!(
+        !console.contains("setpriv"),
+        "the privilege drop must not come from the image:\n{console}"
+    );
+
+    let sup_console = eventually(
+        Duration::from_secs(15),
+        "the supervisor stand-in to report",
+        || async {
+            let log = driver.console_log(&sup_name);
             log.contains("odl-standin: env OPENSHELL_SANDBOX=")
                 .then_some(log)
         },
     )
     .await;
+    // The companion is launched with the RFC 0012 inputs instead of the old
+    // token file: its credentials come from the launch authentication bundle,
+    // and it is told which backend it may attach.
+    assert!(
+        !sup_console.contains("OPENSHELL_SANDBOX_TOKEN_FILE"),
+        "the legacy token file must not be given to the companion:\n{sup_console}"
+    );
+    assert!(
+        sup_console.contains("--auth-bundle-file /etc/openshell/runtime/auth-bundle.json"),
+        "companion should be exec'd with its auth bundle:\n{sup_console}"
+    );
+    assert!(
+        sup_console
+            .contains("--backend-descriptor-file /etc/openshell/runtime/backend-descriptor.json"),
+        "companion should be exec'd with its backend descriptor:\n{sup_console}"
+    );
     for line in [
         format!("odl-standin: env OPENSHELL_SANDBOX_ID={id}"),
-        format!("odl-standin: env OPENSHELL_ENDPOINT={expected_endpoint}"),
-        "odl-standin: env OPENSHELL_SANDBOX_TOKEN_FILE=/etc/openshell/auth/sandbox.jwt".to_string(),
+        "odl-standin: env OPENSHELL_ENDPOINT=http://127.0.0.1:17670".to_string(),
         "odl-standin: env OPENSHELL_SSH_SOCKET_PATH=/run/openshell/ssh.sock".to_string(),
     ] {
         assert!(
-            console.contains(&line),
-            "missing {line:?} in console:\n{console}"
+            sup_console.contains(&line),
+            "missing {line:?} in companion console:\n{sup_console}"
         );
     }
-    assert!(
-        console.contains(r#""/opt/openshell/bin/openshell-sandbox", "--workdir", "/sandbox""#),
-        "supervisor should be exec'd with --workdir /sandbox:\n{console}"
-    );
 }
 
 /// The command a sandbox is created with reaches the supervisor intact,
@@ -252,13 +431,16 @@ async fn requested_command_reaches_the_supervisor() {
         .await
         .expect("create_sandbox should succeed");
 
+    // The canonical process is the companion's to run, so its spec travels
+    // there. The workload boundary is given a bootstrap and nothing else.
+    let sup_name = format!("{name}-supervisor");
     let prefix = "odl-standin: env OPENSHELL_MAIN_PROCESS_SPEC=";
     let line = eventually(
-        Duration::from_secs(15),
-        "the stand-in to report",
+        Duration::from_secs(30),
+        "the supervisor stand-in to report",
         || async {
             driver
-                .console_log(&name)
+                .console_log(&sup_name)
                 .lines()
                 .find_map(|line| line.trim_end().strip_prefix(prefix).map(str::to_string))
         },
@@ -274,6 +456,10 @@ async fn requested_command_reaches_the_supervisor() {
             "tty": false,
             "await_main_process_attachment": false,
         })
+    );
+    assert!(
+        !driver.console_log(&name).contains(prefix),
+        "the workload must not be given the canonical process spec"
     );
 }
 
@@ -403,7 +589,7 @@ async fn unmanaged_instance_is_treated_as_not_found() {
     let alias = ensure_sandbox_image();
 
     // Created behind the driver's back, so it has no sandbox id marker.
-    lxc(&["init", &alias, &name]);
+    lxc_init_unmanaged(&alias, &name);
 
     let status = driver.get(&name).await.expect_err("get unmanaged");
     assert_eq!(status.code(), Code::NotFound);
@@ -441,10 +627,12 @@ async fn explicit_gateway_endpoint_reaches_the_instance() {
         .await
         .expect("create_sandbox should succeed");
 
+    // The gateway is the companion's to reach; the workload never learns
+    // where it is.
     let config = lxd()
-        .get_instance(&name)
+        .get_instance(&format!("{name}-supervisor"))
         .await
-        .expect("raw get_instance")
+        .expect("raw get_instance companion")
         .config;
     assert_eq!(
         config
@@ -452,6 +640,12 @@ async fn explicit_gateway_endpoint_reaches_the_instance() {
             .map(String::as_str),
         Some(endpoint)
     );
+    let workload = lxd()
+        .get_instance(&name)
+        .await
+        .expect("raw get_instance")
+        .config;
+    assert!(!workload.contains_key("environment.OPENSHELL_ENDPOINT"));
 }
 
 /// The init script points `host.openshell.internal` at the gateway endpoint's
@@ -461,9 +655,8 @@ async fn explicit_gateway_endpoint_reaches_the_instance() {
 #[tokio::test]
 async fn host_alias_follows_the_gateway_endpoint() {
     for (endpoint, expected) in [
-        ("http://[fd42::5]:17670", Some(vec!["fd42::5"])),
-        ("http://localhost:17670", Some(vec!["127.0.0.1", "::1"])),
-        ("http://gateway.invalid:17670", None),
+        ("http://[fd42::5]:17670", vec!["fd42::5"]),
+        ("http://localhost:17670", vec!["127.0.0.1", "::1"]),
     ] {
         let driver = Driver::start_with(DriverOptions {
             extra_args: vec!["--gateway-endpoint".into(), endpoint.into()],
@@ -474,15 +667,21 @@ async fn host_alias_follows_the_gateway_endpoint() {
         let _cleanup = driver.cleanup(&[&name]);
         driver.create_running(&name).await;
 
+        // The companion is the half that knows where the gateway is, so it is
+        // the half whose `/etc/hosts` follows the endpoint. In the workload
+        // the alias is the boundary's business: it mediates that egress, and
+        // the init script has no endpoint to seed from.
+        let sup_name = format!("{name}-supervisor");
+
         // The init script logs the outcome before handing over to the
         // supervisor.
         let log = eventually(Duration::from_secs(60), "the init script", || async {
-            let log = driver.console_log(&name);
+            let log = driver.console_log(&sup_name);
             (log.contains("seeded /etc/hosts") || log.contains("not seeded")).then_some(log)
         })
         .await;
         let (hosts, _) = lxd()
-            .get_file_from_instance(&name, "/etc/hosts")
+            .get_file_from_instance(&sup_name, "/etc/hosts")
             .await
             .expect("read /etc/hosts");
         let alias = String::from_utf8_lossy(&hosts)
@@ -495,20 +694,43 @@ async fn host_alias_follows_the_gateway_endpoint() {
                     .to_string()
             });
 
-        match expected {
-            Some(addresses) => assert!(
-                alias.as_deref().is_some_and(|a| addresses.contains(&a)),
-                "{endpoint}: alias {alias:?}, expected one of {addresses:?}; console:\n{log}"
-            ),
-            None => {
-                assert_eq!(alias, None, "{endpoint}: console:\n{log}");
-                assert!(
-                    log.contains("cannot resolve gateway host"),
-                    "{endpoint}: {log}"
-                );
-            }
-        }
+        assert!(
+            alias.as_deref().is_some_and(|a| expected.contains(&a)),
+            "{endpoint}: alias {alias:?}, expected one of {expected:?}; console:\n{log}"
+        );
     }
+}
+
+/// An endpoint that resolves to nothing is refused at create.
+///
+/// The sandbox's egress ACL needs an address to write its gateway rule
+/// against, and that ACL is the outer fence the sandbox cannot run without.
+/// A sandbox created anyway would come up fenced off from the gateway it
+/// exists to talk to, so the driver says so while there is still a request to
+/// fail.
+#[tokio::test]
+async fn an_unresolvable_gateway_endpoint_is_refused() {
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec![
+            "--gateway-endpoint".into(),
+            "http://gateway.invalid:17670".into(),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("badgw");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let status = driver
+        .create(sandbox(&name))
+        .await
+        .expect_err("a gateway endpoint that resolves to nothing cannot be fenced for");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("cannot resolve gateway endpoint"),
+        "{status}"
+    );
+    assert!(lxd().get_instance(&name).await.is_err());
 }
 
 /// With TLS materials sandboxes get an https endpoint and the materials at
@@ -560,60 +782,121 @@ async fn guest_tls_materials_reach_the_instance() {
         .await
         .expect("create_sandbox should succeed");
 
-    let config = lxd()
+    // The TLS materials and the endpoint are the companion's: it is the half
+    // that talks to the gateway. The workload never learns where the gateway
+    // is, and is given no credentials for it.
+    let workload = lxd()
         .get_instance(&name)
         .await
         .expect("raw get_instance")
         .config;
-    let expected_endpoint = format!("https://{}:17670", bridge_ipv4("lxdbr0").await);
+    for absent in [
+        "environment.OPENSHELL_ENDPOINT",
+        "environment.OPENSHELL_TLS_CA",
+        "environment.OPENSHELL_TLS_CERT",
+        "environment.OPENSHELL_TLS_KEY",
+    ] {
+        assert!(
+            !workload.contains_key(absent),
+            "{absent} must not be set on the workload instance"
+        );
+    }
+
+    let sup_name = format!("{name}-supervisor");
+    let sup_config = lxd()
+        .get_instance(&sup_name)
+        .await
+        .expect("raw get_instance supervisor companion")
+        .config;
     assert_eq!(
-        config
+        sup_config
             .get("environment.OPENSHELL_ENDPOINT")
             .map(String::as_str),
-        Some(expected_endpoint.as_str())
+        Some("https://127.0.0.1:17670")
     );
     assert_eq!(
-        config
+        sup_config
             .get("environment.OPENSHELL_GATEWAY_TLS_SERVER_NAME")
             .map(String::as_str),
         Some("gateway.openshell.internal")
     );
     for (file, _, env, guest_path) in files {
         assert_eq!(
-            config
+            sup_config
                 .get(&format!("environment.{env}"))
                 .map(String::as_str),
             Some(guest_path),
             "{env}"
         );
         let (content, mode) = lxd()
-            .get_file_from_instance(&name, guest_path)
+            .get_file_from_instance(&sup_name, guest_path)
             .await
-            .unwrap_or_else(|e| panic!("{guest_path} should exist in the sandbox: {e}"));
+            .unwrap_or_else(|e| {
+                panic!("{guest_path} should exist in the supervisor companion: {e}")
+            });
         assert_eq!(content.as_ref(), format!("test {file}").as_bytes());
         assert_eq!(mode, 0o400, "{guest_path}");
     }
 }
 
-/// LXD applies ACLs to individual NICs only on OVN networks, so restricting
-/// egress on a bridge is refused up front rather than silently skipped.
+/// LXD applies ACLs to individual NICs only on OVN networks, and that ACL is
+/// the outer network fence OpenShell v0.1.0 requires, so a sandbox on a bridge
+/// is refused up front rather than created and left unable to attach.
+///
+/// The rest of this suite needs an OVN host, so this one has nothing to assert
+/// there and says so rather than failing: what it is about is the *refusal*,
+/// which only happens on a network that cannot carry the fence.
 #[tokio::test]
-async fn restricted_egress_refuses_a_bridge_network() {
+async fn a_bridge_network_cannot_carry_the_outer_fence() {
+    // A bridge is created for this test rather than skipping when the host's
+    // default network is OVN — which it always is, since every other test
+    // needs one, so the skip meant this path was never exercised anywhere.
+    let bridge = unique_name("odlbr").replace('-', "");
+    let bridge = &bridge[..bridge.len().min(15)];
+    if !lxc_output(&["network", "create", bridge, "--type=bridge"])
+        .status
+        .success()
+    {
+        eprintln!("skipped: could not create a bridge network");
+        return;
+    }
+    struct BridgeCleanup<'a>(&'a str);
+    impl Drop for BridgeCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = lxc_output(&["network", "delete", self.0]);
+        }
+    }
+    let _cleanup_bridge = BridgeCleanup(bridge);
+
+    // The bridge is selected through `driver_config`, which the admission
+    // policy forbids by default — so the driver has to allow it, or the
+    // create is refused for that reason and never reaches the fence.
     let driver = Driver::start_with(DriverOptions {
-        extra_args: vec!["--restrict-sandbox-egress".into()],
+        extra_args: vec!["--allow-driver-config".to_string()],
         ..Default::default()
     })
     .await;
-    let name = unique_name("egress");
+    let name = unique_name("bridged");
     let _cleanup = driver.cleanup(&[&name]);
 
+    let mut request = sandbox(&name);
+    template_mut(&mut request).driver_config = Some(Struct {
+        fields: BTreeMap::from([("network".to_string(), string_value(bridge))]),
+    });
+
     let status = driver
-        .create(sandbox(&name))
+        .create(request)
         .await
-        .expect_err("a sandbox on lxdbr0 cannot have its egress restricted");
+        .expect_err("a bridge cannot carry a per-NIC ACL, so it cannot fence a sandbox");
     assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
-    assert!(status.message().contains("OVN"), "{status}");
-    assert!(lxd().get_instance(&name).await.is_err());
+    assert!(
+        status.message().contains("OVN"),
+        "the refusal should say why: {status}"
+    );
+    assert!(
+        lxd().get_instance(&name).await.is_err(),
+        "a sandbox that cannot be fenced must not be left behind"
+    );
 }
 
 /// A rejected create must not leave anything behind in LXD.

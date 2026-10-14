@@ -27,12 +27,12 @@
 #   OPENSHELL_TEST_WORK_DIR   state, logs and artifacts (default: target/openshell-test)
 #   OPENSHELL_TEST_CACHE_DIR  downloads and builds (default: target/openshell-test-cache)
 #   OPENSHELL_TEST_PROJECT    LXD project to run in (default: openshell-test)
-#   OPENSHELL_TEST_NETWORK    network sandboxes attach to (default: lxdbr0)
+#   OPENSHELL_TEST_NETWORK    OVN network sandboxes attach to (default: lxdbr0,
+#                             which is refused: see require_ovn_network)
 #   OPENSHELL_TEST_POOL       pool for sandbox root disks (default: default)
 #   OPENSHELL_TEST_GATEWAY_IP host address the gateway binds and sandboxes
 #                             reach it at (default: derived from the network)
-#   OPENSHELL_TEST_DRIVER_ARGS  extra driver arguments, e.g.
-#                             --restrict-sandbox-egress (default: none)
+#   OPENSHELL_TEST_DRIVER_ARGS  extra driver arguments (default: none)
 
 set -euo pipefail
 
@@ -40,28 +40,36 @@ set -euo pipefail
 
 # Bump the release here and in `OPENSHELL_REF` in the Makefile together, so
 # the vendored proto matches the gateway the suites run against.
-OPENSHELL_VERSION="0.0.116"
+OPENSHELL_VERSION="0.1.2"
 OPENSHELL_REPO="https://github.com/NVIDIA/OpenShell"
-OPENSHELL_RELEASE_URL="${OPENSHELL_REPO}/releases/download/v${OPENSHELL_VERSION}"
-# The commit the release tag points to, for suites that need the source.
+# The commit the tag points to. The gateway and CLI are *built* from it.
+# v0.1.2 does publish release binaries, but building from the pinned commit
+# is what keeps the gateway, CLI and conformance runner at one verified
+# revision rather than three artifacts whose provenance has to be pinned
+# separately.
 # shellcheck disable=SC2034  # used by the suites that source this file
-OPENSHELL_SOURCE_REV="d1155aa70042d3e2ee49dbfa15346b108b7c1d92"
-GATEWAY_SHA256_X86_64="59c6da724eae7a00c28826f9191efbdf4fbaa5c768afdc8dea6a80a949ebcc89"
-GATEWAY_SHA256_AARCH64="292c379193a339220234ffea585350901468bb8f4076e2076bc074e8ed18974b"
-CLI_SHA256_X86_64="4fb4476d80a1875a0b83547ec3aba999cf0a2e2d75f95f2f709b622e2103520e"
-CLI_SHA256_AARCH64="7a949c48d1e000cd280869eea1e203e24816b9cfefc575b68a8b72b939cb3f43"
+OPENSHELL_SOURCE_REV="6648bd0c290efbc41ba131ee9831ee45cd431f94"
 
-# The supervisor released with the gateway, pinned by index digest.
-SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_VERSION}@sha256:c8c42aef16c200063e32cbf72e553e4ead027085427b555efafd95063ecead42"
+# The two halves of a sandbox, pinned by digest and to the same revision as
+# the gateway. A gateway, a supervisor companion and a workload boundary from
+# different revisions do not make a working sandbox, and the version strings
+# these images report do not say which revision they came from.
+SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
+SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:bf4797b6c511f2d8ba02955dbba4bf76c1f0dd6d83531420c5408d5f1fb9d72f"
 
-# The sandbox rootfs, pinned by index digest. Upstream publishes it only as
-# `latest` and per-commit tags, so nothing ties a build of it to an OpenShell
-# release and it moves without warning — which is how it came to ship a
-# Python two minor versions ahead of what the suites were built against, and
-# `exec_python` started dying on bytecode the sandbox could not run. Bumping
-# this means checking SANDBOX_PYTHON_VERSION in upstream-e2e.sh with it.
+# The workload rootfs, pinned by digest: upstream's own default sandbox image.
+#
+# It used to be `openshell-community/sandboxes/base`, which upstream moved
+# away from and has not rebuilt since May 2026 — its `/etc/openshell/policy.yaml`
+# no longer parses, and a sandbox booted from it never leaves Provisioning
+# ("Image policy is invalid"). A base image with no policy at all is the
+# supported case: the supervisor falls back to the restrictive default.
+#
+# Bumping this means checking SANDBOX_PYTHON_VERSION in upstream-e2e.sh with
+# it: cloudpickle ships a test's function into the sandbox as bytecode, and
+# bytecode does not survive a Python version change.
 # shellcheck disable=SC2034  # used by the suites that source this file
-SANDBOX_IMAGE="ghcr.io/nvidia/openshell-community/sandboxes/base:latest@sha256:aeef1c63f00e2913ea002ccb3aaf925f338b5c5d70e63576f0d95c16a138044e"
+SANDBOX_IMAGE="nvcr.io/nvidia/base/ubuntu:24.04@sha256:c280ee89f8bfcbdaba6179ad4347f60c509e841cbe63eb93002f01bf70e0819c"
 
 # --- Layout ------------------------------------------------------------------
 
@@ -73,8 +81,13 @@ PROJECT="${OPENSHELL_TEST_PROJECT:-openshell-test}"
 # Where sandboxes land. Both go on the test project's own default profile,
 # which is where the driver reads them from: it is given nothing but
 # --project, the way an operator points it at a prepared project.
-NETWORK="${OPENSHELL_TEST_NETWORK:-lxdbr0}"
-STORAGE_POOL="${OPENSHELL_TEST_POOL:-default}"
+#
+# Read from the host's own `default` profile rather than assumed. These suites
+# need an OVN network now — a sandbox cannot be fenced anywhere else — and an
+# OVN host is usually a MicroCloud, which has neither an `lxdbr0` nor a pool
+# called `default`. `scripts/setup-ovn-test-env.sh` lays that profile out.
+NETWORK="${OPENSHELL_TEST_NETWORK:-$(lxc profile device get default eth0 network </dev/null 2>/dev/null || true)}"
+STORAGE_POOL="${OPENSHELL_TEST_POOL:-$(lxc profile device get default root pool </dev/null 2>/dev/null || true)}"
 # Driver options the suites do not set themselves, for exercising one of its
 # modes against a whole suite without a second script.
 read -r -a EXTRA_DRIVER_ARGS <<<"${OPENSHELL_TEST_DRIVER_ARGS:-}"
@@ -103,6 +116,15 @@ die() {
     exit 1
 }
 
+require_layout() {
+    [ -n "$NETWORK" ] || die \
+        "no network to put sandboxes on: the host's default profile has no eth0 NIC." \
+        "Run 'make setup-ovn-test-env', or set OPENSHELL_TEST_NETWORK."
+    [ -n "$STORAGE_POOL" ] || die \
+        "no pool to put sandbox root disks on: the host's default profile has no root disk." \
+        "Run 'make setup-ovn-test-env', or set OPENSHELL_TEST_POOL."
+}
+
 require_tools() {
     local missing=()
     local tool
@@ -116,36 +138,48 @@ require_tools() {
 
 # --- Binaries ----------------------------------------------------------------
 
-fetch_release_asset() {
-    local name=$1 sha256=$2
-    local archive="${OPENSHELL_DIR}/${name}"
-    if [ ! -f "$archive" ]; then
-        log "downloading ${name}"
-        curl -fsSL --retry 3 -o "${archive}.partial" "${OPENSHELL_RELEASE_URL}/${name}"
-        mv "${archive}.partial" "$archive"
-    fi
-    echo "${sha256}  ${archive}" | sha256sum --check --quiet \
-        || die "checksum mismatch for ${name}; delete ${archive} to download it again"
-    case "$name" in
-        *.tar.gz) tar -xzf "$archive" -C "$OPENSHELL_DIR" ;;
-    esac
-}
-
+# Builds the gateway and the CLI from the pinned revision, into the cache.
+#
+# They used to be downloaded: every v0.0.x tag published release binaries with
+# checksums to pin. No v0.1.0-pre tag has a GitHub release at all, so there was
+# nothing to download, and building was the only way to run the suites against
+# the release the driver targets. v0.1.x releases publish assets again, but the
+# suites keep building from the pinned commit: one revision across the gateway,
+# CLI and conformance runner, pinned by commit rather than by a set of asset
+# checksums.
+#
+# The build is cached by revision, so it happens once per bump rather than
+# once per run. It is a large Rust workspace; expect the first one to take a
+# while and to want several gigabytes of disk.
 fetch_openshell() {
+    local stamp="${OPENSHELL_DIR}/.built"
+    if [ -x "$GATEWAY_BIN" ] && [ -x "$CLI_BIN" ] &&
+        [ "$(cat "$stamp" 2>/dev/null)" = "$OPENSHELL_SOURCE_REV" ]; then
+        log "reusing OpenShell ${OPENSHELL_VERSION} built at ${OPENSHELL_DIR}"
+        return
+    fi
+
+    local src="${CACHE_DIR}/openshell-src-${OPENSHELL_SOURCE_REV}"
+    if [ ! -f "${src}/Cargo.toml" ]; then
+        log "fetching OpenShell ${OPENSHELL_VERSION} source (${OPENSHELL_SOURCE_REV})"
+        rm -rf "$src"
+        fetch_git_rev "$src" "$OPENSHELL_REPO" "$OPENSHELL_SOURCE_REV"
+        rm -rf "${src}/.git"
+    fi
+
+    log "building openshell-gateway and the openshell CLI (this takes a while)"
     mkdir -p "$OPENSHELL_DIR"
-    case "$(uname -m)" in
-        x86_64)
-            fetch_release_asset "openshell-gateway-x86_64-unknown-linux-gnu.tar.gz" "$GATEWAY_SHA256_X86_64"
-            fetch_release_asset "openshell-x86_64-unknown-linux-musl.tar.gz" "$CLI_SHA256_X86_64"
-            ;;
-        aarch64)
-            fetch_release_asset "openshell-gateway-aarch64-unknown-linux-gnu.tar.gz" "$GATEWAY_SHA256_AARCH64"
-            fetch_release_asset "openshell-aarch64-unknown-linux-musl.tar.gz" "$CLI_SHA256_AARCH64"
-            ;;
-        *)
-            die "unsupported architecture $(uname -m)"
-            ;;
-    esac
+    (
+        cd "$src"
+        CARGO_TARGET_DIR="${CACHE_DIR}/openshell-target" \
+            cargo build --release --locked \
+            -p openshell-gateway --bin openshell-gateway \
+            -p openshell-cli --bin openshell </dev/null
+    ) || die "building OpenShell ${OPENSHELL_VERSION} failed"
+
+    install -m 0755 "${CACHE_DIR}/openshell-target/release/openshell-gateway" "$GATEWAY_BIN"
+    install -m 0755 "${CACHE_DIR}/openshell-target/release/openshell" "$CLI_BIN"
+    printf '%s\n' "$OPENSHELL_SOURCE_REV" >"$stamp"
 }
 
 build_driver() {
@@ -206,6 +240,22 @@ gateway_ipv4() {
     echo "${cidr%/*}"
 }
 
+# Refuses a network the driver cannot fence.
+#
+# From OpenShell v0.1.0 the sandbox egress ACL is the outer network fence both
+# halves of a sandbox validate before the workload runs, and LXD applies a
+# per-NIC ACL only on OVN. On anything else every create fails, one sandbox at
+# a time; say so once, here, instead.
+require_ovn_network() {
+    local type
+    type="$(network_type)"
+    [ "$type" = "ovn" ] || die \
+        "network ${NETWORK} is a ${type} network, and sandboxes need an OVN one:" \
+        "their egress ACL is the outer network fence OpenShell v0.1.0 requires," \
+        "and LXD applies a per-NIC ACL nowhere else." \
+        "Set OPENSHELL_TEST_NETWORK to an OVN network."
+}
+
 create_project() {
     if lxc project show "$PROJECT" </dev/null >/dev/null 2>&1; then
         die "LXD project ${PROJECT} already exists; run '${ENV_SCRIPT} down' first"
@@ -233,9 +283,9 @@ delete_project() {
         lxc storage volume delete "$STORAGE_POOL" "$volume" --project "$PROJECT" </dev/null >/dev/null 2>&1 || true
     done
     lxc project delete "$PROJECT" </dev/null >/dev/null
-    # --restrict-sandbox-egress leaves an ACL behind. It belongs to the
-    # project the network is in, not the one just deleted, so nothing else
-    # here takes it with them.
+    # The sandbox egress ACL is left behind. It belongs to the project the
+    # network is in, not the one just deleted, so nothing else here takes it
+    # with them.
     lxc network acl delete "openshell-egress-${NETWORK}" </dev/null >/dev/null 2>&1 || true
 }
 
@@ -247,11 +297,12 @@ write_gateway_config() {
     echo "openshell-test" >"${keys}/kid"
     chmod 600 "${keys}/signing.pem"
 
-    # Schema version 1 is what v0.0.116 accepts. Without gateway_jwt the
-    # gateway mints no sandbox token and the supervisor cannot connect.
+    # Schema version 2 is what v0.1.0 accepts; a v0.0.116 file says 1 and is
+    # rejected outright. Without gateway_jwt the gateway mints no launch
+    # authentication, and neither half of a sandbox can authenticate.
     cat >"${WORK_DIR}/gateway.toml" <<EOF
 [openshell]
-version = 1
+version = 2
 
 [openshell.gateway.auth]
 allow_unauthenticated_users = true
@@ -301,6 +352,7 @@ start_driver() {
         --log-level "info,openshell_driver_lxd=debug" \
         --default-image "$SANDBOX_IMAGE" \
         --supervisor-image "$SUPERVISOR_IMAGE" \
+        --sandbox-binary-image "$SANDBOX_BINARY_IMAGE" \
         --supervisor-cache-dir "${WORK_DIR}/supervisor-cache" \
         --image-work-dir "${WORK_DIR}/image-work" \
         --gateway-grpc-port "$GATEWAY_PORT" \
@@ -326,7 +378,7 @@ start_gateway() {
         --bind-address "$ip" \
         --port "$GATEWAY_PORT" \
         --health-port "$HEALTH_PORT" \
-        --drivers lxd \
+        --compute-driver lxd \
         --compute-driver-socket "$DRIVER_SOCKET" \
         --db-url "sqlite:${WORK_DIR}/gateway.db?mode=rwc" \
         --log-level info \
@@ -343,24 +395,6 @@ start_gateway() {
     done
     tail -n 50 "${WORK_DIR}/gateway.log" >&2 || true
     die "gateway did not become healthy"
-}
-
-# Writes an argument-less executable at `$WORK_DIR/actions/<action>` that
-# runs `openshell-env.sh <action>` on this environment, for test runners
-# whose host actions cannot take arguments. Prints its path.
-write_host_action() {
-    local action=$1
-    local path="${WORK_DIR}/actions/${action}"
-    mkdir -p "${WORK_DIR}/actions"
-    cat >"$path" <<EOF
-#!/bin/sh
-OPENSHELL_TEST_WORK_DIR='${WORK_DIR}' OPENSHELL_TEST_CACHE_DIR='${CACHE_DIR}' OPENSHELL_TEST_PROJECT='${PROJECT}' \\
-OPENSHELL_TEST_NETWORK='${NETWORK}' OPENSHELL_TEST_POOL='${STORAGE_POOL}' \\
-OPENSHELL_TEST_DRIVER_ARGS='${OPENSHELL_TEST_DRIVER_ARGS:-}' \\
-    exec '${ENV_SCRIPT}' ${action}
-EOF
-    chmod +x "$path"
-    echo "$path"
 }
 
 gateway_endpoint() {
@@ -400,6 +434,8 @@ ensure_not_running() {
 env_up() {
     require_tools
     ensure_not_running
+    require_layout
+    require_ovn_network
     fetch_openshell
     build_driver
 

@@ -17,6 +17,7 @@ script.
 |---|---|
 | `make build` | `cargo build --workspace` |
 | `make check` | `cargo check --workspace --all-targets` |
+| `make setup-ovn-test-env` | bootstraps a single-node MicroCloud with OVN (needs root). Every suite that creates a sandbox needs it — see below |
 | `make test` | provisions LXD for lxd-client's integration tests, then `cargo test --workspace` |
 | `make test-conformance` | runs upstream OpenShell's conformance suite against the driver (see `scripts/conformance.sh`; the environment is `scripts/openshell-env.sh`) |
 | `make test-upstream-e2e` | runs upstream OpenShell's policy, Landlock and inference e2e tests against the driver (see `scripts/upstream-e2e.sh`) |
@@ -29,6 +30,20 @@ script.
 | `make release` | `cargo build --release --workspace` |
 | `make clean` | `cargo clean` |
 
+## Sandboxes need OVN
+
+From OpenShell v0.1.0 a sandbox's outer network fence is a per-NIC LXD ACL, and
+LXD applies one only on an OVN network — so `make test-driver`,
+`make test-conformance` and `make test-upstream-e2e` all need one, and a plain
+`lxd init` cannot provide it. `make setup-ovn-test-env` bootstraps a
+single-node MicroCloud for that, synthesizing the spare disk and the spare NIC
+MicroCloud wants out of a loop file and a veth pair, so it works on a CI runner
+or a laptop. It installs no Ceph: a single node has nothing to replicate to.
+
+The suites read the network and the pool from the host's `default` profile,
+which that script lays out, so nothing needs configuring per host.
+`OPENSHELL_TEST_NETWORK` and `OPENSHELL_TEST_POOL` override them.
+
 ## Conventions
 
 - **Spelling**: US English spelling throughout (e.g. "organization", "color",
@@ -39,14 +54,16 @@ script.
 
 ## Rock packaging
 
-The rock definition lives in `rockcraft.yaml` (base `ubuntu@26.04`). It bundles
-`openshell-gateway` (upstream NVIDIA/OpenShell) and `openshell-driver-lxd`
-under Pebble. A second rock definition lives in `rocks/supervisor/rockcraft.yaml`
-(base `bare`); it ships the statically-linked `openshell-sandbox` boundary
-binary that the driver extracts into every sandbox, built from the same pinned
-upstream revision as the gateway. A GitHub Actions workflow
-(`.github/workflows/rock.yaml`) builds and smoke-tests both rocks
-(`tests/rock/smoke.sh`, `tests/rock/smoke-supervisor.sh`) on every push/PR to
-`main`, and assembles/pushes multi-arch OCI images and manifests to GHCR on
-push to `main` (`ghcr.io/<owner>/openshell-gateway` and
-`ghcr.io/<owner>/openshell-supervisor`).
+Three rocks, all built from one pinned upstream revision — see
+[rocks/README.md](rocks/README.md) for why that matters and how to build them:
+
+| rock | definition | contents |
+|---|---|---|
+| `openshell-gateway` | `rockcraft.yaml` | the gateway and this driver, under Pebble |
+| `openshell-supervisor` | `rocks/supervisor/rockcraft.yaml` | the out-of-workload half of a sandbox |
+| `openshell-sandbox` | `rocks/sandbox/rockcraft.yaml` | the in-workload boundary binary |
+
+A GitHub Actions workflow (`.github/workflows/rock.yaml`) packs and
+smoke-tests all three (`tests/rock/smoke*.sh`) on every push/PR to `main`, and
+assembles and pushes multi-arch OCI images and manifests to GHCR on push to
+`main` (`ghcr.io/<owner>/openshell-{gateway,supervisor,sandbox}`).

@@ -75,6 +75,11 @@ pub struct Instance {
     pub config: HashMap<String, String>,
     /// Device configuration map (device name to key/value config).
     pub devices: HashMap<String, HashMap<String, String>>,
+    /// Devices after profile expansion: the instance's own devices plus those
+    /// its profiles contribute. This is what the instance actually runs with,
+    /// so it is the authoritative view for checks such as "how many NICs".
+    #[serde(default)]
+    pub expanded_devices: HashMap<String, HashMap<String, String>>,
     /// Instance type: `"container"` or `"virtual-machine"`.
     #[serde(rename = "type")]
     pub type_: String,
@@ -330,6 +335,11 @@ pub struct Profile {
     /// `type`, `network`, `pool`.
     #[serde(default)]
     pub devices: HashMap<String, HashMap<String, String>>,
+    /// Instance configuration the profile contributes, e.g. `environment.*`
+    /// and `security.*`. A caller-named profile can set these, so a driver
+    /// that admits caller profiles has to look at them.
+    #[serde(default)]
+    pub config: HashMap<String, String>,
 }
 
 /// An image as listed by `GET /1.0/images?recursion=1`.

@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-ovn-test-env setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -42,6 +42,14 @@ test-conformance:
 test-upstream-e2e:
 	./scripts/upstream-e2e.sh
 
+# Bootstraps a single-node MicroCloud with OVN, synthesizing the spare disk and
+# spare NIC it wants. Every suite that creates a sandbox needs an OVN network
+# from OpenShell v0.1.0 on: the per-NIC ACL that a sandbox's outer fence is
+# made of is the one thing LXD does not do on a bridge. Needs root; idempotent;
+# `--purge` undoes it.
+setup-ovn-test-env:
+	sudo ./scripts/setup-ovn-test-env.sh
+
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
 # `test` so the same command works locally and in CI.
@@ -57,9 +65,13 @@ fmt-check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Lints the shell scripts under scripts/ and tests/.
+# Lints every shell script in the repo, the two that run inside a sandbox
+# included: they are the container's boot path, so a mistake in them is a
+# sandbox that never starts.
 shellcheck:
 	shellcheck scripts/*.sh tests/rock/*.sh
+	shellcheck -s sh crates/openshell-driver-lxd/assets/openshell-init.sh \
+		crates/openshell-driver-lxd/assets/dhcp-client/udhcpc.script
 
 # Packs the openshell-gateway OCI rock with rockcraft.
 rock:
@@ -82,14 +94,17 @@ proto:
 	cargo build -p computev1
 
 # Proto files vendored from upstream NVIDIA/OpenShell. compute_driver.proto is
-# the driver contract itself; options.proto defines the custom field and method
-# options it imports (e.g. the `secret` field option on sandbox_token) and must
-# be resolvable on protoc's include path for codegen to succeed.
-UPSTREAM_PROTOS := compute_driver.proto options.proto
+# the driver contract itself; the rest are the files it imports, directly or
+# not, and must be resolvable on protoc's include path for codegen to succeed:
+# options.proto defines the custom field and method options (e.g. the `secret`
+# field option on launch_authentication), extension.proto the protocol metadata
+# the gateway negotiates with, and sandbox.proto the effective policy handed to
+# the driver, which in turn imports datamodel.proto.
+UPSTREAM_PROTOS := compute_driver.proto options.proto extension.proto sandbox.proto datamodel.proto
 
 # OpenShell release the vendored protos are taken from: the newest release the
 # driver targets.
-OPENSHELL_REF ?= v0.1.0-pre.1
+OPENSHELL_REF ?= v0.1.2
 
 # Sync proto/ with upstream NVIDIA/OpenShell at $(OPENSHELL_REF).
 sync-proto:
