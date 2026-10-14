@@ -309,9 +309,11 @@ fn to_driver_sandbox(instance: &Instance, stop_seen: StopSeen) -> DriverSandbox 
             sandbox_fd: String::new(),
             conditions: vec![ready_condition(instance, stop_seen)],
             deleting: false,
-            // Both are declared by the v0.1.2 contract but not read by
-            // the gateway yet: it takes the workload identity and the fence
-            // from the supervisor's own attach, not from this snapshot.
+            // Both are declared by the compute contract. The v0.1.4 gateway
+            // reads `resolved_identity` to surface a `WorkloadIdentity`
+            // condition, but only when it is set; the driver reports it at
+            // create and persists nothing to rebuild it here, so the snapshot
+            // leaves it out. `fence_evidence` is still unread.
             resolved_identity: None,
             fence_evidence: None,
         }),

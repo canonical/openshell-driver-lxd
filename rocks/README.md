@@ -1,7 +1,7 @@
 # rocks/
 
 Three rocks, built from **one pinned upstream revision**, currently
-`6648bd0c290efbc41ba131ee9831ee45cd431f94` (OpenShell v0.1.2):
+`5a7728c304b5528e954e9ae900cf21f84e1a12b1` (OpenShell v0.1.4):
 
 | rock | definition | base | what it is |
 |---|---|---|---|
