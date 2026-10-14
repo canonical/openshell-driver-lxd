@@ -40,22 +40,22 @@ set -euo pipefail
 
 # Bump the release here and in `OPENSHELL_REF` in the Makefile together, so
 # the vendored proto matches the gateway the suites run against.
-OPENSHELL_VERSION="0.1.2"
+OPENSHELL_VERSION="0.1.4"
 OPENSHELL_REPO="https://github.com/NVIDIA/OpenShell"
 # The commit the tag points to. The gateway and CLI are *built* from it.
-# v0.1.2 does publish release binaries, but building from the pinned commit
+# v0.1.4 does publish release binaries, but building from the pinned commit
 # is what keeps the gateway, CLI and conformance runner at one verified
 # revision rather than three artifacts whose provenance has to be pinned
 # separately.
 # shellcheck disable=SC2034  # used by the suites that source this file
-OPENSHELL_SOURCE_REV="6648bd0c290efbc41ba131ee9831ee45cd431f94"
+OPENSHELL_SOURCE_REV="5a7728c304b5528e954e9ae900cf21f84e1a12b1"
 
 # The two halves of a sandbox, pinned by digest and to the same revision as
 # the gateway. A gateway, a supervisor companion and a workload boundary from
 # different revisions do not make a working sandbox, and the version strings
 # these images report do not say which revision they came from.
-SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:d7b5264bb6bc56f4796e6fa3617b8e4a8d785be0b7293542efd8cc250b0fb67a"
-SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:bf4797b6c511f2d8ba02955dbba4bf76c1f0dd6d83531420c5408d5f1fb9d72f"
+SUPERVISOR_IMAGE="ghcr.io/nvidia/openshell/supervisor:${OPENSHELL_SOURCE_REV}@sha256:aa681d8264af6ee860e38349ed3c76609a51778eb6d0f02743df03787b80a290"
+SANDBOX_BINARY_IMAGE="ghcr.io/nvidia/openshell/sandbox:${OPENSHELL_SOURCE_REV}@sha256:ca00c094aeaa60681b8196cda18ab3c5dd5f7d782d4c36798256427b67599070"
 
 # The workload rootfs, pinned by digest: upstream's own default sandbox image.
 #
