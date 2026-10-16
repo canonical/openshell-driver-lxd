@@ -710,6 +710,14 @@ async fn host_alias_follows_the_gateway_endpoint() {
 /// fail.
 #[tokio::test]
 async fn an_unresolvable_gateway_endpoint_is_refused() {
+    // The refusal comes from writing the gateway into a per-NIC ACL, which LXD
+    // only has on OVN. On a bridge no ACL is written, so there is nothing that
+    // needs the gateway resolved and the driver accepts the create.
+    if !default_network_is_ovn() {
+        eprintln!("skipped: only an OVN fence needs the gateway endpoint resolved at create");
+        return;
+    }
+
     let driver = Driver::start_with(DriverOptions {
         extra_args: vec![
             "--gateway-endpoint".into(),

@@ -27,8 +27,9 @@
 #   OPENSHELL_TEST_WORK_DIR   state, logs and artifacts (default: target/openshell-test)
 #   OPENSHELL_TEST_CACHE_DIR  downloads and builds (default: target/openshell-test-cache)
 #   OPENSHELL_TEST_PROJECT    LXD project to run in (default: openshell-test)
-#   OPENSHELL_TEST_NETWORK    OVN network sandboxes attach to (default: lxdbr0,
-#                             which is refused: see require_ovn_network)
+#   OPENSHELL_TEST_NETWORK    network sandboxes attach to (default: read from
+#                             the host's default profile). OVN is fenced; a
+#                             bridge runs unfenced — see require_usable_network.
 #   OPENSHELL_TEST_POOL       pool for sandbox root disks (default: default)
 #   OPENSHELL_TEST_GATEWAY_IP host address the gateway binds and sandboxes
 #                             reach it at (default: derived from the network)
@@ -82,10 +83,11 @@ PROJECT="${OPENSHELL_TEST_PROJECT:-openshell-test}"
 # which is where the driver reads them from: it is given nothing but
 # --project, the way an operator points it at a prepared project.
 #
-# Read from the host's own `default` profile rather than assumed. These suites
-# need an OVN network now — a sandbox cannot be fenced anywhere else — and an
-# OVN host is usually a MicroCloud, which has neither an `lxdbr0` nor a pool
-# called `default`. `scripts/setup-ovn-test-env.sh` lays that profile out.
+# Read from the host's own `default` profile rather than assumed. An OVN host
+# is usually a MicroCloud, which has neither an `lxdbr0` nor a pool called
+# `default`; `scripts/setup-ovn-test-env.sh` lays that profile out for the
+# fenced run, and `scripts/setup-lxd-test-env.sh` gives a plain bridge for the
+# unfenced one.
 NETWORK="${OPENSHELL_TEST_NETWORK:-$(lxc profile device get default eth0 network </dev/null 2>/dev/null || true)}"
 STORAGE_POOL="${OPENSHELL_TEST_POOL:-$(lxc profile device get default root pool </dev/null 2>/dev/null || true)}"
 # Driver options the suites do not set themselves, for exercising one of its
@@ -240,20 +242,29 @@ gateway_ipv4() {
     echo "${cidr%/*}"
 }
 
-# Refuses a network the driver cannot fence.
+# Warns about a network the driver cannot fence; refuses one it cannot use.
 #
 # From OpenShell v0.1.0 the sandbox egress ACL is the outer network fence both
 # halves of a sandbox validate before the workload runs, and LXD applies a
-# per-NIC ACL only on OVN. On anything else every create fails, one sandbox at
-# a time; say so once, here, instead.
-require_ovn_network() {
+# per-NIC ACL only on OVN. On a bridge the driver attaches no ACL and runs the
+# sandbox unfenced — a real hole, so the suites still run but say so. A network
+# that is neither is refused once, here, rather than one create at a time.
+require_usable_network() {
     local type
     type="$(network_type)"
-    [ "$type" = "ovn" ] || die \
-        "network ${NETWORK} is a ${type} network, and sandboxes need an OVN one:" \
-        "their egress ACL is the outer network fence OpenShell v0.1.0 requires," \
-        "and LXD applies a per-NIC ACL nowhere else." \
-        "Set OPENSHELL_TEST_NETWORK to an OVN network."
+    case "$type" in
+        ovn) return 0 ;;
+        bridge)
+            log "network ${NETWORK} is a bridge: LXD attaches no per-NIC ACL, so"
+            log "sandboxes run without their outer network fence; only the"
+            log "in-workload boundary isolates them."
+            ;;
+        *)
+            die "network ${NETWORK} is a ${type} network; sandboxes need an OVN" \
+                "one (fenced) or a bridge (unfenced). Set OPENSHELL_TEST_NETWORK," \
+                "or run 'make setup-ovn-test-env' / 'make setup-lxd-test-env'."
+            ;;
+    esac
 }
 
 create_project() {
@@ -435,7 +446,7 @@ env_up() {
     require_tools
     ensure_not_running
     require_layout
-    require_ovn_network
+    require_usable_network
     fetch_openshell
     build_driver
 
