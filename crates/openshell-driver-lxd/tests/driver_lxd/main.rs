@@ -10,11 +10,12 @@
 //! stand-in holds a sandbox in whatever state a test asks for.
 //!
 //! Requires a running LXD whose `default` profile places instances on an
-//! **OVN** network — from OpenShell v0.1.0 a sandbox cannot be fenced, and so
-//! cannot be created, anywhere else — with a root disk on a pool the profile
-//! names (the tests read both from it rather than assuming `lxdbr0` and
+//! **OVN** network — that is the only kind LXD applies a per-NIC ACL to, and
+//! so the only kind a sandbox can be *fenced* on; a bridge is a deliberate
+//! unfenced fallback the driver warns about — with a root disk on a pool the
+//! profile names (the tests read both from it rather than assuming `lxdbr0` and
 //! `default`). Also the `lxc` CLI (used for out-of-band changes, as an
-//! operator would make them), `skopeo`, `umoci` and `mksquashfs` on `PATH`,
+//! operator would make them), `skopeo` and `sqfstar` on `PATH`,
 //! and outbound registry access: the sandbox image is imported on first use.
 //!
 //! Tests for behaviour the driver does not have yet are `#[ignore]`d with the

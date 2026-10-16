@@ -407,10 +407,14 @@ impl LxdFenceEvidence {
 
     /// Whether what was read back off the NIC is actually a fence.
     ///
-    /// All four conditions matter, and none can be inferred from another:
+    /// A network LXD will not enforce an ACL on — anything but OVN, a bridge
+    /// in practice — has no fence to read: the driver attaches none, warns
+    /// (see `Driver::collect_fence_evidence`) and runs the sandbox anyway, so
+    /// this returns `true` and only the in-workload boundary fences it.
     ///
-    /// - the network is OVN, because LXD applies `security.acls` to a NIC
-    ///   only there — a bridge takes the keys and ignores them;
+    /// On OVN all of the following matter, and none can be inferred from
+    /// another:
+    ///
     /// - the driver's own ACL is among those the NIC carries, so the rules in
     ///   force are the ones the driver wrote;
     /// - egress defaults to `reject`, so the driver's rules are the only way
@@ -420,6 +424,12 @@ impl LxdFenceEvidence {
     /// - and the network carries no ACLs of its own, which LXD would apply to
     ///   this NIC without recording them on it.
     fn fence_is_in_force(&self) -> bool {
+        // A bridge cannot carry a per-NIC ACL; the driver attaches none and
+        // runs the sandbox unfenced rather than refusing it, warning where it
+        // does. Any other type still has to be OVN or the create is refused.
+        if is_unfenced_fallback(&self.network_type) {
+            return true;
+        }
         self.network_type.eq_ignore_ascii_case(NETWORK_TYPE_OVN)
             && !self.fence_acl.is_empty()
             // Nothing applied at the network level. Those rules reach this
@@ -440,6 +450,33 @@ impl LxdFenceEvidence {
 
 /// The one LXD network type that applies an ACL to an individual NIC.
 pub const NETWORK_TYPE_OVN: &str = "ovn";
+
+/// A bridge network type.
+///
+/// LXD applies `security.acls` to a NIC only on OVN, so a sandbox placed on a
+/// bridge carries none and runs without this driver's outer network fence —
+/// an explicit fallback the driver logs a warning about.
+pub const NETWORK_TYPE_BRIDGE: &str = "bridge";
+
+/// Whether LXD enforces this driver's ACLs on a network of `network_type`.
+///
+/// Only an OVN NIC carries `security.acls`; a bridge takes the keys and
+/// ignores them. The driver attaches an ACL (on a NIC, and as a network ACL)
+/// only where LXD will enforce it.
+pub fn acls_are_enforced(network_type: &str) -> bool {
+    network_type.eq_ignore_ascii_case(NETWORK_TYPE_OVN)
+}
+
+/// Whether the driver runs a sandbox on `network_type` with no ACL at all,
+/// accepting that it has no outer network fence.
+///
+/// A bridge is the one such type: it can be fenced only with a network-scoped
+/// ACL the driver cannot attach per sandbox, so rather than refuse the create
+/// the driver attaches nothing, warns and leans on the in-workload boundary.
+/// Any other non-OVN type is still refused.
+pub fn is_unfenced_fallback(network_type: &str) -> bool {
+    network_type.eq_ignore_ascii_case(NETWORK_TYPE_BRIDGE)
+}
 
 /// The NIC default action a fence requires in both directions.
 pub const ACL_ACTION_REJECT: &str = "reject";
@@ -1189,9 +1226,6 @@ mod tests {
             ("ingress still defaults to allow", |e| {
                 e.default_ingress_action = "allow".to_string();
             }),
-            ("the network cannot carry a per-NIC ACL", |e| {
-                e.network_type = "bridge".to_string();
-            }),
             // Applied to every NIC on the network by LXD, and never recorded
             // on the NIC device — so a fence read from the NIC alone would
             // attest right past it.
@@ -1224,6 +1258,27 @@ mod tests {
         evidence.fence_acl = String::new();
         let err = evidence.project("g1").unwrap_err();
         assert!(format!("{err}").contains("OVN network"), "{err}");
+    }
+
+    /// A bridge cannot carry a per-NIC ACL, so the driver attaches none and
+    /// runs the sandbox unfenced rather than refusing it: the create warns and
+    /// proceeds, and this is the deliberate downgrade that warning announces.
+    #[test]
+    fn a_bridge_is_an_explicit_unfenced_fallback() {
+        assert!(!acls_are_enforced(NETWORK_TYPE_BRIDGE));
+        assert!(!acls_are_enforced("physical"));
+        assert!(acls_are_enforced(NETWORK_TYPE_OVN));
+
+        let mut evidence = fenced_evidence();
+        evidence.network_type = NETWORK_TYPE_BRIDGE.to_string();
+        // Nothing was attached, so nothing can be read back.
+        evidence.applied_acls.clear();
+        evidence.fence_acl = String::new();
+        evidence.default_egress_action = String::new();
+        evidence.default_ingress_action = String::new();
+        evidence
+            .project("g1")
+            .expect("a bridge is an explicit unfenced fallback, not a hard failure");
     }
 
     /// Anything that can carry a packet off the workload without passing
