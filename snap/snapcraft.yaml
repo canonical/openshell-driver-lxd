@@ -4,7 +4,7 @@
 # out-of-tree ComputeDriver gRPC contract over a Unix socket that it publishes
 # into the OpenShell snap through the `compute-driver` content interface.
 name: openshell-driver-lxd
-base: core24
+base: core26
 # Derived from the git history (tag or commit) so a local `snapcraft pack` and
 # the CI build both get a real version, rather than a value pinned here that
 # drifts from what was actually built. Matches rockcraft.yaml.
