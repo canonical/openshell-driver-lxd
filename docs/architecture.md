@@ -209,15 +209,19 @@ Sandboxes run from LXD images produced by converting an OCI/Docker image
 on demand (`image.rs`, `SkopeoImporter`):
 
 1. `skopeo copy` pulls the OCI image (subject to `--allowed-registries`).
-2. `umoci unpack` extracts its rootfs.
-3. The bundled POSIX init script (`assets/openshell-init.sh`) is injected at
-   `/openshell-init.sh` and pointed to by `/sbin/init`, since LXD containers
-   have no dedicated "init command" instance option — this lets a sandbox
-   boot even inside a restricted project that forbids `raw.lxc`.
+2. `oci_flatten` merges the OCI layers in memory into a single rootfs tar —
+   resolving whiteouts and opaque directories — and pipes it straight into
+   `sqfstar` (squashfs-tools) to build the rootfs squashfs. No unpacked rootfs
+   is written and the OCI layout is never modified, so the modes the image
+   carries (including setuid/setgid) survive into the sandbox.
+3. The bundled POSIX init script (`assets/openshell-init.sh`) is injected into
+   the tar at `/openshell-init.sh` and pointed to by `/sbin/init`, since LXD
+   containers have no dedicated "init command" instance option — this lets a
+   sandbox boot even inside a restricted project that forbids `raw.lxc`.
    See [The workload half's boot path](#the-workload-halfs-boot-path) for why
    that script runs nothing out of the image it is injected into.
-4. `mksquashfs` builds the rootfs squashfs and a `metadata.tar.xz` is built
-   with `tar`/`xz`, forming an LXD unified image tarball.
+4. A `metadata.tar.xz` is built with `tar`/`xz`, forming an LXD unified image
+   tarball.
 5. The image is imported into LXD and aliased by a prefix
    (`openshell-oci-`) plus a conversion revision and the content digest
    (`CONVERSION_REVISION`), so a change to the conversion process (e.g. the
@@ -226,10 +230,11 @@ on demand (`image.rs`, `SkopeoImporter`):
 
 `ImageCache` deduplicates concurrent resolution of the same reference and
 serves already-converted images by alias without re-pulling. The supervisor
-binary (`/openshell-sandbox`) is extracted the same way from a separate,
-minimal "supervisor" OCI image, cached on the host by content digest, and
-uploaded once per digest as an LXD custom storage volume that every sandbox
-mounts read-only — the sandbox rootfs and the supervisor binary are
+binary (`/openshell-sandbox`) is lifted from a separate, minimal "supervisor"
+OCI image — through the same flattener, without unpacking a rootfs — cached on
+the host by content digest, and uploaded once per digest as an LXD custom
+storage volume that every sandbox mounts read-only — the sandbox rootfs and
+the supervisor binary are
 versioned and distributed independently.
 
 Garbage collection (`gc.rs`) periodically removes:
@@ -386,8 +391,8 @@ Rockcraft (`.github/workflows/rock.yaml`):
 
 - `rockcraft.yaml` (base `ubuntu@26.04`) bundles the upstream OpenShell
   gateway and this driver under Pebble, plus the host tools the image
-  conversion pipeline shells out to (`skopeo`, `umoci`, `squashfs-tools`,
-  `xz-utils`), published as `ghcr.io/canonical/openshell-gateway`.
+  conversion pipeline shells out to (`skopeo`, `squashfs-tools` for
+  `sqfstar`, `xz-utils`), published as `ghcr.io/canonical/openshell-gateway`.
 - `rocks/supervisor/rockcraft.yaml` (base `bare`) builds only the static,
   musl-linked `openshell-sandbox` boundary binary from the *same pinned
   upstream commit* as the gateway rock, published as

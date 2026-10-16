@@ -128,7 +128,7 @@ require_layout() {
 require_tools() {
     local missing=()
     local tool
-    for tool in lxc skopeo umoci mksquashfs curl openssl sha256sum tar git cargo ss; do
+    for tool in lxc skopeo sqfstar xz curl openssl sha256sum tar git cargo ss; do
         command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
     done
     if [ "${#missing[@]}" -gt 0 ]; then
