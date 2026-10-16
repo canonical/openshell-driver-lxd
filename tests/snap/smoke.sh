@@ -69,6 +69,13 @@ done
 
 # --- 4. The daemon plugs the interfaces it needs. ---------------------------
 echo "==> Check: the driver app declares its plugs"
+# snapd auto-connects `network` and `network-bind` after install, and that can
+# lag the install itself -- most noticeably on the first install after the base
+# snap is fetched. Let the connections settle before asserting.
+for _ in $(seq 1 30); do
+    snap connections "${SNAP_NAME}" | grep -q 'openshell-driver-lxd:network-bind ' && break
+    sleep 1
+done
 for plug in lxd network network-bind; do
     snap connections "${SNAP_NAME}" | grep -q "openshell-driver-lxd:${plug} " \
         || { echo "ERROR: the ${plug} plug is not declared" >&2; exit 1; }
