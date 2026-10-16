@@ -184,11 +184,11 @@ async fn converted_image_keeps_file_ownership() {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     };
 
-    // `umoci unpack --rootless` cannot chown, so it records each file's owner
-    // in an xattr and the driver replays it into the squashfs. Without that
-    // replay everything in the image would belong to root, and a sandbox
-    // running as its unprivileged workload identity could not write its own
-    // home.
+    // The flattened tar carries each file's owner from the image layers
+    // straight into the squashfs, so the sandbox user owns its home and can
+    // write to it — as it would under Docker. Without that, everything in the
+    // image would belong to root and a sandbox running as its unprivileged
+    // workload identity could not write its own home.
     let home = exec("getent passwd 1000 | cut -d: -f6");
     assert!(
         !home.is_empty(),

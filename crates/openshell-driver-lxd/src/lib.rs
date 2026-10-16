@@ -11,5 +11,6 @@ pub mod grpc;
 pub mod image;
 pub(crate) mod isolation;
 pub(crate) mod mapping;
+pub(crate) mod oci_flatten;
 pub mod protocol;
 pub(crate) mod watcher;

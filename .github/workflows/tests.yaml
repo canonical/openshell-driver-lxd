@@ -30,20 +30,24 @@ jobs:
       - name: Run lxd-client tests
         run: make test-lxd-client
 
-  # Everything that creates a sandbox needs an OVN network: from OpenShell
-  # v0.1.0 a sandbox's outer fence is a per-NIC LXD ACL, and LXD applies one
-  # only on OVN. `setup-ovn-test-env` bootstraps a single-node MicroCloud and
-  # synthesizes the spare disk and spare NIC a runner does not have, so these
-  # jobs deliberately do *not* use setup-lxd-action: it would install and
-  # initialize an LXD that MicroCloud then has to work around.
+  # Every sandbox suite runs twice: once fenced, on an OVN network, and once
+  # unfenced, on a bridge. From OpenShell v0.1.0 a sandbox's outer fence is a
+  # per-NIC LXD ACL, and LXD applies one only on OVN; on a bridge the driver
+  # warns and runs the sandbox on its in-workload boundary alone. The OVN run
+  # uses `setup-ovn-test-env`, which bootstraps a single-node MicroCloud and
+  # synthesizes the spare disk and spare NIC a runner does not have — so it
+  # deliberately does *not* use setup-lxd-action, which would install and
+  # initialize an LXD MicroCloud then has to work around. The bridge run uses
+  # `setup-lxd-test-env` for a plain LXD.
   sandbox-tests:
-    name: ${{ matrix.suite }}
+    name: ${{ matrix.suite }} (${{ matrix.network }})
     runs-on: ubuntu-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
         suite: [driver, conformance, upstream-e2e]
+        network: [ovn, bridge]
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
@@ -63,15 +67,21 @@ jobs:
           sudo apt-get install --no-install-recommends -y protobuf-compiler libprotobuf-dev
 
       - name: Install image import tools
-        # The driver shells out to all four while converting an OCI image into
-        # an LXD one, and to busybox-static for images missing a shell or `ip`.
-        run: sudo apt-get install --no-install-recommends -y skopeo umoci squashfs-tools xz-utils busybox-static
+        # The driver shells out to skopeo and sqfstar (squashfs-tools) while
+        # converting an OCI image into an LXD one, and to busybox-static for
+        # images missing a shell or `ip`.
+        run: sudo apt-get install --no-install-recommends -y skopeo squashfs-tools xz-utils busybox-static
 
-      - name: Bootstrap MicroCloud with OVN
-        run: make setup-ovn-test-env
+      - name: Bootstrap the test network
+        # OVN for the fenced run, a plain bridge for the unfenced one.
+        run: |
+          case "${{ matrix.network }}" in
+            ovn) make setup-ovn-test-env ;;
+            bridge) make setup-lxd-test-env ;;
+          esac
 
       - name: Run ${{ matrix.suite }} suite
-        # setup-ovn-test-env puts the runner user in the lxd group so it can
+        # Both setup scripts put the runner user in the lxd group so it can
         # reach the LXD socket, but group membership only applies to sessions
         # started after the change, and this job's session predates it.
         # Re-entering through sudo makes it resolve the groups afresh — the
@@ -82,6 +92,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ${{ matrix.suite }}-artifacts
+          name: ${{ matrix.suite }}-${{ matrix.network }}-artifacts
           path: target/openshell-test/artifacts
           if-no-files-found: ignore

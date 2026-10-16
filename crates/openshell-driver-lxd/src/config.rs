@@ -284,13 +284,9 @@ pub struct Config {
     #[arg(long)]
     pub skopeo_path: Option<PathBuf>,
 
-    /// Optional path override for the umoci binary.
+    /// Optional path override for the sqfstar binary (from squashfs-tools).
     #[arg(long)]
-    pub umoci_path: Option<PathBuf>,
-
-    /// Optional path override for the mksquashfs binary.
-    #[arg(long)]
-    pub mksquashfs_path: Option<PathBuf>,
+    pub sqfstar_path: Option<PathBuf>,
 
     /// Remote LXD HTTPS endpoint (e.g. https://10.0.0.1:8443).
     /// When set, --lxd-socket is ignored and HTTPS+mTLS is used instead.

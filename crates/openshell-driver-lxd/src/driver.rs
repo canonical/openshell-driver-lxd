@@ -142,8 +142,7 @@ impl LxdComputeDriver {
         let importer = Arc::new(SkopeoImporter::new(
             lxd.clone(),
             config.skopeo_path.clone(),
-            config.umoci_path.clone(),
-            config.mksquashfs_path.clone(),
+            config.sqfstar_path.clone(),
             config.image_work_dir.clone(),
             Duration::from_secs(config.image_pull_timeout_secs),
             Duration::from_secs(config.image_convert_timeout_secs),
@@ -203,7 +202,7 @@ impl LxdComputeDriver {
     /// `create_sandbox` need not block on a registry pull, and so a bad
     /// default reference or an unreachable registry surfaces at startup
     /// rather than on the first request. Importing requires the external
-    /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
+    /// tooling (skopeo/sqfstar); any failure here is logged and
     /// otherwise ignored — the same import is retried on first use.
     pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
         self.resolve_image(&self.config.default_image).await
@@ -872,11 +871,17 @@ impl LxdComputeDriver {
         let placement =
             mapping::Placement::resolve(template, &defaults.network, &defaults.storage_pool);
         let network = self.check_placement(placement).await?;
+        // LXD enforces a per-NIC ACL only on OVN. On any other type the driver
+        // attaches no ACL at all and the sandbox runs without its outer network
+        // fence; `collect_fence_evidence` warns once the create reaches it.
+        let fenced = isolation::acls_are_enforced(&network.type_.to_string());
 
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
-        // Not optional since OpenShell v0.1.0: this ACL is the sandbox's outer
-        // network fence, and both halves of a sandbox refuse to run without
-        // one. See `isolation::LxdFenceEvidence::project`.
+        // Not optional on OVN since OpenShell v0.1.0: this ACL is the
+        // sandbox's outer network fence, and both halves of a sandbox refuse
+        // to run without one. See `isolation::LxdFenceEvidence::project`.
+        // Where LXD will not enforce an ACL (a bridge), no ACL is created and
+        // the returned name is a placeholder that no NIC carries.
         let fence_acl = self
             .ensure_network_egress_acl(placement.network, &network)
             .await?;
@@ -972,19 +977,29 @@ impl LxdComputeDriver {
         // is what makes this the kind of race that passes every test and then
         // fails a suite.
         let sandbox_acls = self
-            .ensure_sandbox_acls(&sandbox.name, &gateway_endpoint)
+            .ensure_sandbox_acls(&sandbox.name, &gateway_endpoint, fenced)
             .await?;
         // The halves are not given the same thing. The workload carries only
         // the protocol ACL, so with both NIC defaults at `reject` it has no
         // egress at all — its traffic is relayed by the companion, and the
         // fence has to hold if the in-guest boundary is ever escaped. The
         // companion carries what it needs to do that relaying.
-        let workload_acls = [sandbox_acls.protocol.as_str()];
-        let companion_acls = [
-            fence_acl.as_str(),
-            sandbox_acls.protocol.as_str(),
-            sandbox_acls.egress.as_str(),
-        ];
+        //
+        // Where LXD will not enforce an ACL (a bridge), the driver attaches
+        // none: the NICs carry no `security.acls`, and the sandbox runs
+        // unfenced behind its in-workload boundary only.
+        let (workload_acls, companion_acls): (Vec<&str>, Vec<&str>) = if fenced {
+            (
+                vec![sandbox_acls.protocol.as_str()],
+                vec![
+                    fence_acl.as_str(),
+                    sandbox_acls.protocol.as_str(),
+                    sandbox_acls.egress.as_str(),
+                ],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Ensure digest-keyed custom storage volume exists on the aux pool.
         // Locks are keyed by pool *and* digest: the same binary on two pools
@@ -1499,6 +1514,20 @@ impl LxdComputeDriver {
         network_type: &str,
         fence_acl: &str,
     ) -> Result<isolation::LxdFenceEvidence, DriverError> {
+        // LXD attaches a per-NIC ACL only on OVN. On a bridge the driver
+        // attaches none, so the sandbox has no outer network fence and the
+        // in-workload boundary is all there is. Said loudly, once per create
+        // and per start, because it is a real hole an operator has to see.
+        if isolation::is_unfenced_fallback(network_type) {
+            tracing::warn!(
+                instance = name,
+                network,
+                network_type,
+                "network is a bridge, which cannot carry LXD per-NIC ACLs; this sandbox runs \
+                 without its outer network fence"
+            );
+        }
+
         let instance = self.lxd.get_instance(name).await?;
 
         // LXD applies a network's own `security.acls` to every NIC on it, and
@@ -1847,7 +1876,8 @@ impl LxdComputeDriver {
             if let Ok(lxd_network) = self.lxd.get_network(&network).await {
                 match self.resolve_gateway_endpoint(&network, &lxd_network) {
                     Ok(endpoint) => {
-                        self.ensure_sandbox_acls(name, &endpoint).await?;
+                        let fenced = isolation::acls_are_enforced(&lxd_network.type_.to_string());
+                        self.ensure_sandbox_acls(name, &endpoint, fenced).await?;
                         host_gateway_ip = Self::host_gateway_ip(
                             &Self::resolve_gateway_addresses(&endpoint).await?,
                         );
@@ -2079,17 +2109,13 @@ impl LxdComputeDriver {
         network_name: &str,
         network: &lxd_client::Network,
     ) -> Result<String, DriverError> {
-        if network.type_ != NetworkType::Ovn {
-            return Err(DriverError::FailedPrecondition(format!(
-                "sandboxes need an OVN network, where LXD applies ACLs to each NIC: the \
-                 egress ACL is the outer network fence OpenShell v0.1.0 requires before a \
-                 workload runs, and LXD rejects a per-NIC ACL anywhere else. {network_name:?} \
-                 is a {} network",
-                network.type_
-            )));
-        }
-
         let name = crate::egress::acl_name(network_name);
+        // Only OVN enforces a per-NIC ACL; on a bridge there is nothing to
+        // create and the sandbox runs without the fence. The create warns
+        // once `collect_fence_evidence` sees the network type.
+        if !isolation::acls_are_enforced(&network.type_.to_string()) {
+            return Ok(name);
+        }
         self.lxd
             .ensure_network_acl(&name, crate::egress::network_rules(), Vec::new())
             .await?;
@@ -2107,23 +2133,35 @@ impl LxdComputeDriver {
     /// after the gateway moved reaches the new address. Nothing else rewrites
     /// it: it belongs to one sandbox, so one sandbox's lifecycle is the only
     /// thing that touches it.
+    ///
+    /// `fenced` is whether LXD will enforce these ACLs at all. When it will
+    /// not (a bridge), nothing is created — the NICs carry no `security.acls`
+    /// either — so the names are still returned but name no ACL.
     async fn ensure_sandbox_acls(
         &self,
         sandbox_name: &str,
         gateway_endpoint: &str,
+        fenced: bool,
     ) -> Result<SandboxAcls, DriverError> {
+        let protocol = crate::egress::sandbox_protocol_acl_name(sandbox_name);
+        let fence_acl = crate::egress::sandbox_egress_acl_name(sandbox_name);
+        if !fenced {
+            return Ok(SandboxAcls {
+                protocol,
+                egress: fence_acl,
+            });
+        }
+
         let gateway = Self::resolve_gateway_addresses(gateway_endpoint).await?;
 
         // The protocol ACL first: the companion's egress rules name it as
         // their subject, and LXD validates a subject against the ACLs that
         // exist when the rule is written.
-        let protocol = crate::egress::sandbox_protocol_acl_name(sandbox_name);
         let (egress, ingress) = crate::egress::sandbox_protocol_rules(&protocol);
         self.lxd
             .ensure_network_acl(&protocol, egress, ingress)
             .await?;
 
-        let fence_acl = crate::egress::sandbox_egress_acl_name(sandbox_name);
         self.lxd
             .ensure_network_acl(
                 &fence_acl,
