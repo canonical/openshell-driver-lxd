@@ -23,6 +23,8 @@ jobs:
         run: sudo snap install snapcraft --classic
       - name: Build snap
         run: snapcraft pack
+      - name: Smoke test
+        run: make test-snap
       - name: Upload snap artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
