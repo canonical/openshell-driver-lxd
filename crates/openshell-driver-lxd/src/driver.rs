@@ -142,8 +142,7 @@ impl LxdComputeDriver {
         let importer = Arc::new(SkopeoImporter::new(
             lxd.clone(),
             config.skopeo_path.clone(),
-            config.umoci_path.clone(),
-            config.mksquashfs_path.clone(),
+            config.sqfstar_path.clone(),
             config.image_work_dir.clone(),
             Duration::from_secs(config.image_pull_timeout_secs),
             Duration::from_secs(config.image_convert_timeout_secs),
@@ -203,7 +202,7 @@ impl LxdComputeDriver {
     /// `create_sandbox` need not block on a registry pull, and so a bad
     /// default reference or an unreachable registry surfaces at startup
     /// rather than on the first request. Importing requires the external
-    /// tooling (skopeo/umoci/mksquashfs); any failure here is logged and
+    /// tooling (skopeo/sqfstar); any failure here is logged and
     /// otherwise ignored — the same import is retried on first use.
     pub async fn ensure_default_image(&self) -> Result<String, DriverError> {
         self.resolve_image(&self.config.default_image).await

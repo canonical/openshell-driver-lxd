@@ -17,7 +17,8 @@ test-lxd-client: setup-lxd-test-env
 # Runs the driver's unit and integration tests. The integration tests
 # (crates/openshell-driver-lxd/tests/driver_lxd) start the driver binary and
 # boot real sandboxes on a live LXD, so they need the `lxc` CLI, `skopeo`,
-# `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus outbound access to
+# and `squashfs-tools` (for `sqfstar`, and `mksquashfs` in the image-import
+# helper) on PATH plus outbound access to
 # ghcr.io: the sandbox image is imported on first use. Sandboxes run a
 # stand-in supervisor built from examples/, not the real one, which needs a
 # gateway. They also share one LXD daemon and default project, so run them

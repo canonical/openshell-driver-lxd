@@ -201,7 +201,6 @@ pub fn ensure_sandbox_image() -> String {
                     lxd(),
                     None,
                     None,
-                    None,
                     image_work_dir(),
                     Duration::from_secs(900),
                     Duration::from_secs(1800),

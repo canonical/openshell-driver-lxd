@@ -3,8 +3,10 @@
 //! OCI image resolution, caching, and LXD image importing.
 
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -19,22 +21,12 @@ use crate::error::DriverError;
 /// Default prefix for digest-derived LXD image aliases.
 pub const DEFAULT_CACHE_ALIAS_PREFIX: &str = "openshell-oci-";
 
-/// Canonical path inside the guest rootfs for the injected PID 1 init script.
-pub(crate) const GUEST_INIT_SCRIPT_PATH: &str = "/openshell-init.sh";
-
-/// The init LXD starts in a container. LXD has no instance option for a
-/// container's init; the only other way to change it is `lxc.init.cmd` in
-/// `raw.lxc`, a low-level key restricted projects refuse. Pointing this path
-/// at [`GUEST_INIT_SCRIPT_PATH`] in the converted image lets a sandbox boot in
-/// a restricted project.
-pub(crate) const GUEST_INIT_PATH: &str = "/sbin/init";
-
-/// How many symlinks resolving a path inside a rootfs may follow, as the
-/// kernel's limit for a path lookup.
-const MAX_SYMLINK_HOPS: usize = 40;
-
 /// Bundled POSIX/busybox init script injected into converted rootfs images.
 const INIT_SCRIPT_CONTENTS: &str = include_str!("../assets/openshell-init.sh");
+
+/// Name of the in-workload boundary binary the supervisor image ships at its
+/// root, extracted into a host cache and mounted into the workload container.
+const SUPERVISOR_BINARY_NAME: &str = "openshell-sandbox";
 
 static OCI_REF_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     // Strict OCI reference grammar:
@@ -109,11 +101,11 @@ pub fn check_registry_allowed(reference: &str, allowed: &[String]) -> Result<(),
     }
 }
 
-/// Cache size `mksquashfs` is allowed for an image conversion.
+/// Cache size `sqfstar` is allowed for an image conversion.
 ///
 /// See the call site: the default (a quarter of physical RAM) is too much for
 /// a host that is also running the gateway and its sandboxes.
-const MKSQUASHFS_MEM: &str = "512M";
+const SQFSTAR_MEM: &str = "512M";
 
 /// Revision of the OCI-to-LXD conversion, part of every cache alias.
 ///
@@ -147,10 +139,17 @@ const MKSQUASHFS_MEM: &str = "512M";
 /// system depended on the network's resolver accepting a special-use name,
 /// which RFC 6761 says it need not.
 ///
+/// Revision 12 replaces the unpack-and-repack conversion with a streaming one:
+/// the OCI layers are merged in memory and piped straight into `sqfstar`,
+/// instead of being unpacked with `umoci` and repacked with `mksquashfs`.
+/// Setuid/setgid bits now survive (the old `--rootless` unpack could not
+/// create them under the snap's seccomp policy), and the image is no longer
+/// rewritten, so the same OCI digest converts to a different image.
+///
 /// The init script is baked into the converted image, so any change to
 /// `assets/openshell-init.sh` needs a bump here: without one, hosts that
 /// already converted an image keep booting the old script.
-pub const CONVERSION_REVISION: u32 = 11;
+pub const CONVERSION_REVISION: u32 = 12;
 
 /// Returns the deterministic LXD cache alias for the given content digest.
 ///
@@ -165,177 +164,6 @@ pub fn cache_alias(digest: &str) -> String {
 pub fn cache_alias_with_prefix(prefix: &str, digest: &str) -> String {
     let clean = digest.strip_prefix("sha256:").unwrap_or(digest);
     format!("{prefix}r{CONVERSION_REVISION}-{clean}")
-}
-
-/// Extended attribute in which `umoci unpack --rootless` records each file's
-/// owner from the image layers, because it does not chown — neither as an
-/// unprivileged user nor as root.
-const ROOTLESS_OWNER_XATTR: &str = "user.rootlesscontainers";
-
-/// umoci's "unchanged" id in [`ROOTLESS_OWNER_XATTR`]: the file keeps the
-/// unpacking user's id, which stands for root.
-const ROOTLESS_NOOP_ID: u32 = u32::MAX;
-
-/// Decodes a [`ROOTLESS_OWNER_XATTR`] value, the rootlesscontainers protobuf
-/// `Resource { uint32 uid = 1; uint32 gid = 2; }`, into `(uid, gid)`.
-///
-/// A missing field and the no-op id both mean root.
-pub(crate) fn decode_rootless_owner(bytes: &[u8]) -> Option<(u32, u32)> {
-    let mut uid = 0;
-    let mut gid = 0;
-    let mut rest = bytes;
-    while let Some((&key, tail)) = rest.split_first() {
-        // Only varint fields are expected (wire type 0).
-        if key & 0x7 != 0 {
-            return None;
-        }
-        let mut value: u64 = 0;
-        let mut shift = 0;
-        let mut consumed = 0;
-        for &byte in tail {
-            consumed += 1;
-            value |= u64::from(byte & 0x7f) << shift;
-            if byte & 0x80 == 0 {
-                break;
-            }
-            shift += 7;
-            if shift > 35 {
-                return None;
-            }
-        }
-        if consumed == 0 || tail[consumed - 1] & 0x80 != 0 {
-            return None;
-        }
-        let id = u32::try_from(value).ok()?;
-        let id = if id == ROOTLESS_NOOP_ID { 0 } else { id };
-        match key >> 3 {
-            1 => uid = id,
-            2 => gid = id,
-            _ => {}
-        }
-        rest = &tail[consumed..];
-    }
-    Some((uid, gid))
-}
-
-/// Reads [`ROOTLESS_OWNER_XATTR`] from `path` without following symlinks.
-#[cfg(target_os = "linux")]
-fn read_rootless_owner(path: &Path) -> std::io::Result<Option<(u32, u32)>> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
-
-    let c_path = CString::new(path.as_os_str().as_bytes())
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-    let c_name = CString::new(ROOTLESS_OWNER_XATTR).expect("static name has no NUL");
-    let mut buf = [0u8; 64];
-    // SAFETY: both strings are NUL-terminated and outlive the call, and the
-    // buffer length passed is the buffer's real length.
-    let len = unsafe {
-        libc::lgetxattr(
-            c_path.as_ptr(),
-            c_name.as_ptr(),
-            buf.as_mut_ptr().cast(),
-            buf.len(),
-        )
-    };
-    if len < 0 {
-        let err = std::io::Error::last_os_error();
-        return match err.raw_os_error() {
-            // No record (a root-owned file) or no xattr support (a symlink).
-            Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(None),
-            _ => Err(err),
-        };
-    }
-    let len = usize::try_from(len).expect("non-negative length");
-    decode_rootless_owner(&buf[..len]).map(Some).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("malformed {ROOTLESS_OWNER_XATTR} on {}", path.display()),
-        )
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn read_rootless_owner(_path: &Path) -> std::io::Result<Option<(u32, u32)>> {
-    Ok(None)
-}
-
-/// Quotes a rootfs-relative path for a mksquashfs pseudo definition.
-fn pseudo_quote(path: &[u8]) -> Vec<u8> {
-    let mut quoted = Vec::with_capacity(path.len() + 2);
-    quoted.push(b'"');
-    for &byte in path {
-        if byte == b'"' || byte == b'\\' {
-            quoted.push(b'\\');
-        }
-        quoted.push(byte);
-    }
-    quoted.push(b'"');
-    quoted
-}
-
-/// Writes a mksquashfs pseudo file that gives every entry under `rootfs` the
-/// owner the image layers specify.
-///
-/// `umoci unpack --rootless` leaves every file owned by the unpacking user and
-/// records the real owner in [`ROOTLESS_OWNER_XATTR`]. Without restoring it,
-/// every file in the sandbox would belong to root (or to whoever ran the
-/// driver), and the sandbox user could not write to its own workdir. Each
-/// entry gets an `m` (modify) definition with its current mode and its
-/// recorded owner, root when there is no record. Returns the number of
-/// entries.
-pub(crate) fn write_ownership_pseudo_file(
-    rootfs: &Path,
-    pseudo_file: &Path,
-) -> Result<usize, DriverError> {
-    use std::io::Write;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let io_err = |what: &str, path: &Path, e: std::io::Error| {
-        DriverError::ImageImport(format!("{what} {}: {e}", path.display()))
-    };
-    let file = std::fs::File::create(pseudo_file)
-        .map_err(|e| io_err("failed to create pseudo file", pseudo_file, e))?;
-    let mut out = std::io::BufWriter::new(file);
-    let mut count = 0;
-    let mut pending = vec![rootfs.to_path_buf()];
-
-    while let Some(dir) = pending.pop() {
-        let entries =
-            std::fs::read_dir(&dir).map_err(|e| io_err("failed to read directory", &dir, e))?;
-        for entry in entries {
-            let entry = entry.map_err(|e| io_err("failed to read directory", &dir, e))?;
-            let path = entry.path();
-            let metadata =
-                std::fs::symlink_metadata(&path).map_err(|e| io_err("failed to stat", &path, e))?;
-            if metadata.is_dir() {
-                pending.push(path.clone());
-            }
-
-            let relative = path.strip_prefix(rootfs).expect("walk stays inside rootfs");
-            let relative = relative.as_os_str().as_bytes();
-            if relative.contains(&b'\n') {
-                // The pseudo file format cannot name it; it keeps the
-                // unpacking user as owner.
-                tracing::warn!(path = %path.display(), "cannot restore owner of a path containing a newline");
-                continue;
-            }
-            let (uid, gid) = read_rootless_owner(&path)
-                .map_err(|e| io_err("failed to read owner of", &path, e))?
-                .unwrap_or((0, 0));
-            let mode = metadata.mode() & 0o7777;
-
-            out.write_all(&pseudo_quote(relative))
-                .and_then(|()| writeln!(out, " m {mode:o} {uid} {gid}"))
-                .map_err(|e| io_err("failed to write pseudo file", pseudo_file, e))?;
-            count += 1;
-        }
-    }
-
-    out.flush()
-        .map_err(|e| io_err("failed to write pseudo file", pseudo_file, e))?;
-    Ok(count)
 }
 
 /// Returns `reference` with any leading `docker://` scheme and any trailing
@@ -692,12 +520,11 @@ pub fn select_arch_digest(raw: &[u8], os: &str, arch: &str) -> Result<String, Dr
     )))
 }
 
-/// Real implementation of [`OciImporter`] using `skopeo`, `umoci`, and `mksquashfs`.
+/// Real implementation of [`OciImporter`] using `skopeo` and `sqfstar`.
 pub struct SkopeoImporter {
     lxd: LxdClient,
     skopeo_path: PathBuf,
-    umoci_path: PathBuf,
-    mksquashfs_path: PathBuf,
+    sqfstar_path: PathBuf,
     work_dir: PathBuf,
     /// Deadline for each registry call.
     timeout: Duration,
@@ -711,8 +538,7 @@ impl SkopeoImporter {
     pub fn new(
         lxd: LxdClient,
         skopeo_path: Option<PathBuf>,
-        umoci_path: Option<PathBuf>,
-        mksquashfs_path: Option<PathBuf>,
+        sqfstar_path: Option<PathBuf>,
         work_dir: PathBuf,
         timeout: Duration,
         convert_timeout: Duration,
@@ -720,8 +546,7 @@ impl SkopeoImporter {
         Self {
             lxd,
             skopeo_path: skopeo_path.unwrap_or_else(|| PathBuf::from("skopeo")),
-            umoci_path: umoci_path.unwrap_or_else(|| PathBuf::from("umoci")),
-            mksquashfs_path: mksquashfs_path.unwrap_or_else(|| PathBuf::from("mksquashfs")),
+            sqfstar_path: sqfstar_path.unwrap_or_else(|| PathBuf::from("sqfstar")),
             work_dir,
             timeout,
             convert_timeout,
@@ -796,6 +621,128 @@ impl SkopeoImporter {
                 ))
             })
     }
+
+    /// Converts the OCI image at `oci_dir` into the LXD rootfs squashfs at
+    /// `squashfs_path`, injecting the init script on the way through.
+    ///
+    /// The image is flattened in memory into a tar stream that is piped
+    /// straight into `sqfstar`: no unpacked rootfs is ever written, and the
+    /// OCI layout is left untouched. Because `sqfstar` records modes straight
+    /// into the squashfs rather than `chmod`-ing files on the host, an image
+    /// that ships setuid binaries converts even under the strictly
+    /// confined snap — which is what lets the driver stop mutating the image.
+    async fn flatten_rootfs(
+        &self,
+        oci_dir: &Path,
+        squashfs_path: &Path,
+        alias: &str,
+    ) -> Result<(), DriverError> {
+        let oci = oci_dir.to_path_buf();
+        let squashfs = squashfs_path.to_path_buf();
+        let sqfstar = self.sqfstar_path.clone();
+        let timeout = self.convert_timeout;
+        let stats =
+            tokio::task::spawn_blocking(move || run_sqfstar(&oci, &squashfs, &sqfstar, timeout))
+                .await
+                .map_err(|e| {
+                    DriverError::ImageImport(format!("image conversion panicked: {e}"))
+                })??;
+
+        tracing::info!(
+            alias = %alias,
+            entries = stats.entries,
+            xattrs = stats.xattrs,
+            "flattened OCI image into a rootfs squashfs"
+        );
+        Ok(())
+    }
+}
+
+/// Runs `sqfstar` to build `squashfs_path` from the flattened `oci_dir`,
+/// feeding the rootfs tar to its standard input.
+///
+/// This is blocking by design: it both writes the tar stream and waits on the
+/// child, and it is called from a blocking task rather than blocking the async
+/// runtime.
+fn run_sqfstar(
+    oci_dir: &Path,
+    squashfs_path: &Path,
+    sqfstar_path: &Path,
+    timeout: Duration,
+) -> Result<crate::oci_flatten::FlattenStats, DriverError> {
+    let stderr_path = squashfs_path.with_extension("sqfstar.stderr");
+    let stderr_file = std::fs::File::create(&stderr_path).map_err(|e| {
+        DriverError::ImageImport(format!("failed to create {}: {e}", stderr_path.display()))
+    })?;
+
+    let mut child = std::process::Command::new(sqfstar_path)
+        .args([
+            // No `-numeric-owner`: sqfstar only gained it in squashfs-tools
+            // 4.7, and the snap's core24 base ships 4.6.1. It is not needed —
+            // the flattened tar carries numeric uid/gid and no user/group
+            // names, so sqfstar stores the numbers as they are either way.
+            OsStr::new("-root-uid"),
+            OsStr::new("0"),
+            OsStr::new("-root-gid"),
+            OsStr::new("0"),
+            OsStr::new("-root-mode"),
+            OsStr::new("0755"),
+            OsStr::new("-default-uid"),
+            OsStr::new("0"),
+            OsStr::new("-default-gid"),
+            OsStr::new("0"),
+            OsStr::new("-default-mode"),
+            OsStr::new("0755"),
+            OsStr::new("-mem"),
+            OsStr::new(SQFSTAR_MEM),
+            squashfs_path.as_os_str(),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(stderr_file))
+        .spawn()
+        .map_err(|e| DriverError::ImageImport(format!("failed to execute sqfstar: {e}")))?;
+
+    let mut stdin = child.stdin.take().expect("stdin was piped to sqfstar");
+    let flat = crate::oci_flatten::flatten_image_to_tar(
+        oci_dir,
+        INIT_SCRIPT_CONTENTS.as_bytes(),
+        &mut stdin,
+    );
+    // Close the pipe so sqfstar sees EOF even if the write failed.
+    drop(stdin);
+
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(DriverError::ImageImport(format!(
+                        "sqfstar timed out building {}",
+                        squashfs_path.display()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(DriverError::ImageImport(format!(
+                    "failed to wait for sqfstar: {e}"
+                )))
+            }
+        }
+    };
+
+    if !status.success() {
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        return Err(DriverError::ImageImport(format!(
+            "sqfstar failed building {}: {stderr}",
+            squashfs_path.display()
+        )));
+    }
+    flat
 }
 
 #[tonic::async_trait]
@@ -850,8 +797,6 @@ impl OciImporter for SkopeoImporter {
         let temp_path = temp_dir.path();
 
         let oci_dest = temp_path.join("oci");
-        let bundle_dest = temp_path.join("bundle");
-        let rootfs_dest = bundle_dest.join("rootfs");
         let squashfs_path = temp_path.join("rootfs.squashfs");
 
         // 1. skopeo copy docker://<repo>@<digest> oci:<temp_path>/oci:img
@@ -884,98 +829,22 @@ impl OciImporter for SkopeoImporter {
             )));
         }
 
-        // 2. umoci unpack --image <temp_path>/oci:img <temp_path>/bundle
-        let cmd = tokio::process::Command::new(&self.umoci_path)
-            .args([
-                "unpack",
-                "--rootless",
-                "--image",
-                &format!("{}:img", oci_dest.display()),
-                &bundle_dest.display().to_string(),
-            ])
-            .kill_on_drop(true)
-            .output();
+        // 2. Flatten the OCI layout into a single rootfs tar and pipe it into
+        //    sqfstar. The image itself is not mutated: the layers are read as
+        //    they are, merged in memory, and streamed straight into the
+        //    squashfs, so no unpacked rootfs is ever written — and no chmod is
+        //    issued, which is what lets a strictly confined snap convert an
+        //    image whose layers carry setuid binaries.
+        self.flatten_rootfs(&oci_dest, &squashfs_path, alias)
+            .await?;
 
-        let output = tokio::time::timeout(self.convert_timeout, cmd)
-            .await
-            .map_err(|_| DriverError::ImageImport(format!("umoci unpack timed out for {alias}")))?
-            .map_err(|e| {
-                DriverError::ImageImport(format!("failed to execute umoci unpack: {e}"))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(DriverError::ImageImport(format!(
-                "umoci unpack failed for {alias}: {stderr}"
-            )));
-        }
-
-        // The compressed OCI copy has served its purpose now that the rootfs
-        // is unpacked. Dropping it here keeps peak scratch usage to the
-        // rootfs plus the squashfs being written, instead of holding all
-        // three representations of the image at once.
+        // The OCI copy has served its purpose. Dropping it keeps peak scratch
+        // usage to the squashfs being handed to LXD.
         if let Err(e) = tokio::fs::remove_dir_all(&oci_dest).await {
             tracing::debug!(path = %oci_dest.display(), %e, "could not free OCI copy early");
         }
 
-        // Inject the minimal init script before repacking with mksquashfs, and
-        // make it the container's init. Nothing is injected *for* the script:
-        // it takes its interpreter and every program it runs from the driver's
-        // own volumes, so the image needs to provide none of them.
-        inject_init_script(&rootfs_dest)?;
-        install_init(&rootfs_dest)?;
-
-        // Restore the owners the image specifies, which the rootless unpack
-        // only recorded in xattrs.
-        let pseudo_path = temp_path.join("ownership.pseudo");
-        let entries = {
-            let rootfs = rootfs_dest.clone();
-            let pseudo = pseudo_path.clone();
-            tokio::task::spawn_blocking(move || write_ownership_pseudo_file(&rootfs, &pseudo))
-                .await
-                .map_err(|e| DriverError::ImageImport(format!("ownership scan panicked: {e}")))??
-        };
-        tracing::debug!(alias = %alias, entries, "restoring image file ownership");
-
-        // 3. mksquashfs <rootfs_dest> <squashfs_path>, with the image's
-        //    ownership applied and umoci's bookkeeping xattr left out.
-        let cmd = tokio::process::Command::new(&self.mksquashfs_path)
-            .args([
-                rootfs_dest.as_os_str(),
-                squashfs_path.as_os_str(),
-                std::ffi::OsStr::new("-noappend"),
-                std::ffi::OsStr::new("-root-uid"),
-                std::ffi::OsStr::new("0"),
-                std::ffi::OsStr::new("-root-gid"),
-                std::ffi::OsStr::new("0"),
-                std::ffi::OsStr::new("-pf"),
-                pseudo_path.as_os_str(),
-                std::ffi::OsStr::new("-xattrs-exclude"),
-                std::ffi::OsStr::new("^user\\.rootlesscontainers$"),
-                // Bound the cache. mksquashfs defaults to a quarter of
-                // physical RAM, but it runs beside the gateway, the driver and
-                // LXD on the same host, and a sandbox create must not risk
-                // OOM-killing them. Compression is not the slow part of an
-                // import — pulling the image is.
-                std::ffi::OsStr::new("-mem"),
-                std::ffi::OsStr::new(MKSQUASHFS_MEM),
-            ])
-            .kill_on_drop(true)
-            .output();
-
-        let output = tokio::time::timeout(self.convert_timeout, cmd)
-            .await
-            .map_err(|_| DriverError::ImageImport(format!("mksquashfs timed out for {alias}")))?
-            .map_err(|e| DriverError::ImageImport(format!("failed to execute mksquashfs: {e}")))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(DriverError::ImageImport(format!(
-                "mksquashfs failed for {alias}: {stderr}"
-            )));
-        }
-
-        // 4. Assemble metadata.tar.xz
+        // 3. Assemble metadata.tar.xz
         // metadata.yaml contains architecture and creation date
         let creation_date = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -987,7 +856,7 @@ impl OciImporter for SkopeoImporter {
 
         let metadata_tar_bytes = create_metadata_tar_xz(temp_path, &metadata_yaml).await?;
 
-        // 5. Upload via LxdClient::create_image_from_split + wait_operation
+        // 4. Upload via LxdClient::create_image_from_split + wait_operation
         let op = tokio::time::timeout(
             self.convert_timeout,
             self.lxd.create_image_from_split(
@@ -1020,7 +889,7 @@ impl OciImporter for SkopeoImporter {
                 DriverError::ImageImport("operation response missing image fingerprint".into())
             })?;
 
-        // 6. Bind the alias to the fingerprint
+        // 5. Bind the alias to the fingerprint
         if let Err(e) = self
             .lxd
             .create_image_alias(
@@ -1078,8 +947,6 @@ impl OciImporter for SkopeoImporter {
         let temp_path = temp_dir.path();
 
         let oci_dest = temp_path.join("oci");
-        let bundle_dest = temp_path.join("bundle");
-        let rootfs_dest = bundle_dest.join("rootfs");
 
         // 1. skopeo copy docker://<repo>@<digest> oci:<temp_path>/oci:img
         let oci_tag_arg = format!("oci:{}:img", oci_dest.display());
@@ -1111,36 +978,6 @@ impl OciImporter for SkopeoImporter {
             )));
         }
 
-        // 2. umoci unpack --image <temp_path>/oci:img <temp_path>/bundle
-        let cmd = tokio::process::Command::new(&self.umoci_path)
-            .args([
-                "unpack",
-                "--rootless",
-                "--image",
-                &format!("{}:img", oci_dest.display()),
-                &bundle_dest.display().to_string(),
-            ])
-            .kill_on_drop(true)
-            .output();
-
-        let output = tokio::time::timeout(self.convert_timeout, cmd)
-            .await
-            .map_err(|_| {
-                DriverError::ImageImport(format!("umoci unpack timed out for {reference}"))
-            })?
-            .map_err(|e| {
-                DriverError::ImageImport(format!("failed to execute umoci unpack: {e}"))
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(DriverError::ImageImport(format!(
-                "umoci unpack failed for {reference}: {stderr}"
-            )));
-        }
-
-        let extracted_source = rootfs_dest.join("openshell-sandbox");
-
         tokio::fs::create_dir_all(&target_dir).await.map_err(|e| {
             DriverError::ImageImport(format!(
                 "failed to create supervisor cache directory {}: {e}",
@@ -1158,7 +995,23 @@ impl OciImporter for SkopeoImporter {
             EXTRACT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
 
-        copy_extracted_binary(&extracted_source, &temp_target, reference).await?;
+        // 2. Pull /openshell-sandbox out of the flattened image without
+        //    unpacking a rootfs; it is the top-most layer's copy, and a
+        //    symlink or a non-regular file there is rejected.
+        {
+            let oci = oci_dest.clone();
+            let target = temp_target.clone();
+            let reference = reference.to_string();
+            tokio::task::spawn_blocking(move || {
+                crate::oci_flatten::extract_file(&oci, SUPERVISOR_BINARY_NAME, &target)
+            })
+            .await
+            .map_err(|e| {
+                DriverError::ImageImport(format!(
+                    "supervisor extraction panicked for {reference}: {e}"
+                ))
+            })??;
+        }
 
         if is_valid_cached_binary(&binary_path).await {
             let _ = tokio::fs::remove_file(&temp_target).await;
@@ -1180,91 +1033,6 @@ impl OciImporter for SkopeoImporter {
 
         Ok((binary_path, digest))
     }
-}
-
-/// Copies an extracted supervisor binary to its destination.
-///
-/// Requires that the source is a regular file (rejecting symlinks) and copies
-/// it without following symlinks so an image cannot point at a host file.
-async fn copy_extracted_binary(
-    source: &Path,
-    target: &Path,
-    reference: &str,
-) -> Result<(), DriverError> {
-    let metadata = match tokio::fs::symlink_metadata(source).await {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(DriverError::ImageImport(format!(
-                "image {reference:?} does not contain /openshell-sandbox"
-            )));
-        }
-        Err(e) => {
-            return Err(DriverError::ImageImport(format!(
-                "failed to stat /openshell-sandbox in image {reference:?}: {e}"
-            )));
-        }
-    };
-
-    if metadata.file_type().is_symlink() {
-        return Err(DriverError::ImageImport(format!(
-            "image {reference:?} has a symlink at /openshell-sandbox"
-        )));
-    }
-    if !metadata.is_file() {
-        return Err(DriverError::ImageImport(format!(
-            "image {reference:?} does not contain a regular file at /openshell-sandbox"
-        )));
-    }
-
-    #[cfg(unix)]
-    {
-        let mut source_file = tokio::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(source)
-            .await
-            .map_err(|e| {
-                DriverError::ImageImport(format!(
-                    "failed to open extracted supervisor binary {}: {e}",
-                    source.display()
-                ))
-            })?;
-        let mut target_file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(target)
-            .await
-            .map_err(|e| {
-                DriverError::ImageImport(format!(
-                    "failed to create temporary supervisor binary {}: {e}",
-                    target.display()
-                ))
-            })?;
-        tokio::io::copy(&mut source_file, &mut target_file)
-            .await
-            .map_err(|e| {
-                DriverError::ImageImport(format!(
-                    "failed to copy extracted supervisor binary to {}: {e}",
-                    target.display()
-                ))
-            })?;
-
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(target, std::fs::Permissions::from_mode(0o755)).await;
-    }
-
-    #[cfg(not(unix))]
-    {
-        tokio::fs::copy(source, target).await.map_err(|e| {
-            DriverError::ImageImport(format!(
-                "failed to copy extracted supervisor binary to {}: {e}",
-                target.display()
-            ))
-        })?;
-    }
-
-    Ok(())
 }
 
 /// Creates a `.tar.xz` archive containing `metadata.yaml` in the given directory.
@@ -1299,155 +1067,6 @@ async fn create_metadata_tar_xz(dir: &Path, metadata_yaml: &str) -> Result<Vec<u
         .map_err(|e| DriverError::ImageImport(format!("failed to read metadata.tar.xz: {e}")))
 }
 
-/// Injects the bundled init script into the unpacked rootfs at `GUEST_INIT_SCRIPT_PATH`
-/// with executable permissions (`0755`).
-fn inject_init_script(rootfs_dest: &Path) -> Result<(), DriverError> {
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // The script sits at the top of the rootfs, so the only path component
-    // an image controls is the file itself. An image may ship that path as a
-    // symlink (say to /etc/shadow): writing through it would let the image
-    // overwrite a host file as the driver's user. Whatever is there is
-    // removed without being followed, and the script is created fresh.
-    let script_path = rootfs_dest.join(GUEST_INIT_SCRIPT_PATH.trim_start_matches('/'));
-    match std::fs::symlink_metadata(&script_path) {
-        Ok(metadata) if metadata.is_dir() => {
-            return Err(DriverError::ImageImport(format!(
-                "the image has a directory at {GUEST_INIT_SCRIPT_PATH}"
-            )));
-        }
-        Ok(_) => std::fs::remove_file(&script_path).map_err(|e| {
-            DriverError::ImageImport(format!(
-                "failed to remove {} from the image: {e}",
-                script_path.display()
-            ))
-        })?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => {
-            return Err(DriverError::ImageImport(format!(
-                "failed to stat {}: {e}",
-                script_path.display()
-            )))
-        }
-    }
-
-    // `create_new` refuses to open anything that appeared in between,
-    // symlinks included.
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o755)
-        .open(&script_path)
-        .and_then(|mut file| file.write_all(INIT_SCRIPT_CONTENTS.as_bytes()))
-        .map_err(|e| {
-            DriverError::ImageImport(format!(
-                "failed to write init script to {}: {e}",
-                script_path.display()
-            ))
-        })
-}
-
-/// Resolves `guest_path`, an absolute path as the container sees it, to the
-/// host path it names under `rootfs`, following symlinks in its directories
-/// the way the container would.
-///
-/// The rootfs comes from an arbitrary image, so its symlinks must never be
-/// followed on the host: `sbin -> /usr/sbin` would otherwise lead the driver
-/// to the host's own `/usr/sbin`. Absolute targets are taken relative to
-/// `rootfs` and `..` stops at it. The last component is not followed.
-fn resolve_in_rootfs(rootfs: &Path, guest_path: &str) -> Result<PathBuf, DriverError> {
-    use std::collections::VecDeque;
-    use std::path::Component;
-
-    let guest = Path::new(guest_path);
-    let file_name = guest
-        .file_name()
-        .ok_or_else(|| DriverError::ImageImport(format!("{guest_path:?} does not name a file")))?;
-    let mut pending: VecDeque<_> = guest
-        .parent()
-        .into_iter()
-        .flat_map(Path::components)
-        .map(|c| c.as_os_str().to_owned())
-        .collect();
-
-    let mut resolved = PathBuf::new();
-    let mut hops = 0;
-    while let Some(part) = pending.pop_front() {
-        match Path::new(&part).components().next() {
-            Some(Component::Normal(name)) => {
-                let candidate = rootfs.join(&resolved).join(name);
-                let is_symlink = std::fs::symlink_metadata(&candidate)
-                    .is_ok_and(|metadata| metadata.file_type().is_symlink());
-                if !is_symlink {
-                    resolved.push(name);
-                    continue;
-                }
-                hops += 1;
-                if hops > MAX_SYMLINK_HOPS {
-                    return Err(DriverError::ImageImport(format!(
-                        "too many symlinks resolving {guest_path:?} in the image"
-                    )));
-                }
-                let target = std::fs::read_link(&candidate).map_err(|e| {
-                    DriverError::ImageImport(format!(
-                        "failed to read symlink {}: {e}",
-                        candidate.display()
-                    ))
-                })?;
-                if target.is_absolute() {
-                    resolved.clear();
-                }
-                for component in target.components().rev() {
-                    pending.push_front(component.as_os_str().to_owned());
-                }
-            }
-            Some(Component::ParentDir) => {
-                resolved.pop();
-            }
-            // The root and `.` leave the position unchanged.
-            _ => {}
-        }
-    }
-
-    let resolved = rootfs.join(resolved).join(file_name);
-    // An absolute target restarts from the rootfs and `..` stops at it, so
-    // this cannot trip today. It is asserted anyway: staying inside the
-    // rootfs is the one thing this function exists for, and an edit that
-    // broke it would have the driver writing to the host.
-    if !resolved.starts_with(rootfs) {
-        return Err(DriverError::ImageImport(format!(
-            "{guest_path:?} resolves outside the image rootfs"
-        )));
-    }
-    Ok(resolved)
-}
-
-/// Makes [`GUEST_INIT_PATH`] a symlink to the injected init script, replacing
-/// whatever init the image shipped: a sandbox's init is always the script,
-/// which hands over to the supervisor.
-fn install_init(rootfs_dest: &Path) -> Result<(), DriverError> {
-    let init = resolve_in_rootfs(rootfs_dest, GUEST_INIT_PATH)?;
-    let io_err = |what: &str, e: std::io::Error| {
-        DriverError::ImageImport(format!("failed to {what} {}: {e}", init.display()))
-    };
-
-    if let Some(parent) = init.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| io_err("create the parent of", e))?;
-    }
-    match std::fs::symlink_metadata(&init) {
-        Ok(metadata) if metadata.is_dir() => {
-            return Err(DriverError::ImageImport(format!(
-                "the image has a directory at {GUEST_INIT_PATH}"
-            )));
-        }
-        Ok(_) => std::fs::remove_file(&init).map_err(|e| io_err("remove", e))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(io_err("stat", e)),
-    }
-    std::os::unix::fs::symlink(GUEST_INIT_SCRIPT_PATH, &init).map_err(|e| io_err("create", e))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1460,107 +1079,8 @@ mod tests {
         let digest_body = "ab".repeat(32);
         let digest = format!("sha256:{digest_body}");
         let alias = cache_alias(&digest);
-        assert_eq!(alias, format!("openshell-oci-r11-{digest_body}"));
-        assert_eq!(alias.len(), "openshell-oci-r11-".len() + 64);
-    }
-
-    /// Values observed from `umoci unpack --rootless` (umoci 0.4.7).
-    #[test]
-    fn rootless_owner_records_decode() {
-        // uid 998, gid 998
-        assert_eq!(
-            decode_rootless_owner(&[0x08, 0xe6, 0x07, 0x10, 0xe6, 0x07]),
-            Some((998, 998))
-        );
-        // uid unchanged (root), gid 42
-        assert_eq!(
-            decode_rootless_owner(&[0x08, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x10, 0x2a]),
-            Some((0, 42))
-        );
-        assert_eq!(decode_rootless_owner(&[]), Some((0, 0)));
-        // Truncated varint and a non-varint field are rejected.
-        assert_eq!(decode_rootless_owner(&[0x08, 0xe6]), None);
-        assert_eq!(decode_rootless_owner(&[0x0a, 0x01]), None);
-    }
-
-    #[test]
-    fn pseudo_paths_are_quoted() {
-        assert_eq!(pseudo_quote(b"etc/passwd"), b"\"etc/passwd\"".to_vec());
-        assert_eq!(
-            pseudo_quote(br#"dir with space/fi"le\x"#),
-            br#""dir with space/fi\"le\\x""#.to_vec()
-        );
-    }
-
-    #[cfg(target_os = "linux")]
-    fn set_rootless_owner(path: &Path, value: &[u8]) -> bool {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let c_path = CString::new(path.as_os_str().as_bytes()).unwrap();
-        let c_name = CString::new(ROOTLESS_OWNER_XATTR).unwrap();
-        // SAFETY: NUL-terminated strings and a correctly sized value.
-        unsafe {
-            libc::lsetxattr(
-                c_path.as_ptr(),
-                c_name.as_ptr(),
-                value.as_ptr().cast(),
-                value.len(),
-                0,
-            ) == 0
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn ownership_pseudo_file_restores_recorded_owners() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let rootfs = temp.path().join("rootfs");
-        std::fs::create_dir_all(rootfs.join("sandbox")).unwrap();
-        std::fs::write(rootfs.join("sandbox/.bashrc"), b"x").unwrap();
-        std::fs::create_dir_all(rootfs.join("usr/bin")).unwrap();
-        std::fs::write(rootfs.join("usr/bin/sudo"), b"x").unwrap();
-        for (path, mode) in [
-            ("sandbox", 0o755),
-            ("sandbox/.bashrc", 0o644),
-            ("usr", 0o755),
-            ("usr/bin", 0o755),
-            ("usr/bin/sudo", 0o4755),
-        ] {
-            std::fs::set_permissions(rootfs.join(path), std::fs::Permissions::from_mode(mode))
-                .unwrap();
-        }
-        std::os::unix::fs::symlink("sandbox/.bashrc", rootfs.join("link")).unwrap();
-
-        let owner_998 = [0x08, 0xe6, 0x07, 0x10, 0xe6, 0x07];
-        if !set_rootless_owner(&rootfs.join("sandbox"), &owner_998) {
-            eprintln!("user xattrs unsupported here; skipping");
-            return;
-        }
-        assert!(set_rootless_owner(
-            &rootfs.join("sandbox/.bashrc"),
-            &owner_998
-        ));
-
-        let pseudo = temp.path().join("ownership.pseudo");
-        let count = write_ownership_pseudo_file(&rootfs, &pseudo).unwrap();
-        let contents = std::fs::read_to_string(&pseudo).unwrap();
-        let mut lines: Vec<&str> = contents.lines().collect();
-        lines.sort_unstable();
-
-        assert_eq!(count, 6, "{contents}");
-        assert_eq!(
-            lines,
-            vec![
-                "\"link\" m 777 0 0",
-                "\"sandbox\" m 755 998 998",
-                "\"sandbox/.bashrc\" m 644 998 998",
-                "\"usr\" m 755 0 0",
-                "\"usr/bin\" m 755 0 0",
-                "\"usr/bin/sudo\" m 4755 0 0",
-            ]
-        );
+        assert_eq!(alias, format!("openshell-oci-r12-{digest_body}"));
+        assert_eq!(alias.len(), "openshell-oci-r12-".len() + 64);
     }
 
     #[test]
@@ -1988,173 +1508,6 @@ mod tests {
         assert_eq!(copy_source_with_scheme, copy_source);
     }
 
-    #[test]
-    fn test_inject_init_script() {
-        #[cfg(unix)]
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-
-        inject_init_script(&rootfs).unwrap();
-
-        let expected_path = rootfs.join(GUEST_INIT_SCRIPT_PATH.trim_start_matches('/'));
-        assert!(expected_path.exists());
-        let contents = std::fs::read_to_string(&expected_path).unwrap();
-        assert!(!contents.is_empty());
-        assert_eq!(contents, INIT_SCRIPT_CONTENTS);
-
-        #[cfg(unix)]
-        {
-            let metadata = std::fs::metadata(&expected_path).unwrap();
-            let mode = metadata.permissions().mode() & 0o777;
-            assert_eq!(mode, 0o755);
-        }
-    }
-
-    /// An image that ships the script's path as a symlink must not get the
-    /// driver to write through it.
-    #[test]
-    fn init_script_is_not_written_through_a_symlink_in_the_image() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-        let host_file = temp_dir.path().join("host-secret");
-        std::fs::write(&host_file, "do not touch").unwrap();
-        std::fs::set_permissions(&host_file, std::fs::Permissions::from_mode(0o600)).unwrap();
-        std::os::unix::fs::symlink(&host_file, rootfs.join("openshell-init.sh")).unwrap();
-
-        inject_init_script(&rootfs).unwrap();
-
-        assert_eq!(std::fs::read_to_string(&host_file).unwrap(), "do not touch");
-        let host_mode = std::fs::metadata(&host_file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(host_mode, 0o600);
-        let script = rootfs.join("openshell-init.sh");
-        assert!(!std::fs::symlink_metadata(&script)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::read_to_string(&script).unwrap(),
-            INIT_SCRIPT_CONTENTS
-        );
-    }
-
-    /// The guarantee every destination in this module depends on.
-    #[test]
-    fn guest_paths_always_resolve_inside_the_rootfs() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(rootfs.join("real")).unwrap();
-        std::os::unix::fs::symlink("/etc/cron.d", rootfs.join("absolute")).unwrap();
-        std::os::unix::fs::symlink("../../../../etc", rootfs.join("climbing")).unwrap();
-
-        for guest_path in [
-            "/bin/busybox",
-            "/absolute/payload",
-            "/climbing/payload",
-            "/real/../../../payload",
-        ] {
-            let resolved = resolve_in_rootfs(&rootfs, guest_path).unwrap();
-            assert!(
-                resolved.starts_with(&rootfs),
-                "{guest_path} resolved to {}",
-                resolved.display()
-            );
-        }
-    }
-
-    #[test]
-    fn init_is_the_init_script() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(rootfs.join("sbin")).unwrap();
-        std::fs::write(rootfs.join("sbin/init"), "#!/bin/sh\nexec systemd\n").unwrap();
-
-        install_init(&rootfs).unwrap();
-
-        let init = rootfs.join("sbin/init");
-        assert!(std::fs::symlink_metadata(&init)
-            .unwrap()
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::read_link(&init).unwrap(),
-            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
-        );
-    }
-
-    #[test]
-    fn init_is_installed_where_the_image_has_no_sbin() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-
-        install_init(&rootfs).unwrap();
-
-        assert_eq!(
-            std::fs::read_link(rootfs.join("sbin/init")).unwrap(),
-            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
-        );
-    }
-
-    /// A merged-/usr image links `sbin` to `usr/sbin`; the init goes where
-    /// the container will look for it.
-    #[test]
-    fn init_follows_a_relative_sbin_symlink_inside_the_rootfs() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
-        std::os::unix::fs::symlink("usr/sbin", rootfs.join("sbin")).unwrap();
-
-        install_init(&rootfs).unwrap();
-
-        assert_eq!(
-            std::fs::read_link(rootfs.join("usr/sbin/init")).unwrap(),
-            PathBuf::from(GUEST_INIT_SCRIPT_PATH)
-        );
-    }
-
-    /// An absolute symlink in the image points inside the container, never at
-    /// the host: `sbin -> /usr/sbin` must not reach the host's `/usr/sbin`.
-    #[test]
-    fn init_resolves_absolute_symlinks_against_the_rootfs() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        let host = temp_dir.path().join("host-usr-sbin");
-        std::fs::create_dir_all(rootfs.join("usr/sbin")).unwrap();
-        std::fs::create_dir_all(&host).unwrap();
-        std::os::unix::fs::symlink("/usr/sbin", rootfs.join("sbin")).unwrap();
-        // Would resolve out of the rootfs if `..` were not stopped at its root.
-        std::os::unix::fs::symlink("../../../host-usr-sbin", rootfs.join("usr/escape")).unwrap();
-
-        assert_eq!(
-            resolve_in_rootfs(&rootfs, "/sbin/init").unwrap(),
-            rootfs.join("usr/sbin/init")
-        );
-        assert_eq!(
-            resolve_in_rootfs(&rootfs, "/usr/escape/init").unwrap(),
-            rootfs.join("host-usr-sbin/init")
-        );
-
-        install_init(&rootfs).unwrap();
-        assert!(rootfs.join("usr/sbin/init").symlink_metadata().is_ok());
-        assert_eq!(std::fs::read_dir(&host).unwrap().count(), 0);
-    }
-
-    #[test]
-    fn symlink_loops_in_the_image_are_an_error() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let rootfs = temp_dir.path().join("rootfs");
-        std::fs::create_dir_all(&rootfs).unwrap();
-        std::os::unix::fs::symlink("/sbin", rootfs.join("sbin")).unwrap();
-
-        assert!(install_init(&rootfs).is_err());
-    }
-
     #[tokio::test]
     async fn extract_supervisor_binary_cache_hit_and_miss() {
         let digest_hex = "ee".repeat(32);
@@ -2261,46 +1614,5 @@ mod tests {
         // Cached binary is a symlink: must NOT be treated as a cache hit,
         // but re-extracted by importer.
         assert!(!is_valid_cached_binary(&symlink_bin).await);
-    }
-
-    #[tokio::test]
-    async fn copy_extracted_binary_refuses_symlink() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let host_file = temp_dir.path().join("host_secret");
-        std::fs::write(&host_file, b"secret data").unwrap();
-
-        let link_path = temp_dir.path().join("symlink_bin");
-        std::os::unix::fs::symlink(&host_file, &link_path).unwrap();
-
-        let target_path = temp_dir.path().join("target_bin");
-        let err = copy_extracted_binary(&link_path, &target_path, "test:latest")
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("symlink"));
-        assert!(!target_path.exists());
-    }
-
-    #[tokio::test]
-    async fn copy_extracted_binary_copies_regular_file() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let source_file = temp_dir.path().join("source_bin");
-        std::fs::write(&source_file, b"binary content").unwrap();
-
-        let target_path = temp_dir.path().join("target_bin");
-        copy_extracted_binary(&source_file, &target_path, "test:latest")
-            .await
-            .unwrap();
-
-        assert_eq!(std::fs::read(&target_path).unwrap(), b"binary content");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&target_path)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777;
-            assert_eq!(mode, 0o755);
-        }
     }
 }
