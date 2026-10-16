@@ -839,15 +839,15 @@ async fn guest_tls_materials_reach_the_instance() {
     }
 }
 
-/// LXD applies ACLs to individual NICs only on OVN networks, and that ACL is
-/// the outer network fence OpenShell v0.1.0 requires, so a sandbox on a bridge
-/// is refused up front rather than created and left unable to attach.
+/// LXD applies ACLs to individual NICs only on OVN networks, so a bridge
+/// cannot carry the outer network fence. Rather than refuse the create, the
+/// driver falls back to no ACL at all: the sandbox is created, it is warned
+/// about loudly, and its NIC carries no `security.acls`.
 ///
-/// The rest of this suite needs an OVN host, so this one has nothing to assert
-/// there and says so rather than failing: what it is about is the *refusal*,
-/// which only happens on a network that cannot carry the fence.
+/// The rest of this suite needs an OVN host, so this one makes its own bridge
+/// rather than reading the default network.
 #[tokio::test]
-async fn a_bridge_network_cannot_carry_the_outer_fence() {
+async fn a_bridge_is_a_warned_unfenced_fallback() {
     // A bridge is created for this test rather than skipping when the host's
     // default network is OVN — which it always is, since every other test
     // needs one, so the skip meant this path was never exercised anywhere.
@@ -869,8 +869,7 @@ async fn a_bridge_network_cannot_carry_the_outer_fence() {
     let _cleanup_bridge = BridgeCleanup(bridge);
 
     // The bridge is selected through `driver_config`, which the admission
-    // policy forbids by default — so the driver has to allow it, or the
-    // create is refused for that reason and never reaches the fence.
+    // policy forbids by default — so the driver has to allow it.
     let driver = Driver::start_with(DriverOptions {
         extra_args: vec!["--allow-driver-config".to_string()],
         ..Default::default()
@@ -884,18 +883,30 @@ async fn a_bridge_network_cannot_carry_the_outer_fence() {
         fields: BTreeMap::from([("network".to_string(), string_value(bridge))]),
     });
 
-    let status = driver
+    driver
         .create(request)
         .await
-        .expect_err("a bridge cannot carry a per-NIC ACL, so it cannot fence a sandbox");
-    assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
+        .expect("a bridge is an explicit unfenced fallback, not a refusal");
+
+    // Nothing was attached, so nothing can be read back off the NIC.
+    let instance = lxd()
+        .get_instance(&name)
+        .await
+        .expect("the sandbox was created");
+    let eth0 = instance
+        .expanded_devices
+        .get("eth0")
+        .expect("the sandbox has a NIC");
     assert!(
-        status.message().contains("OVN"),
-        "the refusal should say why: {status}"
+        !eth0.keys().any(|key| key.starts_with("security.acls")),
+        "a bridge NIC must carry no ACL: {eth0:?}"
     );
+
+    // ...and the driver said so, because it is a real hole.
     assert!(
-        lxd().get_instance(&name).await.is_err(),
-        "a sandbox that cannot be fenced must not be left behind"
+        driver.log().contains("without its outer network fence"),
+        "the driver must warn about the unfenced fallback:\n{}",
+        driver.log()
     );
 }
 
