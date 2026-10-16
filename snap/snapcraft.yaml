@@ -1,0 +1,88 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+#
+# Proof-of-concept snap for the OpenShell LXD compute driver. It serves the
+# out-of-tree ComputeDriver gRPC contract over a Unix socket that it publishes
+# into the OpenShell snap through the `compute-driver` content interface.
+name: openshell-driver-lxd
+base: core24
+# Derived from the git history (tag or commit) so a local `snapcraft pack` and
+# the CI build both get a real version, rather than a value pinned here that
+# drifts from what was actually built. Matches rockcraft.yaml.
+version: git
+summary: OpenShell compute driver for LXD / MicroCloud
+description: |
+  An out-of-tree OpenShell compute driver that realizes sandboxes as LXD
+  system containers. It is reached over the `compute-driver` content interface,
+  through which it shares its gRPC socket with the OpenShell snap.
+license: AGPL-3.0-only
+grade: devel
+confinement: strict
+platforms:
+  amd64:
+    build-on: [amd64]
+    build-for: [amd64]
+  arm64:
+    build-on: [arm64]
+    build-for: [arm64]
+
+# skopeo resolves its config from /etc/containers/{registries.conf,policy.json}.
+# Inside the confined snap that path is the base's, and reading the host's is
+# denied; bind the staged containers-common config over it so pulls use the
+# snap's own copies.
+layout:
+  /etc/containers:
+    bind: $SNAP/etc/containers
+
+apps:
+  driver:
+    command: bin/driver-wrapper
+    daemon: simple
+    restart-condition: on-failure
+    plugs:
+      - lxd
+      - network
+      - network-bind
+
+plugs:
+  # Connected to `openshell:compute-driver`. The driver publishes its gRPC
+  # socket and a descriptor into this directory; the target is what the driver
+  # sees, and maps to `$SNAP_COMMON/compute-driver` in the OpenShell snap.
+  compute-driver:
+    interface: content
+    content: openshell-compute-driver
+    target: $SNAP_COMMON/openshell
+    default-provider: openshell
+
+parts:
+  driver:
+    plugin: rust
+    source: .
+    rust-path:
+      - crates/openshell-driver-lxd
+    build-packages:
+      - pkg-config
+      - libssl-dev
+      - protobuf-compiler
+      - libprotobuf-dev
+      - cmake
+      - clang
+      - build-essential
+    override-build: |
+      craftctl default
+      install -D -m 0755 "$CRAFT_PART_SRC/snap/local/driver-wrapper.sh" \
+        "$CRAFT_PART_INSTALL/bin/driver-wrapper"
+
+  runtime-deps:
+    plugin: nil
+    stage-packages:
+      - ca-certificates
+      - iproute2
+      - libssl3t64
+      - busybox-static
+      # The driver shells out to skopeo to pull an OCI image and to sqfstar
+      # (from squashfs-tools) to turn the flattened tar into the LXD rootfs
+      # squashfs. There is no umoci or mksquashfs step any more: the layers
+      # are merged in-process and streamed straight into sqfstar.
+      - squashfs-tools
+      - xz-utils
+      - skopeo
