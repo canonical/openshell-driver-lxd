@@ -871,10 +871,13 @@ impl LxdComputeDriver {
         let placement =
             mapping::Placement::resolve(template, &defaults.network, &defaults.storage_pool);
         let network = self.check_placement(placement).await?;
-        // LXD enforces a per-NIC ACL only on OVN. On any other type the driver
-        // attaches no ACL at all and the sandbox runs without its outer network
-        // fence; `collect_fence_evidence` warns once the create reaches it.
-        let fenced = isolation::acls_are_enforced(&network.type_.to_string());
+        // `check_placement` has already refused a network whose LXD type
+        // contradicts `--network-mode`, so the mode alone says whether LXD
+        // will enforce this sandbox's ACLs: on OVN it will, on a bridge (an
+        // explicit `--network-mode bridge`) it will not and the sandbox runs
+        // behind its in-workload boundary alone, which `collect_fence_evidence`
+        // warns about.
+        let fenced = self.config.network_mode.fences();
 
         let gateway_endpoint = self.resolve_gateway_endpoint(placement.network, &network)?;
         // Not optional on OVN since OpenShell v0.1.0: this ACL is the
@@ -1876,7 +1879,7 @@ impl LxdComputeDriver {
             if let Ok(lxd_network) = self.lxd.get_network(&network).await {
                 match self.resolve_gateway_endpoint(&network, &lxd_network) {
                     Ok(endpoint) => {
-                        let fenced = isolation::acls_are_enforced(&lxd_network.type_.to_string());
+                        let fenced = self.config.network_mode.fences();
                         self.ensure_sandbox_acls(name, &endpoint, fenced).await?;
                         host_gateway_ip = Self::host_gateway_ip(
                             &Self::resolve_gateway_addresses(&endpoint).await?,
@@ -2088,6 +2091,22 @@ impl LxdComputeDriver {
             }
             Err(e) => return Err(e.into()),
         };
+        // The mode is the operator's declaration of which network a sandbox
+        // runs on, and with it which fence it runs behind; a network whose LXD
+        // type contradicts it is refused here rather than silently run the
+        // other way. In particular the default (`ovn`) will not fall back to
+        // an unfenced bridge, so that fallback is only ever an explicit one.
+        let reported = network.type_.to_string();
+        let required = self.config.network_mode.network_type();
+        if !reported.eq_ignore_ascii_case(required) {
+            return Err(DriverError::FailedPrecondition(format!(
+                "LXD network {:?} is a {reported:?} network, but --network-mode {} requires a \
+                 {required:?} one; point the sandbox's driver_config.network, the driver's \
+                 --default-network, or the NIC device of the project's default profile at a \
+                 {required:?} network, or set --network-mode accordingly",
+                placement.network, self.config.network_mode
+            )));
+        }
         if !self.lxd.storage_pool_exists(placement.storage_pool).await? {
             return Err(DriverError::FailedPrecondition(format!(
                 "LXD storage pool {:?} does not exist; point the sandbox's \

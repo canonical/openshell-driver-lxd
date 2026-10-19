@@ -31,6 +31,12 @@ set -- \
 if [ -n "${OPENSHELL_DRIVER_NETWORK:-}" ]; then
     set -- --default-network "$OPENSHELL_DRIVER_NETWORK" "$@"
 fi
+# Which LXD network sandboxes require, and with it whether the driver fences
+# them. Left unset the driver's own default applies, `ovn`; a bridge has to be
+# asked for here, so an unfenced sandbox is never selected by accident.
+if [ -n "${OPENSHELL_DRIVER_NETWORK_MODE:-}" ]; then
+    set -- --network-mode "$OPENSHELL_DRIVER_NETWORK_MODE" "$@"
+fi
 if [ -n "${OPENSHELL_DRIVER_GATEWAY_ENDPOINT:-}" ]; then
     set -- --gateway-endpoint "$OPENSHELL_DRIVER_GATEWAY_ENDPOINT" "$@"
 fi

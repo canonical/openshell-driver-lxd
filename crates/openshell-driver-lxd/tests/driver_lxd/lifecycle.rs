@@ -848,9 +848,10 @@ async fn guest_tls_materials_reach_the_instance() {
 }
 
 /// LXD applies ACLs to individual NICs only on OVN networks, so a bridge
-/// cannot carry the outer network fence. Rather than refuse the create, the
-/// driver falls back to no ACL at all: the sandbox is created, it is warned
-/// about loudly, and its NIC carries no `security.acls`.
+/// cannot carry the outer network fence. With `--network-mode bridge` the
+/// driver accepts that explicitly rather than refuse the create: the sandbox
+/// is created, it is warned about loudly, and its NIC carries no
+/// `security.acls`.
 ///
 /// The rest of this suite needs an OVN host, so this one makes its own bridge
 /// rather than reading the default network.
@@ -877,9 +878,14 @@ async fn a_bridge_is_a_warned_unfenced_fallback() {
     let _cleanup_bridge = BridgeCleanup(bridge);
 
     // The bridge is selected through `driver_config`, which the admission
-    // policy forbids by default — so the driver has to allow it.
+    // policy forbids by default — so the driver has to allow it. It is also
+    // the unfenced fallback, which `--network-mode bridge` asks for.
     let driver = Driver::start_with(DriverOptions {
-        extra_args: vec!["--allow-driver-config".to_string()],
+        extra_args: vec![
+            "--allow-driver-config".to_string(),
+            "--network-mode".to_string(),
+            "bridge".to_string(),
+        ],
         ..Default::default()
     })
     .await;
@@ -915,6 +921,61 @@ async fn a_bridge_is_a_warned_unfenced_fallback() {
         driver.log().contains("without its outer network fence"),
         "the driver must warn about the unfenced fallback:\n{}",
         driver.log()
+    );
+}
+
+/// Under `--network-mode ovn` a sandbox on a bridge is refused rather than
+/// silently run unfenced: the unfenced fallback has to be asked for by name.
+/// This is the security property the mode exists for. The harness selects the
+/// mode from the host's network by default, so this test pins `ovn` itself
+/// rather than lean on the default, which would be `bridge` on a bridge host.
+#[tokio::test]
+async fn a_bridge_is_refused_unless_the_bridge_mode_is_selected() {
+    let bridge = unique_name("odlbr").replace('-', "");
+    let bridge = &bridge[..bridge.len().min(15)];
+    if !lxc_output(&["network", "create", bridge, "--type=bridge"])
+        .status
+        .success()
+    {
+        eprintln!("skipped: could not create a bridge network");
+        return;
+    }
+    struct BridgeCleanup<'a>(&'a str);
+    impl Drop for BridgeCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = lxc_output(&["network", "delete", self.0]);
+        }
+    }
+    let _cleanup_bridge = BridgeCleanup(bridge);
+
+    // The fenced mode: a bridge cannot carry its outer ACL, so the create is
+    // refused. Pinned explicitly because the harness would otherwise pick the
+    // host's own network type, which is `bridge` on the unfenced run.
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec![
+            "--allow-driver-config".to_string(),
+            "--network-mode".to_string(),
+            "ovn".to_string(),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("bridged");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let mut request = sandbox(&name);
+    template_mut(&mut request).driver_config = Some(Struct {
+        fields: BTreeMap::from([("network".to_string(), string_value(bridge))]),
+    });
+
+    let status = driver
+        .create(request)
+        .await
+        .expect_err("a bridge is refused under the fenced network mode");
+    assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
+    assert!(
+        status.message().contains("--network-mode"),
+        "the refusal must name the mode: {status}"
     );
 }
 

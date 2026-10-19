@@ -353,12 +353,24 @@ start_driver() {
     if [ "$(network_type)" = "ovn" ]; then
         endpoint=(--gateway-endpoint "$(gateway_endpoint)")
     fi
+    # The driver's own default is the fenced OVN mode, and it refuses a
+    # network whose LXD type contradicts it. The suites run on whatever network
+    # the host already has — an OVN one from `make setup-ovn-test-env`, or the
+    # plain bridge from `make setup-lxd-test-env` — so select the mode that
+    # matches it rather than let the default refuse every sandbox on a bridge.
+    # A network of any other type was already refused by require_usable_network,
+    # and an operator can still pin the mode via OPENSHELL_TEST_DRIVER_ARGS.
+    local mode=()
+    if ! printf '%s\n' "${EXTRA_DRIVER_ARGS[@]}" | grep -qx -- '--network-mode'; then
+        mode=(--network-mode "$(network_type)")
+    fi
     # The gateway here is plaintext, as upstream's own suites run it; the
     # driver refuses one unless told this is a test environment.
     "$DRIVER_BIN" \
         --socket "$DRIVER_SOCKET" \
         --allow-plaintext-gateway \
         "${endpoint[@]}" \
+        "${mode[@]}" \
         --project "$PROJECT" \
         --log-level "info,openshell_driver_lxd=debug" \
         --default-image "$SANDBOX_IMAGE" \

@@ -536,6 +536,15 @@ impl Driver {
             let scheme = if tls { "https" } else { "http" };
             cmd.args(["--gateway-endpoint", &format!("{scheme}://127.0.0.1:17670")]);
         }
+        // The driver's own default is the fenced OVN mode and refuses a
+        // network that contradicts it, but the suites run on whatever the host
+        // was set up for: OVN (`make setup-ovn-test-env`) or a plain bridge
+        // (`make setup-lxd-test-env`). Select the mode matching that network
+        // so a bridge host does not refuse every create, unless the test pins
+        // its own mode (the bridge tests do, while running on an OVN host).
+        if !options.extra_args.iter().any(|arg| arg == "--network-mode") {
+            cmd.arg("--network-mode").arg(default_network_type());
+        }
         if !options.cleanup {
             cmd.args(["--cleanup-interval-secs", "0"]);
         }

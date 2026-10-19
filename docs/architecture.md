@@ -313,8 +313,12 @@ a sandbox that never attaches, so `create_sandbox` refuses one up front.
 
 LXD only applies `security.acls` to an individual NIC on an OVN network; a
 bridge accepts an ACL on the network itself but not per-NIC, which is not a
-per-sandbox fence. So `create_sandbox` fails with `FailedPrecondition` on a
-bridge rather than provisioning a sandbox that cannot start.
+per-sandbox fence. The driver requires a network matching `--network-mode`
+(default `ovn`) and refuses any other type: on a bridge it will not provision a
+sandbox that cannot start, and it will not silently run one unfenced. A bridge
+is accepted, explicitly without the outer network fence, only on
+`--network-mode bridge` — where `create_sandbox` attaches no ACL, warns, and
+leans on the in-workload boundary.
 
 Inside the guest, network configuration is done by a static `busybox`/`udhcpc`
 binary (`dhcp_client.rs`) run against an event script
