@@ -710,6 +710,14 @@ async fn host_alias_follows_the_gateway_endpoint() {
 /// fail.
 #[tokio::test]
 async fn an_unresolvable_gateway_endpoint_is_refused() {
+    // The refusal comes from writing the gateway into a per-NIC ACL, which LXD
+    // only has on OVN. On a bridge no ACL is written, so there is nothing that
+    // needs the gateway resolved and the driver accepts the create.
+    if !default_network_is_ovn() {
+        eprintln!("skipped: only an OVN fence needs the gateway endpoint resolved at create");
+        return;
+    }
+
     let driver = Driver::start_with(DriverOptions {
         extra_args: vec![
             "--gateway-endpoint".into(),
@@ -839,15 +847,16 @@ async fn guest_tls_materials_reach_the_instance() {
     }
 }
 
-/// LXD applies ACLs to individual NICs only on OVN networks, and that ACL is
-/// the outer network fence OpenShell v0.1.0 requires, so a sandbox on a bridge
-/// is refused up front rather than created and left unable to attach.
+/// LXD applies ACLs to individual NICs only on OVN networks, so a bridge
+/// cannot carry the outer network fence. With `--network-mode bridge` the
+/// driver accepts that explicitly rather than refuse the create: the sandbox
+/// is created, it is warned about loudly, and its NIC carries no
+/// `security.acls`.
 ///
-/// The rest of this suite needs an OVN host, so this one has nothing to assert
-/// there and says so rather than failing: what it is about is the *refusal*,
-/// which only happens on a network that cannot carry the fence.
+/// The rest of this suite needs an OVN host, so this one makes its own bridge
+/// rather than reading the default network.
 #[tokio::test]
-async fn a_bridge_network_cannot_carry_the_outer_fence() {
+async fn a_bridge_is_a_warned_unfenced_fallback() {
     // A bridge is created for this test rather than skipping when the host's
     // default network is OVN — which it always is, since every other test
     // needs one, so the skip meant this path was never exercised anywhere.
@@ -869,10 +878,85 @@ async fn a_bridge_network_cannot_carry_the_outer_fence() {
     let _cleanup_bridge = BridgeCleanup(bridge);
 
     // The bridge is selected through `driver_config`, which the admission
-    // policy forbids by default — so the driver has to allow it, or the
-    // create is refused for that reason and never reaches the fence.
+    // policy forbids by default — so the driver has to allow it. It is also
+    // the unfenced fallback, which `--network-mode bridge` asks for.
     let driver = Driver::start_with(DriverOptions {
-        extra_args: vec!["--allow-driver-config".to_string()],
+        extra_args: vec![
+            "--allow-driver-config".to_string(),
+            "--network-mode".to_string(),
+            "bridge".to_string(),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let name = unique_name("bridged");
+    let _cleanup = driver.cleanup(&[&name]);
+
+    let mut request = sandbox(&name);
+    template_mut(&mut request).driver_config = Some(Struct {
+        fields: BTreeMap::from([("network".to_string(), string_value(bridge))]),
+    });
+
+    driver
+        .create(request)
+        .await
+        .expect("a bridge is an explicit unfenced fallback, not a refusal");
+
+    // Nothing was attached, so nothing can be read back off the NIC.
+    let instance = lxd()
+        .get_instance(&name)
+        .await
+        .expect("the sandbox was created");
+    let eth0 = instance
+        .expanded_devices
+        .get("eth0")
+        .expect("the sandbox has a NIC");
+    assert!(
+        !eth0.keys().any(|key| key.starts_with("security.acls")),
+        "a bridge NIC must carry no ACL: {eth0:?}"
+    );
+
+    // ...and the driver said so, because it is a real hole.
+    assert!(
+        driver.log().contains("without its outer network fence"),
+        "the driver must warn about the unfenced fallback:\n{}",
+        driver.log()
+    );
+}
+
+/// Under `--network-mode ovn` a sandbox on a bridge is refused rather than
+/// silently run unfenced: the unfenced fallback has to be asked for by name.
+/// This is the security property the mode exists for. The harness selects the
+/// mode from the host's network by default, so this test pins `ovn` itself
+/// rather than lean on the default, which would be `bridge` on a bridge host.
+#[tokio::test]
+async fn a_bridge_is_refused_unless_the_bridge_mode_is_selected() {
+    let bridge = unique_name("odlbr").replace('-', "");
+    let bridge = &bridge[..bridge.len().min(15)];
+    if !lxc_output(&["network", "create", bridge, "--type=bridge"])
+        .status
+        .success()
+    {
+        eprintln!("skipped: could not create a bridge network");
+        return;
+    }
+    struct BridgeCleanup<'a>(&'a str);
+    impl Drop for BridgeCleanup<'_> {
+        fn drop(&mut self) {
+            let _ = lxc_output(&["network", "delete", self.0]);
+        }
+    }
+    let _cleanup_bridge = BridgeCleanup(bridge);
+
+    // The fenced mode: a bridge cannot carry its outer ACL, so the create is
+    // refused. Pinned explicitly because the harness would otherwise pick the
+    // host's own network type, which is `bridge` on the unfenced run.
+    let driver = Driver::start_with(DriverOptions {
+        extra_args: vec![
+            "--allow-driver-config".to_string(),
+            "--network-mode".to_string(),
+            "ovn".to_string(),
+        ],
         ..Default::default()
     })
     .await;
@@ -887,15 +971,11 @@ async fn a_bridge_network_cannot_carry_the_outer_fence() {
     let status = driver
         .create(request)
         .await
-        .expect_err("a bridge cannot carry a per-NIC ACL, so it cannot fence a sandbox");
+        .expect_err("a bridge is refused under the fenced network mode");
     assert_eq!(status.code(), Code::FailedPrecondition, "{status}");
     assert!(
-        status.message().contains("OVN"),
-        "the refusal should say why: {status}"
-    );
-    assert!(
-        lxd().get_instance(&name).await.is_err(),
-        "a sandbox that cannot be fenced must not be left behind"
+        status.message().contains("--network-mode"),
+        "the refusal must name the mode: {status}"
     );
 }
 

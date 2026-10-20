@@ -36,3 +36,11 @@ if ! lxc image info "local:${IMAGE_ALIAS}" >/dev/null 2>&1; then
     echo "Staging ${IMAGE_SOURCE} as image alias ${IMAGE_ALIAS}..."
     lxc image copy "${IMAGE_SOURCE}" local: --alias "${IMAGE_ALIAS}"
 fi
+
+# Let the invoking user reach the LXD socket without sudo, so the test suites —
+# which do not run as root — can use this LXD. Membership only applies to
+# sessions started after this runs, which is why CI re-enters through
+# `sudo --user` after provisioning.
+if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
+    usermod --append --groups lxd "$SUDO_USER"
+fi

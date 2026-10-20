@@ -1,4 +1,4 @@
-.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock rock setup-ovn-test-env setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
+.PHONY: build release check test test-lxd-client test-driver test-conformance test-upstream-e2e test-rock test-snap rock setup-ovn-test-env setup-lxd-test-env fmt fmt-check clippy shellcheck doc static-checks proto sync-proto run clean
 
 build:
 	cargo build --workspace
@@ -17,7 +17,8 @@ test-lxd-client: setup-lxd-test-env
 # Runs the driver's unit and integration tests. The integration tests
 # (crates/openshell-driver-lxd/tests/driver_lxd) start the driver binary and
 # boot real sandboxes on a live LXD, so they need the `lxc` CLI, `skopeo`,
-# `umoci`, and `mksquashfs` (squashfs-tools) on PATH plus outbound access to
+# and `squashfs-tools` (for `sqfstar`, and `mksquashfs` in the image-import
+# helper) on PATH plus outbound access to
 # ghcr.io: the sandbox image is imported on first use. Sandboxes run a
 # stand-in supervisor built from examples/, not the real one, which needs a
 # gateway. They also share one LXD daemon and default project, so run them
@@ -43,16 +44,18 @@ test-upstream-e2e:
 	./scripts/upstream-e2e.sh
 
 # Bootstraps a single-node MicroCloud with OVN, synthesizing the spare disk and
-# spare NIC it wants. Every suite that creates a sandbox needs an OVN network
-# from OpenShell v0.1.0 on: the per-NIC ACL that a sandbox's outer fence is
-# made of is the one thing LXD does not do on a bridge. Needs root; idempotent;
-# `--purge` undoes it.
+# spare NIC it wants. A sandbox is *fenced* only on OVN from OpenShell v0.1.0 on
+# — the per-NIC ACL its outer fence is made of is the one thing LXD does not do
+# on a bridge — so this is the environment for the fenced run; `make
+# setup-lxd-test-env` gives a plain bridge to run the same suites unfenced.
+# Needs root; idempotent; `--purge` undoes it.
 setup-ovn-test-env:
 	sudo ./scripts/setup-ovn-test-env.sh
 
 # Provisions LXD for lxd-client's integration tests (see
 # crates/lxd-client/tests/integration.rs). Idempotent; a prerequisite of
-# `test` so the same command works locally and in CI.
+# `test` so the same command works locally and in CI. The plain LXD bridge it
+# sets up is also the bridge the sandbox suites run on unfenced.
 setup-lxd-test-env:
 	sudo ./scripts/setup-lxd-test-env.sh
 
@@ -69,7 +72,7 @@ clippy:
 # included: they are the container's boot path, so a mistake in them is a
 # sandbox that never starts.
 shellcheck:
-	shellcheck scripts/*.sh tests/rock/*.sh
+	shellcheck scripts/*.sh tests/rock/*.sh tests/snap/*.sh
 	shellcheck -s sh crates/openshell-driver-lxd/assets/openshell-init.sh \
 		crates/openshell-driver-lxd/assets/dhcp-client/udhcpc.script
 
@@ -80,6 +83,11 @@ rock:
 # Runs smoke tests against the packed rock.
 test-rock:
 	./tests/rock/smoke.sh
+
+# Smoke tests the packed snap. Needs the snap artifact in the repo root (or
+# SNAP_DIR) and root (via sudo) to install it.
+test-snap:
+	./tests/snap/smoke.sh
 
 # Builds the API docs, treating warnings (e.g. broken intra-doc links) as
 # errors so documentation stays valid.

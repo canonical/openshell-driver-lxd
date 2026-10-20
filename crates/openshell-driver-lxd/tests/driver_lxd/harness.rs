@@ -201,7 +201,6 @@ pub fn ensure_sandbox_image() -> String {
                     lxd(),
                     None,
                     None,
-                    None,
                     image_work_dir(),
                     Duration::from_secs(900),
                     Duration::from_secs(1800),
@@ -260,9 +259,8 @@ pub fn standin_supervisor() -> PathBuf {
 
 /// The storage pool the host's `default` profile puts root disks on.
 ///
-/// Not hardcoded: these tests need an OVN host now — sandboxes cannot be
-/// fenced anywhere else — and an OVN host is usually a MicroCloud, whose pool
-/// is `local` or `remote` rather than `default`.
+/// Not hardcoded: the host may be a MicroCloud, whose pool is `local` or
+/// `remote`, or a plain LXD, whose pool is `default`; the suites run on both.
 pub fn default_pool() -> String {
     static POOL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     POOL.get_or_init(|| {
@@ -276,6 +274,42 @@ pub fn default_pool() -> String {
         pool
     })
     .clone()
+}
+
+/// The type of the network the host's `default` profile puts NICs on.
+///
+/// The suites run on whatever the host was set up for: OVN (`make
+/// setup-ovn-test-env`, where a sandbox is fenced) or a bridge (`make
+/// setup-lxd-test-env`, where it runs unfenced). Tests that only make sense on
+/// an OVN fence read this and skip themselves elsewhere.
+pub fn default_network_type() -> String {
+    static TYPE: OnceLock<String> = OnceLock::new();
+    TYPE.get_or_init(|| {
+        let network = lxc(&["profile", "device", "get", "default", "eth0", "network"]);
+        let network = network.trim().to_string();
+        assert!(
+            !network.is_empty(),
+            "the default profile has no eth0 NIC; run 'make setup-ovn-test-env' or \
+                 'make setup-lxd-test-env'"
+        );
+        let json = lxc(&["query", &format!("/1.0/networks/{network}")]);
+        serde_json::from_str::<serde_json::Value>(&json)
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("network {network} reports no type"))
+    })
+    .clone()
+}
+
+/// Whether the host's default network is OVN, the only kind LXD attaches a
+/// per-NIC ACL — a sandbox's outer fence — on.
+pub fn default_network_is_ovn() -> bool {
+    default_network_type().eq_ignore_ascii_case("ovn")
 }
 
 /// Creates a stopped instance the driver did not make, on the host's own pool.
@@ -501,6 +535,15 @@ impl Driver {
                 .any(|arg| arg.starts_with("--guest-tls-"));
             let scheme = if tls { "https" } else { "http" };
             cmd.args(["--gateway-endpoint", &format!("{scheme}://127.0.0.1:17670")]);
+        }
+        // The driver's own default is the fenced OVN mode and refuses a
+        // network that contradicts it, but the suites run on whatever the host
+        // was set up for: OVN (`make setup-ovn-test-env`) or a plain bridge
+        // (`make setup-lxd-test-env`). Select the mode matching that network
+        // so a bridge host does not refuse every create, unless the test pins
+        // its own mode (the bridge tests do, while running on an OVN host).
+        if !options.extra_args.iter().any(|arg| arg == "--network-mode") {
+            cmd.arg("--network-mode").arg(default_network_type());
         }
         if !options.cleanup {
             cmd.args(["--cleanup-interval-secs", "0"]);

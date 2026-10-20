@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 
 use crate::admission::ResourceAdmissionConfig;
 
@@ -131,6 +131,53 @@ pub const DEFAULT_IMAGE_CONVERT_TIMEOUT_SECS: u64 = 30 * 60;
 /// why the window is generous.
 pub const DEFAULT_IMAGE_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 
+/// The LXD network type a sandbox requires, and the outer network fence that
+/// comes with it.
+///
+/// LXD applies `security.acls` to an individual NIC only on an OVN network,
+/// and that per-NIC ACL is the sandbox's outer network fence. A bridge cannot
+/// carry one, so a sandbox on a bridge runs behind its in-workload boundary
+/// alone. The mode names that choice so it is declared rather than inferred:
+/// a network whose LXD type contradicts the mode is refused, and the default
+/// requires the fenced one, so a sandbox never ends up unfenced by accident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum NetworkMode {
+    /// Require an OVN network and the per-NIC ACL fence it carries. A network
+    /// of any other LXD type is refused rather than run unfenced.
+    Ovn,
+    /// Accept a bridge, explicitly without the outer network fence. A network
+    /// of any other LXD type is refused.
+    Bridge,
+}
+
+impl NetworkMode {
+    /// The LXD network type this mode requires, as LXD reports it.
+    #[must_use]
+    pub fn network_type(self) -> &'static str {
+        match self {
+            Self::Ovn => crate::isolation::NETWORK_TYPE_OVN,
+            Self::Bridge => crate::isolation::NETWORK_TYPE_BRIDGE,
+        }
+    }
+
+    /// Whether LXD enforces this driver's per-NIC ACLs in this mode. Only OVN
+    /// does; a bridge accepts none, so `false` is the explicit unfenced
+    /// fallback.
+    #[must_use]
+    pub fn fences(self) -> bool {
+        matches!(self, Self::Ovn)
+    }
+}
+
+impl std::fmt::Display for NetworkMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Ovn => "ovn",
+            Self::Bridge => "bridge",
+        })
+    }
+}
+
 /// CLI configuration for `openshell-driver-lxd`.
 #[derive(Debug, Clone, Parser)]
 #[command(name = "openshell-driver-lxd", version, about)]
@@ -168,6 +215,15 @@ pub struct Config {
     /// typically on the OVN network `default`.
     #[arg(long)]
     pub default_network: Option<String>,
+
+    /// The LXD network type sandboxes require: `ovn` (the default) requires an
+    /// OVN network, whose per-NIC ACL is the sandbox's outer network fence,
+    /// and refuses a sandbox it cannot fence; `bridge` accepts a bridge and
+    /// the unfenced sandbox that comes with it. A network of any other LXD
+    /// type is refused in either mode, so the fence a sandbox runs behind is
+    /// never chosen by accident.
+    #[arg(long, value_enum, default_value_t = NetworkMode::Ovn)]
+    pub network_mode: NetworkMode,
 
     /// LXD storage pool for sandbox root disks unless a request sets
     /// `driver_config.storage_pool`.
@@ -284,13 +340,9 @@ pub struct Config {
     #[arg(long)]
     pub skopeo_path: Option<PathBuf>,
 
-    /// Optional path override for the umoci binary.
+    /// Optional path override for the sqfstar binary (from squashfs-tools).
     #[arg(long)]
-    pub umoci_path: Option<PathBuf>,
-
-    /// Optional path override for the mksquashfs binary.
-    #[arg(long)]
-    pub mksquashfs_path: Option<PathBuf>,
+    pub sqfstar_path: Option<PathBuf>,
 
     /// Remote LXD HTTPS endpoint (e.g. https://10.0.0.1:8443).
     /// When set, --lxd-socket is ignored and HTTPS+mTLS is used instead.
@@ -568,6 +620,7 @@ mod tests {
         assert_eq!(config.socket, PathBuf::from(DEFAULT_SOCKET));
         assert_eq!(config.project, DEFAULT_PROJECT);
         assert_eq!(config.default_network, None);
+        assert_eq!(config.network_mode, NetworkMode::Ovn);
         assert_eq!(config.default_storage_pool, None);
         assert_eq!(config.default_image, DEFAULT_SANDBOX_IMAGE);
         assert_eq!(config.supervisor_image, DEFAULT_SUPERVISOR_IMAGE);
@@ -605,6 +658,28 @@ mod tests {
         assert!(work_dir.is_absolute());
         assert!(!work_dir.starts_with("/tmp"));
         assert!(!work_dir.starts_with(std::env::temp_dir()));
+    }
+
+    /// The network mode names which network a sandbox runs on and is
+    /// fail-closed: it defaults to the fenced OVN network, and a value that is
+    /// not one of the two known modes is a parse error rather than an
+    /// unguarded default.
+    #[test]
+    fn network_mode_defaults_to_ovn_and_is_selectable() {
+        let default = Config::parse_from(["openshell-driver-lxd"]);
+        assert_eq!(default.network_mode, NetworkMode::Ovn);
+        assert!(default.network_mode.fences());
+        assert_eq!(default.network_mode.network_type(), "ovn");
+
+        let bridge = Config::parse_from(["openshell-driver-lxd", "--network-mode", "bridge"]);
+        assert_eq!(bridge.network_mode, NetworkMode::Bridge);
+        assert!(!bridge.network_mode.fences());
+        assert_eq!(bridge.network_mode.network_type(), "bridge");
+
+        assert!(
+            Config::try_parse_from(["openshell-driver-lxd", "--network-mode", "auto"]).is_err(),
+            "an unknown mode must be refused, not silently accepted"
+        );
     }
 
     #[test]

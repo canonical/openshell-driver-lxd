@@ -29,7 +29,11 @@ upstream revision:
 
 Sandboxes need an **OVN network**. Their egress ACL is the outer network fence
 OpenShell v0.1.0 requires before a workload runs, and LXD applies a per-NIC ACL
-only on OVN; the driver refuses to create a sandbox it cannot fence.
+only on OVN; the driver refuses to create a sandbox it cannot fence. LXD's
+network type is checked against `--network-mode` (default `ovn`), so a network
+of another type is refused rather than silently run unfenced. A bridge, which
+cannot carry a per-NIC ACL, is accepted — without the outer network fence — only
+on an explicit `--network-mode bridge`.
 
 ## License
 

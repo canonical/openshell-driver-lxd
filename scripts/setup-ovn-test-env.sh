@@ -46,7 +46,9 @@ NETWORK="${OVN_TEST_NETWORK:-default}"
 UPLINK_CIDR="${OVN_TEST_UPLINK_CIDR:-10.42.0.1/24}"
 DISK_SIZE="${OVN_TEST_DISK_SIZE:-30G}"
 LXD_CHANNEL="${LXD_CHANNEL:-6/stable}"
-MICROOVN_CHANNEL="${MICROOVN_CHANNEL:-24.03/stable}"
+# MicroCloud 3.x refuses MicroOVN 24.03 ("version is not supported"); it wants
+# the LTS-aligned 26.03 line.
+MICROOVN_CHANNEL="${MICROOVN_CHANNEL:-26.03/stable}"
 # MicroCloud has no `latest` track; 3/stable is what rhea runs.
 MICROCLOUD_CHANNEL="${MICROCLOUD_CHANNEL:-3/stable}"
 
